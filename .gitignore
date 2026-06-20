@@ -15,3 +15,12 @@ temp.py
 *.yuv
 
 output/
+# GP-ResLC local environment and experiment artifacts
+.venv/
+wandb/
+outputs/
+experiments/**/q*/
+*.pt
+data_subsets/
+experiments/
+proposal_design/

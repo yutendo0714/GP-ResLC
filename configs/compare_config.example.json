@@ -1,0 +1,14 @@
+{
+  "out": "/out/comparison",
+  "anchor": "baseline",
+  "datasets": {
+    "Kodak":    { "orig": "/data/kodak",    "patch": 64 },
+    "CLIC2020": { "orig": "/data/clic2020", "patch": 256 }
+  },
+  "methods": {
+    "baseline": { "Kodak": "/out/baseline_kodak", "CLIC2020": "/out/baseline_clic" },
+    "ours":     { "Kodak": "/out/ours_kodak",     "CLIC2020": "/out/ours_clic" },
+    "ours_v2":  { "Kodak": "/out/ours_v2_kodak",  "CLIC2020": "/out/ours_v2_clic" },
+    "MS-ILLM":  { "Kodak": "/out/msillm_kodak" }
+  }
+}

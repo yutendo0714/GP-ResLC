@@ -228,7 +228,8 @@ def generate_log_json(frame_num, frame_pixel_num, test_time, frame_types, bits, 
 class OnlyImageFolder(Dataset):
     def __init__(self, root_folder_path, padding_size):
         self.root_folder_path = root_folder_path
-        self.images = sorted(list(os.listdir(root_folder_path)))
+        exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+        self.images = sorted([p for p in os.listdir(root_folder_path) if os.path.splitext(p)[1].lower() in exts])
         self.dataset_length = len(self.images)
         self.padding_size = padding_size
         print(f"Datasets: {self.dataset_length} images are in {root_folder_path}")

@@ -1,0 +1,13 @@
+{
+  "glc_weights": "/weights/GLC_image",
+  "dataset": { "name": "Kodak", "orig": "/data/kodak", "patch": 64 },
+  "q_indexes": [0, 1, 2, 3],
+  "out": "/out/ablation_kodak",
+  "anchor": "baseline",
+  "variants": [
+    { "name": "baseline",         "kind": "baseline" },
+    { "name": "V1 P_theta",       "kind": "v1", "ckpt": "./ckpt_v1/prior_predictor_final.pt" },
+    { "name": "V2 q-cond",        "kind": "v2", "ckpt": "./ckpt_v2_nogate/v2_final.pt" },
+    { "name": "V2 q-cond + gate", "kind": "v2", "ckpt": "./ckpt_v2_gate/v2_final.pt" }
+  ]
+}

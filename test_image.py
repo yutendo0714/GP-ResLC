@@ -19,6 +19,7 @@ def parse_args():
     parser.add_argument('--input_path', type=str, required=True)
     parser.add_argument('--output_path', type=str, required=True)
     parser.add_argument('--fid_patch_size', type=int, default=64)   # 64 for kodak and 256 for high-resolution datasets e.g. CLIC2020 and Div2K
+    parser.add_argument('--skip_metrics', action='store_true', help='Only write reconstructions and bpp.json; evaluate later with scripts/evaluate_recon_grid.py')
 
     args = parser.parse_args()
     return args
@@ -81,9 +82,25 @@ def main():
             write_image(f"{save_path}/{basename}.png", x_hat)
             print(f"[qp={q} {idx}/{len(eval_dataloader)} {basename}] : bpp={bpp:.4f}, bpp_y={bpp_y:.4f}, bpp_z={bpp_z:.4f}")
 
-        print(f" Average : qp={q} : bpp={sum(all_bpps) / len(all_bpps):.4f}")
-
-        evaluate_quality(all_bpps, input_path=args.input_path, output_path=save_path, log_path=save_path, patch_size=args.fid_patch_size)
+        avg_bpp = sum(all_bpps) / len(all_bpps)
+        print(f" Average : qp={q} : bpp={avg_bpp:.4f}")
+        if args.skip_metrics:
+            import json
+            manifest = {
+                "method": "glc",
+                "q": q,
+                "avg_bpp": float(avg_bpp),
+                "images": {},
+            }
+            # test_image.py does not retain per-image bpp_y/bpp_z after printing;
+            # this manifest is enough for total-bpp curve evaluation.
+            for image_name, bpp_item in zip(eval_dataset.images, all_bpps):
+                basename = os.path.splitext(os.path.basename(image_name))[0]
+                manifest["images"][basename] = {"bpp": float(bpp_item)}
+            with open(os.path.join(save_path, "bpp.json"), "w") as f:
+                json.dump(manifest, f, indent=2)
+        else:
+            evaluate_quality(all_bpps, input_path=args.input_path, output_path=save_path, log_path=save_path, patch_size=args.fid_patch_size)
 
 
 if __name__ == "__main__":

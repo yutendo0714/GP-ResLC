@@ -1,0 +1,405 @@
+"""Real bitstream codec utilities for GLC / GP-ResLC image evaluation.
+
+This module implements an evaluation codec that mirrors the GLC inference
+graph, but counts bytes from actual entropy-coded streams instead of summing
+Gaussian likelihood estimates.
+
+Payload design:
+- z uses the published GLC design: fixed-length VQ codebook indices
+  (14 bits/index for a 16384-entry codebook).
+- y uses four arithmetic-coded streams following the same four-part spatial
+  prior order as GLC.
+- A compact binary header is counted in the payload size and is sufficient for
+  decoding without access to the original image.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+import struct
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn.functional as F
+import torchac
+
+
+MAGIC = b"GPRC1"
+VERSION = 1
+HEADER_STRUCT = struct.Struct("<5sBHIIIIHIIIIIIB")
+STREAM_STRUCT = struct.Struct("<hhI")
+
+
+@dataclass
+class ArithmeticStream:
+    lo: int
+    hi: int
+    data: bytes
+
+
+@dataclass
+class RealCodecPayload:
+    q: int
+    orig_hw: Tuple[int, int]
+    padded_hw: Tuple[int, int]
+    y_shape: Tuple[int, int, int]
+    z_shape: Tuple[int, int]
+    z_count: int
+    z_data: bytes
+    y_streams: List[ArithmeticStream]
+
+    def to_bytes(self) -> bytes:
+        y_c, y_h, y_w = self.y_shape
+        z_h, z_w = self.z_shape
+        header = HEADER_STRUCT.pack(
+            MAGIC,
+            VERSION,
+            int(self.q),
+            int(self.orig_hw[0]),
+            int(self.orig_hw[1]),
+            int(self.padded_hw[0]),
+            int(self.padded_hw[1]),
+            int(y_c),
+            int(y_h),
+            int(y_w),
+            int(z_h),
+            int(z_w),
+            int(self.z_count),
+            len(self.z_data),
+            len(self.y_streams),
+        )
+        chunks = [header, self.z_data]
+        for stream in self.y_streams:
+            chunks.append(STREAM_STRUCT.pack(int(stream.lo), int(stream.hi), len(stream.data)))
+            chunks.append(stream.data)
+        return b"".join(chunks)
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "RealCodecPayload":
+        offset = 0
+        header = payload[offset:offset + HEADER_STRUCT.size]
+        offset += HEADER_STRUCT.size
+        (
+            magic,
+            version,
+            q,
+            orig_h,
+            orig_w,
+            pad_h,
+            pad_w,
+            y_c,
+            y_h,
+            y_w,
+            z_h,
+            z_w,
+            z_count,
+            z_nbytes,
+            stream_count,
+        ) = HEADER_STRUCT.unpack(header)
+        if magic != MAGIC:
+            raise ValueError(f"invalid real-codec magic: {magic!r}")
+        if version != VERSION:
+            raise ValueError(f"unsupported real-codec version: {version}")
+        z_data = payload[offset:offset + z_nbytes]
+        offset += z_nbytes
+        streams: List[ArithmeticStream] = []
+        for _ in range(stream_count):
+            lo, hi, nbytes = STREAM_STRUCT.unpack(payload[offset:offset + STREAM_STRUCT.size])
+            offset += STREAM_STRUCT.size
+            data = payload[offset:offset + nbytes]
+            offset += nbytes
+            streams.append(ArithmeticStream(lo=lo, hi=hi, data=data))
+        if offset != len(payload):
+            raise ValueError(f"trailing payload bytes: {len(payload) - offset}")
+        return cls(
+            q=q,
+            orig_hw=(orig_h, orig_w),
+            padded_hw=(pad_h, pad_w),
+            y_shape=(y_c, y_h, y_w),
+            z_shape=(z_h, z_w),
+            z_count=z_count,
+            z_data=z_data,
+            y_streams=streams,
+        )
+
+
+def _pack_fixed_width(values: torch.Tensor, bit_width: int) -> bytes:
+    vals = values.reshape(-1).to(device="cpu", dtype=torch.int64).tolist()
+    acc = 0
+    nbits = 0
+    out = bytearray()
+    mask = (1 << bit_width) - 1
+    for v in vals:
+        if v < 0 or v > mask:
+            raise ValueError(f"value {v} cannot be represented with {bit_width} bits")
+        acc = (acc << bit_width) | int(v)
+        nbits += bit_width
+        while nbits >= 8:
+            nbits -= 8
+            out.append((acc >> nbits) & 0xFF)
+    if nbits:
+        out.append((acc << (8 - nbits)) & 0xFF)
+    return bytes(out)
+
+
+def _unpack_fixed_width(data: bytes, count: int, bit_width: int, device: torch.device) -> torch.Tensor:
+    vals = []
+    acc = 0
+    nbits = 0
+    mask = (1 << bit_width) - 1
+    for byte in data:
+        acc = (acc << 8) | byte
+        nbits += 8
+        while nbits >= bit_width and len(vals) < count:
+            nbits -= bit_width
+            vals.append((acc >> nbits) & mask)
+    if len(vals) != count:
+        raise ValueError(f"decoded {len(vals)} fixed-width values, expected {count}")
+    return torch.tensor(vals, dtype=torch.long, device=device)
+
+
+def _normal_cdf(x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (1.0 + torch.erf(x / (sigma * math.sqrt(2.0))))
+
+
+def _gaussian_cdf_for_range(sigma: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
+    """Return CDF with explicit lower/upper tail symbols.
+
+    Symbols:
+      0        : lower tail (< lo)
+      1..K     : integer values lo..hi
+      K + 1    : upper tail (> hi)
+
+    Actual encoded symbols should be in 1..K. The unused tail symbols preserve
+    the untruncated Gaussian mass, so interval probabilities match the
+    likelihood model for observed values.
+    """
+    if hi < lo:
+        raise ValueError(f"invalid support [{lo}, {hi}]")
+    sigma = sigma.to(device="cpu", dtype=torch.float32).clamp_min_(1e-5)
+    edges = torch.arange(lo, hi + 2, dtype=torch.float32, device=sigma.device) - 0.5
+    cdf = torch.empty((sigma.numel(), (hi - lo + 1) + 3), dtype=torch.float32)
+    cdf[:, 0] = 0.0
+    cdf[:, 1:-1] = _normal_cdf(edges.unsqueeze(0), sigma.reshape(-1, 1))
+    cdf[:, -1] = 1.0
+    return cdf.clamp_(0.0, 1.0)
+
+
+def _encode_gaussian_symbols(values: torch.Tensor, sigma: torch.Tensor) -> ArithmeticStream:
+    values_cpu = values.reshape(-1).to(device="cpu", dtype=torch.int32)
+    if values_cpu.numel() == 0:
+        return ArithmeticStream(lo=0, hi=-1, data=b"")
+    lo = int(values_cpu.min().item())
+    hi = int(values_cpu.max().item())
+    if lo < -32767 or hi > 32766:
+        raise ValueError(f"symbol range [{lo}, {hi}] is outside int16-safe bounds")
+    cdf = _gaussian_cdf_for_range(sigma.reshape(-1), lo, hi)
+    sym = (values_cpu - lo + 1).to(dtype=torch.int16)
+    data = torchac.encode_float_cdf(cdf, sym, needs_normalization=True, check_input_bounds=False)
+    return ArithmeticStream(lo=lo, hi=hi, data=data)
+
+
+def _decode_gaussian_symbols(stream: ArithmeticStream, sigma: torch.Tensor) -> torch.Tensor:
+    sigma = sigma.reshape(-1)
+    if sigma.numel() == 0:
+        return torch.empty((0,), dtype=torch.float32, device=sigma.device)
+    cdf = _gaussian_cdf_for_range(sigma, stream.lo, stream.hi)
+    sym = torchac.decode_float_cdf(cdf, stream.data, needs_normalization=True).to(torch.int32)
+    tail_low = int((sym == 0).sum().item())
+    tail_high = int((sym == (stream.hi - stream.lo + 2)).sum().item())
+    if tail_low or tail_high:
+        raise ValueError(f"decoded tail symbols: low={tail_low}, high={tail_high}")
+    values = sym - 1 + int(stream.lo)
+    return values.to(device=sigma.device, dtype=torch.float32)
+
+
+def _apply_gp_reslc_params(
+    net,
+    z_hat: torch.Tensor,
+    params: torch.Tensor,
+    q: int,
+    predictor_param_mode: str,
+    predictor_delta_bound: float,
+):
+    if not hasattr(net, "prior_predictor") or net.prior_predictor is None:
+        return params
+    if predictor_param_mode == "latent_residual":
+        raise NotImplementedError("real codec currently supports mean/scale_mean/all GP-ResLC modes")
+
+    q_shift = getattr(net, "q_embed", None)
+    z_cond = z_hat if q_shift is None else z_hat + q_shift[q:q + 1]
+    delta_params, _, _ = net.prior_predictor(z_cond)
+    if predictor_delta_bound and predictor_delta_bound > 0:
+        delta_params = predictor_delta_bound * torch.tanh(delta_params / predictor_delta_bound)
+
+    if predictor_param_mode == "mean":
+        masked = torch.zeros_like(delta_params)
+        masked[:, 2 * net.N:] = delta_params[:, 2 * net.N:]
+        delta_params = masked
+    elif predictor_param_mode == "scale_mean":
+        masked = torch.zeros_like(delta_params)
+        masked[:, net.N:] = delta_params[:, net.N:]
+        delta_params = masked
+    elif predictor_param_mode == "all":
+        pass
+    else:
+        raise ValueError(f"unknown predictor_param_mode: {predictor_param_mode}")
+
+    params = params + delta_params
+    gate = getattr(net, "perceptual_gate", None)
+    if gate is not None:
+        gate_rho, _ = gate(z_cond)
+        params = torch.cat((params[:, :net.N] * gate_rho, params[:, net.N:]), dim=1)
+    return params
+
+
+def _encode_y_four_part(net, y: torch.Tensor, params: torch.Tensor):
+    q_enc, q_dec, scales, means = net.separate_prior(params)
+    common_params = net.y_spatial_prior_reduction(params)
+    dtype = y.dtype
+    device = y.device
+    b, c, h, w = y.size()
+    masks = net.get_mask_four_parts(b, c, h, w, dtype, device)
+    y_scaled = y * q_enc
+    y_hat_so_far = None
+    streams: List[ArithmeticStream] = []
+
+    for part_idx, mask in enumerate(masks):
+        if part_idx == 0:
+            cur_scales, cur_means = scales, means
+        else:
+            prior_in = torch.cat((y_hat_so_far, common_params), dim=1)
+            adaptor = (
+                net.y_spatial_prior_adaptor_1 if part_idx == 1
+                else net.y_spatial_prior_adaptor_2 if part_idx == 2
+                else net.y_spatial_prior_adaptor_3
+            )
+            cur_scales, cur_means = net.y_spatial_prior(adaptor(prior_in)).chunk(2, 1)
+
+        means_hat = cur_means * mask
+        y_res = (y_scaled - means_hat) * mask
+        y_q = torch.round(y_res)
+        active = mask > 0.5
+        stream = _encode_gaussian_symbols(y_q[active], cur_scales[active].clamp_min(1e-5))
+        streams.append(stream)
+
+        y_hat_part = y_q + means_hat
+        y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
+
+    y_hat = y_hat_so_far * q_dec
+    return streams, y_hat
+
+
+def _decode_y_four_part(net, payload: RealCodecPayload, params: torch.Tensor):
+    q_enc, q_dec, scales, means = net.separate_prior(params)
+    del q_enc
+    common_params = net.y_spatial_prior_reduction(params)
+    device = params.device
+    dtype = params.dtype
+    c, h, w = payload.y_shape
+    masks = net.get_mask_four_parts(1, c, h, w, dtype, device)
+    y_hat_so_far = None
+
+    for part_idx, (mask, stream) in enumerate(zip(masks, payload.y_streams)):
+        if part_idx == 0:
+            cur_scales, cur_means = scales, means
+        else:
+            prior_in = torch.cat((y_hat_so_far, common_params), dim=1)
+            adaptor = (
+                net.y_spatial_prior_adaptor_1 if part_idx == 1
+                else net.y_spatial_prior_adaptor_2 if part_idx == 2
+                else net.y_spatial_prior_adaptor_3
+            )
+            cur_scales, cur_means = net.y_spatial_prior(adaptor(prior_in)).chunk(2, 1)
+
+        active = mask > 0.5
+        y_q_part = torch.zeros((1, c, h, w), dtype=dtype, device=device)
+        decoded = _decode_gaussian_symbols(stream, cur_scales[active].clamp_min(1e-5))
+        y_q_part[active] = decoded.to(device=device, dtype=dtype)
+        y_hat_part = y_q_part + cur_means * mask
+        y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
+
+    return y_hat_so_far * q_dec
+
+
+@torch.no_grad()
+def compress_to_real_bitstream(
+    net,
+    x_padded: torch.Tensor,
+    q: int,
+    orig_hw: Tuple[int, int],
+    predictor_param_mode: str = "scale_mean",
+    predictor_delta_bound: float = 0.0,
+) -> Tuple[bytes, Dict[str, float]]:
+    """Encode a padded image tensor and return serialized payload bytes."""
+    curr_q_enc = net.q_enc[q:q + 1]
+    y_ori = net.vqgan.encoder(x_padded)
+    y = net.enc(y_ori, curr_q_enc)
+    z = net.hyper_enc(y)
+    z_indices = net.z_vq.get_indices(z).reshape(-1)
+    z_hat = net.z_vq.get_quan_feat(
+        z_indices.reshape(-1, 1),
+        (z.shape[0], z.shape[2], z.shape[3], z.shape[1]),
+    )
+
+    params = net.y_prior_fusion(net.hyper_dec(z_hat))
+    params = _apply_gp_reslc_params(net, z_hat, params, q, predictor_param_mode, predictor_delta_bound)
+    streams, _ = _encode_y_four_part(net, y, params)
+
+    z_bits = int(math.ceil(math.log2(net.codebook_size)))
+    z_data = _pack_fixed_width(z_indices, z_bits)
+    payload = RealCodecPayload(
+        q=q,
+        orig_hw=orig_hw,
+        padded_hw=(int(x_padded.shape[2]), int(x_padded.shape[3])),
+        y_shape=(int(y.shape[1]), int(y.shape[2]), int(y.shape[3])),
+        z_shape=(int(z.shape[2]), int(z.shape[3])),
+        z_count=int(z_indices.numel()),
+        z_data=z_data,
+        y_streams=streams,
+    )
+    payload_bytes = payload.to_bytes()
+    y_bytes = sum(len(s.data) for s in streams)
+    stream_header_bytes = len(streams) * STREAM_STRUCT.size
+    fixed_header_bytes = HEADER_STRUCT.size + stream_header_bytes
+    stats = {
+        "payload_bytes": float(len(payload_bytes)),
+        "header_bytes": float(fixed_header_bytes),
+        "z_bytes": float(len(z_data)),
+        "y_bytes": float(y_bytes),
+        "y_stream_count": float(len(streams)),
+    }
+    return payload_bytes, stats
+
+
+@torch.no_grad()
+def decompress_from_real_bitstream(
+    net,
+    payload_bytes: bytes,
+    predictor_param_mode: str = "scale_mean",
+    predictor_delta_bound: float = 0.0,
+) -> torch.Tensor:
+    """Decode a serialized payload and return padded reconstruction in [-1, 1]."""
+    payload = RealCodecPayload.from_bytes(payload_bytes)
+    device = next(net.parameters()).device
+    z_bits = int(math.ceil(math.log2(net.codebook_size)))
+    z_indices = _unpack_fixed_width(payload.z_data, payload.z_count, z_bits, device=device)
+    z_hat = net.z_vq.get_quan_feat(
+        z_indices.reshape(-1, 1),
+        (1, payload.z_shape[0], payload.z_shape[1], net.N),
+    )
+
+    params = net.y_prior_fusion(net.hyper_dec(z_hat))
+    params = _apply_gp_reslc_params(
+        net, z_hat, params, payload.q, predictor_param_mode, predictor_delta_bound)
+    y_hat = _decode_y_four_part(net, payload, params)
+    curr_q_dec = net.q_dec[payload.q:payload.q + 1]
+    latent = net.dec(y_hat, curr_q_dec)
+    return net.vqgan.generator(latent)
+
+
+def crop_to_original(x_hat_padded: torch.Tensor, orig_hw: Tuple[int, int]) -> torch.Tensor:
+    h, w = orig_hw
+    return x_hat_padded[..., :h, :w]
+
