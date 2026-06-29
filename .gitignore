@@ -1,4 +1,5 @@
 *.pyc
+__pycache__/
 *.pyd
 .vscode/
 .azureml/
@@ -21,6 +22,11 @@ wandb/
 outputs/
 experiments/**/q*/
 *.pt
+
+# Local dataset symlink/manifests. Canonical runtime tree: data/
+data/
+datasets/
+data_splits/
 data_subsets/
 experiments/
 proposal_design/

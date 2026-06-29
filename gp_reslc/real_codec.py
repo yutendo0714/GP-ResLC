@@ -222,39 +222,47 @@ def _apply_gp_reslc_params(
     predictor_param_mode: str,
     predictor_delta_bound: float,
 ):
-    if not hasattr(net, "prior_predictor") or net.prior_predictor is None:
-        return params
-    if predictor_param_mode == "latent_residual":
-        raise NotImplementedError("real codec currently supports mean/scale_mean/all GP-ResLC modes")
-
+    latent_mean_scaled: Optional[torch.Tensor] = None
     q_shift = getattr(net, "q_embed", None)
     z_cond = z_hat if q_shift is None else z_hat + q_shift[q:q + 1]
-    delta_params, _, _ = net.prior_predictor(z_cond)
-    if predictor_delta_bound and predictor_delta_bound > 0:
-        delta_params = predictor_delta_bound * torch.tanh(delta_params / predictor_delta_bound)
 
-    if predictor_param_mode == "mean":
-        masked = torch.zeros_like(delta_params)
-        masked[:, 2 * net.N:] = delta_params[:, 2 * net.N:]
-        delta_params = masked
-    elif predictor_param_mode == "scale_mean":
-        masked = torch.zeros_like(delta_params)
-        masked[:, net.N:] = delta_params[:, net.N:]
-        delta_params = masked
-    elif predictor_param_mode == "all":
-        pass
-    else:
-        raise ValueError(f"unknown predictor_param_mode: {predictor_param_mode}")
+    # Stage-aware modes do not use the global prior_predictor, but they still
+    # must see the same perceptual gate as train_forward before the four-part
+    # prior is evaluated. Skipping this made real-codec consistency checks
+    # compare against a different inference graph.
+    uses_stage_mode = predictor_param_mode in {"stage_quant_gate", "stage_latent_residual"}
+    if not uses_stage_mode:
+        if not hasattr(net, "prior_predictor") or net.prior_predictor is None:
+            if predictor_param_mode not in {"mean", "scale_mean", "all", "latent_residual"}:
+                raise ValueError(f"unknown predictor_param_mode: {predictor_param_mode}")
+        else:
+            delta_params, _, _ = net.prior_predictor(z_cond)
+            if predictor_delta_bound and predictor_delta_bound > 0:
+                delta_params = predictor_delta_bound * torch.tanh(delta_params / predictor_delta_bound)
 
-    params = params + delta_params
+            if predictor_param_mode == "latent_residual":
+                latent_mean_scaled = delta_params[:, 2 * net.N:]
+            elif predictor_param_mode == "mean":
+                masked = torch.zeros_like(delta_params)
+                masked[:, 2 * net.N:] = delta_params[:, 2 * net.N:]
+                params = params + masked
+            elif predictor_param_mode == "scale_mean":
+                masked = torch.zeros_like(delta_params)
+                masked[:, net.N:] = delta_params[:, net.N:]
+                params = params + masked
+            elif predictor_param_mode == "all":
+                params = params + delta_params
+            else:
+                raise ValueError(f"unknown predictor_param_mode: {predictor_param_mode}")
+
     gate = getattr(net, "perceptual_gate", None)
     if gate is not None:
         gate_rho, _ = gate(z_cond)
         params = torch.cat((params[:, :net.N] * gate_rho, params[:, net.N:]), dim=1)
-    return params
+    return params, latent_mean_scaled
 
 
-def _encode_y_four_part(net, y: torch.Tensor, params: torch.Tensor):
+def _encode_y_four_part(net, y: torch.Tensor, params: torch.Tensor, latent_mean_scaled: Optional[torch.Tensor] = None):
     q_enc, q_dec, scales, means = net.separate_prior(params)
     common_params = net.y_spatial_prior_reduction(params)
     dtype = y.dtype
@@ -277,7 +285,11 @@ def _encode_y_four_part(net, y: torch.Tensor, params: torch.Tensor):
             )
             cur_scales, cur_means = net.y_spatial_prior(adaptor(prior_in)).chunk(2, 1)
 
-        means_hat = cur_means * mask
+        if latent_mean_scaled is None:
+            cur_means_total = cur_means
+        else:
+            cur_means_total = cur_means + latent_mean_scaled
+        means_hat = cur_means_total * mask
         y_res = (y_scaled - means_hat) * mask
         y_q = torch.round(y_res)
         active = mask > 0.5
@@ -291,7 +303,158 @@ def _encode_y_four_part(net, y: torch.Tensor, params: torch.Tensor):
     return streams, y_hat
 
 
-def _decode_y_four_part(net, payload: RealCodecPayload, params: torch.Tensor):
+def _encode_y_four_part_stage_residual(net, y: torch.Tensor, params: torch.Tensor,
+                                      predictor_delta_bound: float = 0.0):
+    q_enc, q_dec, scales, means = net.separate_prior(params)
+    common_params = net.y_spatial_prior_reduction(params)
+    dtype = y.dtype
+    device = y.device
+    b, c, h, w = y.size()
+    masks = net.get_mask_four_parts(b, c, h, w, dtype, device)
+    y_scaled = y * q_enc
+    y_hat_so_far = None
+    streams: List[ArithmeticStream] = []
+
+    for part_idx, mask in enumerate(masks):
+        if part_idx == 0:
+            cur_scales, cur_means = scales, means
+            delta = net.stage_residual_predictor.forward_stage(0, common_params)
+        else:
+            prior_in = torch.cat((y_hat_so_far, common_params), dim=1)
+            adaptor = (
+                net.y_spatial_prior_adaptor_1 if part_idx == 1
+                else net.y_spatial_prior_adaptor_2 if part_idx == 2
+                else net.y_spatial_prior_adaptor_3
+            )
+            cur_scales, cur_means = net.y_spatial_prior(adaptor(prior_in)).chunk(2, 1)
+            delta = net.stage_residual_predictor.forward_stage(part_idx, common_params, y_hat_so_far)
+        if predictor_delta_bound and predictor_delta_bound > 0:
+            delta = predictor_delta_bound * torch.tanh(delta / predictor_delta_bound)
+
+        means_hat = (cur_means + delta) * mask
+        y_res = (y_scaled - means_hat) * mask
+        y_q = torch.round(y_res)
+        active = mask > 0.5
+        streams.append(_encode_gaussian_symbols(y_q[active], cur_scales[active].clamp_min(1e-5)))
+        y_hat_part = y_q + means_hat
+        y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
+
+    return streams, y_hat_so_far * q_dec
+
+
+def _encode_y_four_part_stage_quant_gate(net, y: torch.Tensor, params: torch.Tensor):
+    quant_step, scales, means = params.chunk(3, 1)
+    quant_step = quant_step.clamp_min(0.5)
+    common_params = net.y_spatial_prior_reduction(params)
+    dtype = y.dtype
+    device = y.device
+    b, c, h, w = y.size()
+    masks = net.get_mask_four_parts(b, c, h, w, dtype, device)
+    y_hat_so_far = None
+    q_dec_map = torch.zeros_like(quant_step)
+    streams: List[ArithmeticStream] = []
+
+    for part_idx, mask in enumerate(masks):
+        if part_idx == 0:
+            cur_scales, cur_means = scales, means
+            rho, _ = net.stage_quant_gate.forward_stage(0, common_params)
+        else:
+            prior_in = torch.cat((y_hat_so_far, common_params), dim=1)
+            adaptor = (
+                net.y_spatial_prior_adaptor_1 if part_idx == 1
+                else net.y_spatial_prior_adaptor_2 if part_idx == 2
+                else net.y_spatial_prior_adaptor_3
+            )
+            cur_scales, cur_means = net.y_spatial_prior(adaptor(prior_in)).chunk(2, 1)
+            rho, _ = net.stage_quant_gate.forward_stage(part_idx, common_params, y_hat_so_far)
+
+        q_enc = 1.0 / (quant_step * rho)
+        q_dec_map = q_dec_map + quant_step * rho * mask
+        means_hat = cur_means * mask
+        y_res = (y * q_enc - means_hat) * mask
+        y_q = torch.round(y_res)
+        active = mask > 0.5
+        streams.append(_encode_gaussian_symbols(y_q[active], cur_scales[active].clamp_min(1e-5)))
+        y_hat_part = y_q + means_hat
+        y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
+
+    return streams, y_hat_so_far * q_dec_map
+
+
+def _decode_y_four_part_stage_residual(net, payload: RealCodecPayload, params: torch.Tensor,
+                                      predictor_delta_bound: float = 0.0):
+    q_enc, q_dec, scales, means = net.separate_prior(params)
+    del q_enc
+    common_params = net.y_spatial_prior_reduction(params)
+    device = params.device
+    dtype = params.dtype
+    c, h, w = payload.y_shape
+    masks = net.get_mask_four_parts(1, c, h, w, dtype, device)
+    y_hat_so_far = None
+
+    for part_idx, (mask, stream) in enumerate(zip(masks, payload.y_streams)):
+        if part_idx == 0:
+            cur_scales, cur_means = scales, means
+            delta = net.stage_residual_predictor.forward_stage(0, common_params)
+        else:
+            prior_in = torch.cat((y_hat_so_far, common_params), dim=1)
+            adaptor = (
+                net.y_spatial_prior_adaptor_1 if part_idx == 1
+                else net.y_spatial_prior_adaptor_2 if part_idx == 2
+                else net.y_spatial_prior_adaptor_3
+            )
+            cur_scales, cur_means = net.y_spatial_prior(adaptor(prior_in)).chunk(2, 1)
+            delta = net.stage_residual_predictor.forward_stage(part_idx, common_params, y_hat_so_far)
+        if predictor_delta_bound and predictor_delta_bound > 0:
+            delta = predictor_delta_bound * torch.tanh(delta / predictor_delta_bound)
+
+        active = mask > 0.5
+        y_q_part = torch.zeros((1, c, h, w), dtype=dtype, device=device)
+        decoded = _decode_gaussian_symbols(stream, cur_scales[active].clamp_min(1e-5))
+        y_q_part[active] = decoded.to(device=device, dtype=dtype)
+        y_hat_part = y_q_part + (cur_means + delta) * mask
+        y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
+
+    return y_hat_so_far * q_dec
+
+
+def _decode_y_four_part_stage_quant_gate(net, payload: RealCodecPayload, params: torch.Tensor):
+    quant_step, scales, means = params.chunk(3, 1)
+    quant_step = quant_step.clamp_min(0.5)
+    common_params = net.y_spatial_prior_reduction(params)
+    device = params.device
+    dtype = params.dtype
+    c, h, w = payload.y_shape
+    masks = net.get_mask_four_parts(1, c, h, w, dtype, device)
+    y_hat_so_far = None
+    q_dec_map = torch.zeros((1, c, h, w), dtype=dtype, device=device)
+
+    for part_idx, (mask, stream) in enumerate(zip(masks, payload.y_streams)):
+        if part_idx == 0:
+            cur_scales, cur_means = scales, means
+            rho, _ = net.stage_quant_gate.forward_stage(0, common_params)
+        else:
+            prior_in = torch.cat((y_hat_so_far, common_params), dim=1)
+            adaptor = (
+                net.y_spatial_prior_adaptor_1 if part_idx == 1
+                else net.y_spatial_prior_adaptor_2 if part_idx == 2
+                else net.y_spatial_prior_adaptor_3
+            )
+            cur_scales, cur_means = net.y_spatial_prior(adaptor(prior_in)).chunk(2, 1)
+            rho, _ = net.stage_quant_gate.forward_stage(part_idx, common_params, y_hat_so_far)
+
+        active = mask > 0.5
+        y_q_part = torch.zeros((1, c, h, w), dtype=dtype, device=device)
+        decoded = _decode_gaussian_symbols(stream, cur_scales[active].clamp_min(1e-5))
+        y_q_part[active] = decoded.to(device=device, dtype=dtype)
+        q_dec_map = q_dec_map + quant_step * rho * mask
+        y_hat_part = y_q_part + cur_means * mask
+        y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
+
+    return y_hat_so_far * q_dec_map
+
+
+def _decode_y_four_part(net, payload: RealCodecPayload, params: torch.Tensor, latent_mean_scaled: Optional[torch.Tensor] = None):
     q_enc, q_dec, scales, means = net.separate_prior(params)
     del q_enc
     common_params = net.y_spatial_prior_reduction(params)
@@ -317,7 +480,11 @@ def _decode_y_four_part(net, payload: RealCodecPayload, params: torch.Tensor):
         y_q_part = torch.zeros((1, c, h, w), dtype=dtype, device=device)
         decoded = _decode_gaussian_symbols(stream, cur_scales[active].clamp_min(1e-5))
         y_q_part[active] = decoded.to(device=device, dtype=dtype)
-        y_hat_part = y_q_part + cur_means * mask
+        if latent_mean_scaled is None:
+            cur_means_total = cur_means
+        else:
+            cur_means_total = cur_means + latent_mean_scaled
+        y_hat_part = y_q_part + cur_means_total * mask
         y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
 
     return y_hat_so_far * q_dec
@@ -344,8 +511,14 @@ def compress_to_real_bitstream(
     )
 
     params = net.y_prior_fusion(net.hyper_dec(z_hat))
-    params = _apply_gp_reslc_params(net, z_hat, params, q, predictor_param_mode, predictor_delta_bound)
-    streams, _ = _encode_y_four_part(net, y, params)
+    params, latent_mean_scaled = _apply_gp_reslc_params(
+        net, z_hat, params, q, predictor_param_mode, predictor_delta_bound)
+    if predictor_param_mode == "stage_quant_gate":
+        streams, _ = _encode_y_four_part_stage_quant_gate(net, y, params)
+    elif predictor_param_mode == "stage_latent_residual":
+        streams, _ = _encode_y_four_part_stage_residual(net, y, params, predictor_delta_bound)
+    else:
+        streams, _ = _encode_y_four_part(net, y, params, latent_mean_scaled)
 
     z_bits = int(math.ceil(math.log2(net.codebook_size)))
     z_data = _pack_fixed_width(z_indices, z_bits)
@@ -391,9 +564,14 @@ def decompress_from_real_bitstream(
     )
 
     params = net.y_prior_fusion(net.hyper_dec(z_hat))
-    params = _apply_gp_reslc_params(
+    params, latent_mean_scaled = _apply_gp_reslc_params(
         net, z_hat, params, payload.q, predictor_param_mode, predictor_delta_bound)
-    y_hat = _decode_y_four_part(net, payload, params)
+    if predictor_param_mode == "stage_quant_gate":
+        y_hat = _decode_y_four_part_stage_quant_gate(net, payload, params)
+    elif predictor_param_mode == "stage_latent_residual":
+        y_hat = _decode_y_four_part_stage_residual(net, payload, params, predictor_delta_bound)
+    else:
+        y_hat = _decode_y_four_part(net, payload, params, latent_mean_scaled)
     curr_q_dec = net.q_dec[payload.q:payload.q + 1]
     latent = net.dec(y_hat, curr_q_dec)
     return net.vqgan.generator(latent)

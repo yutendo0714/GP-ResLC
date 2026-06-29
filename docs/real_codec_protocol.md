@@ -132,7 +132,7 @@ Protocol: combined CLIC2020 test at original resolution: `/dpl/clic/professional
 
 Artifacts:
 
-- Combined input symlink set: `datasets/clic2020_test/`
+- Combined input symlink set: `data/clic2020_test_combined/`
 - GLC payload/recon: `experiments/real_codec/clic2020_test_glc/`
 - GP-ResLC payload/recon: `experiments/real_codec/clic2020_test_gp_reslc_rho116/`
 - Metrics CSV: `experiments/real_codec/clic2020_test_real_metrics.csv`

@@ -30,6 +30,7 @@
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 try:
     # GLC のブロックを流用（リポジトリ直下から import する想定）
@@ -81,6 +82,217 @@ class PriorPredictor(nn.Module):
         delta_params = self.gate(sem)  # 3N: GLC prior への加算補正（zero-init）
         mu_pred = self.to_mu(sem)      # μ_θ(s): 生成器が復元する潜在の予測
         return delta_params, mu_pred, feat
+
+
+class StageResidualPredictor(nn.Module):
+    """Decoder-recomputable mean correction for each four-part prior stage.
+
+    Stage 0 can only use the hyperprior-derived common parameters. Stages 1-3
+    can also use y_hat_so_far, which is already decoded at that point. Therefore
+    these corrections can be used in the real arithmetic codec without sending
+    extra side information.
+    """
+
+    def __init__(self, N: int = 256):
+        super().__init__()
+        assert DepthConvBlock is not None, "GLC リポジトリ直下で import してください。"
+        self.stage0 = nn.Sequential(
+            DepthConvBlock(N, N),
+            zero_module(nn.Conv2d(N, N, 1)),
+        )
+        self.stages = nn.ModuleList([
+            nn.Sequential(
+                DepthConvBlock(N * 2, N),
+                DepthConvBlock(N, N),
+                zero_module(nn.Conv2d(N, N, 1)),
+            )
+            for _ in range(3)
+        ])
+
+    def forward_stage(self, stage_idx: int, common_params: torch.Tensor,
+                      y_hat_so_far: torch.Tensor | None = None) -> torch.Tensor:
+        if stage_idx == 0:
+            return self.stage0(common_params)
+        if y_hat_so_far is None:
+            raise ValueError("y_hat_so_far is required for stages 1-3")
+        return self.stages[stage_idx - 1](torch.cat((y_hat_so_far, common_params), dim=1))
+
+
+class StageQuantGate(nn.Module):
+    """Stage-aware decoder-recomputable quantization gate.
+
+    The gate predicts rho >= 1 for each four-part prior stage. Larger rho means
+    a larger quant_step, so predictable residual locations are sent with lower
+    precision without transmitting an additional mask.
+    """
+
+    def __init__(self, N: int = 256, rho_max: float = 1.5, softplus_shift: float = 2.0,
+                 softplus_tau: float = 1.0):
+        super().__init__()
+        assert DepthConvBlock is not None, "GLC リポジトリ直下で import してください。"
+        self.rho_max = rho_max
+        self.softplus_shift = softplus_shift
+        self.softplus_tau = softplus_tau
+        self.stage0 = nn.Sequential(
+            DepthConvBlock(N, N),
+            zero_module(nn.Conv2d(N, 1, 1)),
+        )
+        self.stages = nn.ModuleList([
+            nn.Sequential(
+                DepthConvBlock(N * 2, N),
+                DepthConvBlock(N, N),
+                zero_module(nn.Conv2d(N, 1, 1)),
+            )
+            for _ in range(3)
+        ])
+
+    def _rho_from_raw(self, raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        p_tex = torch.sigmoid(raw)
+        shift = raw.new_tensor(self.softplus_shift)
+        tau = max(float(self.softplus_tau), 1e-6)
+        excess = F.softplus(raw + shift) - F.softplus(shift)
+        excess = excess.clamp_min(0.0)
+        rho = 1.0 + (self.rho_max - 1.0) * (1.0 - torch.exp(-excess / tau))
+        return rho, p_tex
+
+    def forward_stage(self, stage_idx: int, common_params: torch.Tensor,
+                      y_hat_so_far: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        if stage_idx == 0:
+            raw = self.stage0(common_params)
+        else:
+            if y_hat_so_far is None:
+                raise ValueError("y_hat_so_far is required for stages 1-3")
+            raw = self.stages[stage_idx - 1](torch.cat((y_hat_so_far, common_params), dim=1))
+        return self._rho_from_raw(raw)
+
+
+def forward_four_part_prior_with_stage_quant_gate(net, y, common_params, stage_gate):
+    """GLC four-part prior with stage-aware quant_step modulation."""
+    quant_step, scales, means = common_params.chunk(3, 1)
+    quant_step = quant_step.clamp_min(0.5)
+    if net.y_spatial_prior_reduction is not None:
+        common_params_reduced = net.y_spatial_prior_reduction(common_params)
+    else:
+        common_params_reduced = common_params
+
+    dtype = y.dtype
+    device = y.device
+    B, C, H, W = y.size()
+    mask_0, mask_1, mask_2, mask_3 = net.get_mask_four_parts(B, C, H, W, dtype, device)
+
+    rho_0, p_0 = stage_gate.forward_stage(0, common_params_reduced)
+    q_enc_0 = 1.0 / (quant_step * rho_0)
+    q_dec_map = quant_step * rho_0 * mask_0
+    y_res_0, y_q_0, y_hat_0, s_hat_0 = net.process_with_mask(
+        y * q_enc_0, scales, means, mask_0)
+
+    y_hat_so_far = y_hat_0
+    params = torch.cat((y_hat_so_far, common_params_reduced), dim=1)
+    scales, means = net.y_spatial_prior(net.y_spatial_prior_adaptor_1(params)).chunk(2, 1)
+    rho_1, p_1 = stage_gate.forward_stage(1, common_params_reduced, y_hat_so_far)
+    q_enc_1 = 1.0 / (quant_step * rho_1)
+    q_dec_map = q_dec_map + quant_step * rho_1 * mask_1
+    y_res_1, y_q_1, y_hat_1, s_hat_1 = net.process_with_mask(
+        y * q_enc_1, scales, means, mask_1)
+
+    y_hat_so_far = y_hat_so_far + y_hat_1
+    params = torch.cat((y_hat_so_far, common_params_reduced), dim=1)
+    scales, means = net.y_spatial_prior(net.y_spatial_prior_adaptor_2(params)).chunk(2, 1)
+    rho_2, p_2 = stage_gate.forward_stage(2, common_params_reduced, y_hat_so_far)
+    q_enc_2 = 1.0 / (quant_step * rho_2)
+    q_dec_map = q_dec_map + quant_step * rho_2 * mask_2
+    y_res_2, y_q_2, y_hat_2, s_hat_2 = net.process_with_mask(
+        y * q_enc_2, scales, means, mask_2)
+
+    y_hat_so_far = y_hat_so_far + y_hat_2
+    params = torch.cat((y_hat_so_far, common_params_reduced), dim=1)
+    scales, means = net.y_spatial_prior(net.y_spatial_prior_adaptor_3(params)).chunk(2, 1)
+    rho_3, p_3 = stage_gate.forward_stage(3, common_params_reduced, y_hat_so_far)
+    q_enc_3 = 1.0 / (quant_step * rho_3)
+    q_dec_map = q_dec_map + quant_step * rho_3 * mask_3
+    y_res_3, y_q_3, y_hat_3, s_hat_3 = net.process_with_mask(
+        y * q_enc_3, scales, means, mask_3)
+
+    y_res = (y_res_0 + y_res_1) + (y_res_2 + y_res_3)
+    y_q = (y_q_0 + y_q_1) + (y_q_2 + y_q_3)
+    y_hat = y_hat_so_far + y_hat_3
+    scales_hat = (s_hat_0 + s_hat_1) + (s_hat_2 + s_hat_3)
+    rho_map = rho_0 * mask_0 + rho_1 * mask_1 + rho_2 * mask_2 + rho_3 * mask_3
+    p_map = p_0 * mask_0 + p_1 * mask_1 + p_2 * mask_2 + p_3 * mask_3
+    y_hat = y_hat * q_dec_map
+    return y_res, y_q, y_hat, scales_hat, rho_map, p_map
+
+
+def _bound_delta(delta: torch.Tensor, bound: float) -> torch.Tensor:
+    if bound and bound > 0:
+        return bound * torch.tanh(delta / bound)
+    return delta
+
+
+def forward_four_part_prior_with_stage_residual(net, y, common_params, stage_predictor,
+                                                predictor_delta_bound: float = 0.0):
+    """GLC four-part prior with stage-aware decoder-recomputable residual means."""
+    q_enc, q_dec, scales, means = net.separate_prior(common_params)
+    if net.y_spatial_prior_reduction is not None:
+        common_params_reduced = net.y_spatial_prior_reduction(common_params)
+    else:
+        common_params_reduced = common_params
+
+    dtype = y.dtype
+    device = y.device
+    B, C, H, W = y.size()
+    mask_0, mask_1, mask_2, mask_3 = net.get_mask_four_parts(B, C, H, W, dtype, device)
+    y_scaled = y * q_enc
+    stage_pred_losses = []
+    stage_pred_abs_vals = []
+    stage_target_abs_vals = []
+
+    def add_stage_stats(delta, target, mask):
+        active = mask > 0.5
+        delta_active = delta[active]
+        target_active = target.detach()[active]
+        stage_pred_losses.append(F.smooth_l1_loss(delta_active, target_active))
+        stage_pred_abs_vals.append(delta_active.detach().abs().mean())
+        stage_target_abs_vals.append(target_active.detach().abs().mean())
+
+    delta_0 = _bound_delta(stage_predictor.forward_stage(0, common_params_reduced), predictor_delta_bound)
+    add_stage_stats(delta_0, y_scaled - means, mask_0)
+    y_res_0, y_q_0, y_hat_0, s_hat_0 = net.process_with_mask(
+        y_scaled, scales, means + delta_0, mask_0)
+
+    y_hat_so_far = y_hat_0
+    params = torch.cat((y_hat_so_far, common_params_reduced), dim=1)
+    scales, means = net.y_spatial_prior(net.y_spatial_prior_adaptor_1(params)).chunk(2, 1)
+    delta_1 = _bound_delta(stage_predictor.forward_stage(1, common_params_reduced, y_hat_so_far), predictor_delta_bound)
+    add_stage_stats(delta_1, y_scaled - means, mask_1)
+    y_res_1, y_q_1, y_hat_1, s_hat_1 = net.process_with_mask(
+        y_scaled, scales, means + delta_1, mask_1)
+
+    y_hat_so_far = y_hat_so_far + y_hat_1
+    params = torch.cat((y_hat_so_far, common_params_reduced), dim=1)
+    scales, means = net.y_spatial_prior(net.y_spatial_prior_adaptor_2(params)).chunk(2, 1)
+    delta_2 = _bound_delta(stage_predictor.forward_stage(2, common_params_reduced, y_hat_so_far), predictor_delta_bound)
+    add_stage_stats(delta_2, y_scaled - means, mask_2)
+    y_res_2, y_q_2, y_hat_2, s_hat_2 = net.process_with_mask(
+        y_scaled, scales, means + delta_2, mask_2)
+
+    y_hat_so_far = y_hat_so_far + y_hat_2
+    params = torch.cat((y_hat_so_far, common_params_reduced), dim=1)
+    scales, means = net.y_spatial_prior(net.y_spatial_prior_adaptor_3(params)).chunk(2, 1)
+    delta_3 = _bound_delta(stage_predictor.forward_stage(3, common_params_reduced, y_hat_so_far), predictor_delta_bound)
+    add_stage_stats(delta_3, y_scaled - means, mask_3)
+    y_res_3, y_q_3, y_hat_3, s_hat_3 = net.process_with_mask(
+        y_scaled, scales, means + delta_3, mask_3)
+
+    y_res = (y_res_0 + y_res_1) + (y_res_2 + y_res_3)
+    y_q = (y_q_0 + y_q_1) + (y_q_2 + y_q_3)
+    y_hat = y_hat_so_far + y_hat_3
+    scales_hat = (s_hat_0 + s_hat_1) + (s_hat_2 + s_hat_3)
+    y_hat = y_hat * q_dec
+    stage_delta_abs = torch.stack(stage_pred_abs_vals).mean()
+    stage_target_abs = torch.stack(stage_target_abs_vals).mean()
+    stage_mean_pred_loss = torch.stack(stage_pred_losses).mean()
+    return y_res, y_q, y_hat, scales_hat, stage_delta_abs, stage_target_abs, stage_mean_pred_loss
 
 
 
@@ -252,7 +464,12 @@ def train_forward(net, x, q_index, use_predictor: bool = True, gate=None, q_shif
     delta_params = None
     latent_pred_scaled = None
     latent_pred = None
-    if use_predictor:
+    stage_delta_abs = None
+    stage_target_abs = None
+    stage_mean_pred_loss = None
+    use_stage_residual = use_predictor and predictor_param_mode == "stage_latent_residual"
+    use_stage_quant_gate = use_predictor and predictor_param_mode == "stage_quant_gate"
+    if use_predictor and not use_stage_residual and not use_stage_quant_gate:
         delta_params, mu_pred, _ = net.prior_predictor(z_cond)
         if predictor_delta_bound and predictor_delta_bound > 0:
             delta_params = predictor_delta_bound * torch.tanh(delta_params / predictor_delta_bound)
@@ -283,7 +500,14 @@ def train_forward(net, x, q_index, use_predictor: bool = True, gate=None, q_shif
         params = torch.cat((params[:, :net.N] * gate_rho, params[:, net.N:]), dim=1)
     params_after = params
 
-    if latent_pred_scaled is not None:
+    if use_stage_quant_gate:
+        y_res, y_q, y_hat, scales_hat, gate_rho, gate_p_tex = forward_four_part_prior_with_stage_quant_gate(
+            net, y, params, net.stage_quant_gate)
+    elif use_stage_residual:
+        (y_res, y_q, y_hat, scales_hat, stage_delta_abs,
+         stage_target_abs, stage_mean_pred_loss) = forward_four_part_prior_with_stage_residual(
+            net, y, params, net.stage_residual_predictor, predictor_delta_bound)
+    elif latent_pred_scaled is not None:
         y_res, y_q, y_hat, scales_hat = forward_four_part_prior_with_latent_mean(
             net, y, params, latent_pred_scaled)
     else:
@@ -304,4 +528,7 @@ def train_forward(net, x, q_index, use_predictor: bool = True, gate=None, q_shif
             "params_base": params_base, "params_after": params_after,
             "latent_pred_scaled": latent_pred_scaled, "latent_pred": latent_pred,
             "gate_rho": gate_rho, "gate_p_tex": gate_p_tex,
+            "stage_delta_abs": stage_delta_abs,
+            "stage_target_abs": stage_target_abs,
+            "stage_mean_pred_loss": stage_mean_pred_loss,
             "y_res": y_res, "y_q": y_q, "scales_hat": scales_hat}

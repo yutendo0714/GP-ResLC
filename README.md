@@ -12,6 +12,16 @@
 
 Official Implementation of GLC, Generative Latent Coding for Ultra-Low Bitrate Image Compression, accepted at CVPR 2024, with an extension to video compression in TCSVT.
 
+## GP-ResLC Research Overlay
+
+This local workspace also contains GP-ResLC research additions on top of the
+official GLC implementation. Start from:
+
+- `docs/project_structure.md` for the cleaned project tree and data paths.
+- `docs/research_priority.md` for the pretrained-vs-scratch research priority.
+- `scripts/README.md` for stable training, evaluation, analysis, and paper
+  script entrypoints.
+
 ## Introduction
 
 Most existing approaches for image and video compression perform transform coding in the pixel space to reduce redundancy. However, due to the misalignment between the pixel space distortion and human perception, such schemes often face the difficulties in achieving both high-realism and high-fidelity at ultra-low bitrate. To solve this problem, we propose Generative Latent Coding (GLC) models for image and video compression, termed GLC-image and GLC-Video. The transform coding of GLC is conducted in the latent space of a generative vector quantized variational auto-encoder (VQ-VAE). Compared to the pixel-space, such a latent space offers greater sparsity, richer semantics and better alignment with human perception, and show its advantages in achieving high-realism and high-fidelity compression. To further enhance performance, we improve the hyper prior by introducing a spatial categorical hyper module in GLC-image and a spatio-temporal categorical hyper module in GLC-video. Additionally, the code-prediction-based loss function is proposed to enhance the semantic consistency. Experiments demonstrate that our scheme shows high visual quality at ultra low bitrate for both image and video compression. For image compression, GLC-image achieves an impressive bitrate of less than 0.04 bpp, achieving the same FID as previous SOTA model MS-ILLM while using 45% fewer bitrate on the CLIC 2020 test set. For video compression, GLC-video achieves 65.3% bitrate saving over PLVC in terms of DISTS.

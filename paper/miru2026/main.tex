@@ -1,0 +1,320 @@
+% MIRU2026 paper draft for GP-ResLC.
+% Official template: https://miru-committee.github.io/miru2026/author/submission/
+\documentclass[MIRU,submit]{miru2026j}
+\usepackage[dvipdfmx]{graphicx}
+\usepackage{amsmath}
+\usepackage{url}
+
+\begin{document}
+
+\title{復号側で再計算可能な量子化倍率による\\
+超低ビットレート生成型画像圧縮}
+
+% TODO: replace author names, affiliations, and email before submission.
+\affiliate{AffilA}{所属未設定}
+\author{著者名未設定}{Author Name}{AffilA}[email@example.com]
+
+\maketitle
+
+\section*{概要}
+画像圧縮は，画像を少ないビット列で表し，復元時の劣化をできるだけ小さくする問題である．
+近年は，ニューラルネットワークで画像を潜在表現へ変換し，その潜在表現の確率を学習して符号化する learned image compression が発展している．
+特に低ビットレートでは，画素値を忠実に近づけるだけでなく，人間にとって自然に見える復元画像を得ることが重要になる．
+生成型画像圧縮では，復号側の生成器が画像らしい構造やテクスチャを補完できるため，すべての潜在情報を同じ精度で送信することは非効率である．
+本稿では，訓練済みGLCを基盤とし，復号側で再計算可能な量子化倍率を導入する GP-ResLC を提案する．
+提案手法は，すでに送信済みの hyper潜在と品質インデックスから主潜在と同じサイズの倍率を推定するため，重要度マップを追加の補助情報として送信しない．
+倍率が大きい位置では主潜在残差を粗く量子化し，倍率が 1 に近い位置では GLC に近い精度を保つ．
+これにより，GLCのVQGAN/VQ-VAE復号器による生成潜在復元能力を保ったまま，算術符号化される主潜在表現の符号長を削減する．
+CLIC2020 test，DIV2K validation，Kodak で評価し，DISTS/FID を中心とする知覚品質を保った bpp削減を確認した．
+
+\section{はじめに}
+画像圧縮の目的は，画像をできるだけ短いビット列で表し，復号後の画像を元画像に近づけることである．
+Learned image compression (LIC) では，この処理をニューラルネットワークで学習する．
+具体的には，符号化器が画像を特徴量である潜在表現へ変換し，その潜在表現を量子化した上で，確率モデルに基づいて符号化する．
+確率モデルが「出現しやすい」と判断した値には短い符号が割り当てられ，「出現しにくい」と判断した値には長い符号が必要になる．
+そのため，潜在表現の分布を正確に推定する確率モデリングが圧縮性能を大きく左右する．
+
+この文脈で，Hyperpriorは，主潜在表現とは別の hyper潜在から分布パラメータを推定することで符号長を削減する\cite{balle2018}．
+Autoregressive priorは，すでに復号済みの近傍潜在を文脈情報として利用し，さらに精密な分布推定を行う\cite{minnen2018}．
+また，Gaussian mixture likelihoodやattention module を導入したモデルは，より柔軟な 潜在分布の確率モデリングを実現した\cite{cheng2020}．
+これらは，いずれも潜在表現をどれだけ短く正確に符号化できるかを改善する流れである．
+
+一方，ビット数が極端に限られる低ビットレート領域では，画像の全ての構造やテクスチャを忠実に送ることはできない．
+この領域では，画素誤差を一様に小さくするだけでは復元画像がぼけやすく，人間の知覚に自然な画像から離れる場合がある．
+Rate-distortion-perception trade-off の観点からも，低ビットレート圧縮では画素単位の歪みだけでなく，復元画像が自然画像としてどれだけもっともらしいかが重要である\cite{blau2019}．
+
+この観点から，HiFiC のような生成型画像圧縮が注目されている\cite{mentzer2020}．
+生成型画像圧縮では，全ての詳細をビット列で送るのではなく，復号側の生成器が画像らしい構造やテクスチャを補完する．
+GLC は，VQGAN\cite{esser2021} や VQ-VAE\cite{oord2017} に基づく生成潜在空間上で変換符号化を行い，超低ビットレート自然画像圧縮で高い知覚品質を示した\cite{jia2024}．
+しかし，訓練済みGLCをそのまま用いる場合，主潜在表現 $y$ のすべての位置で同じ設計の量子化精度を使うため，生成器が補いやすい残差にも符号長が割かれる可能性がある．
+一方で，priorが予測しにくい残差は符号長が大きくなりやすく，限られた符号量では十分な量子化精度を保ちにくい．
+したがって，単に予測困難な残差へビットを割り当てるのではなく，生成器が補える領域の残差精度を下げ，構造や知覚品質に効く領域を相対的に保護することが重要である．
+
+本稿では，提案手法 GP-ResLC として，訓練済み GLC に復号側で再計算可能な量子化倍率を導入する．
+提案手法は符号化器側でのみ計算可能な重要度マップを送らず，すでに送信済みの hyper潜在 $\hat{z}$ と品質インデックス $q$ から同じ倍率を復号側で再計算する．
+これにより，GLCの生成潜在空間を保ったまま，算術符号化される主潜在表現の符号長を削減する．
+本稿の貢献は，(1) 追加の重要度マップなしに，復号済み情報から重要度に応じた量子化倍率を生成するネットワークを構成したこと，(2) 複数のベンチマークにおいて，訓練済み GLC に対する知覚品質中心の符号量-品質曲線の改善を示したことである．
+
+\section{関連研究と位置づけ}
+LIC では，入力画像 $\mathbf{x}$ を解析変換で潜在表現 $\mathbf{y}$ へ写像し，量子化後の $\hat{\mathbf{y}}$ をエントロピー符号化モデルにより符号化する．
+復号側では $\hat{\mathbf{y}}$ から合成変換により復元画像 $\hat{\mathbf{x}}$ を得る．
+Hyperprior\cite{balle2018}，autoregressive prior\cite{minnen2018}，Gaussian mixture likelihood\cite{cheng2020} は，いずれも潜在分布の推定精度を上げることで算術符号化に必要なビット数を減らす流れである．
+
+生成型圧縮では，すべての画像詳細をビット列で送るのではなく，復元側の生成能力に一部を委ねる．
+HiFiC は GAN損失を用いた生成型画像圧縮により，低ビットレートで自然な復元を目指した\cite{mentzer2020}．
+GLC は，VQGAN\cite{esser2021} や VQ-VAE\cite{oord2017} により学習した生成潜在空間を符号化対象とし，categorical hyper module や コード予測の補助教師信号を用いて，超低ビットレートで高い知覚品質を実現する\cite{jia2024}．
+GLC の強みは，画素空間の細部ではなく，人間知覚に整合しやすい生成潜在表現を符号化する点にある．
+
+本研究は GLC を置き換える新しい生成復号器を提案するものではない．
+むしろ，訓練済みGLCを強い生成型圧縮モデルとして利用し，その潜在表現のビット割り当てを見直す．
+空間適応量子化や重要度マップに基づくビット割り当ては既存にも多いが，符号化器側の画像依存マップを送る方式では，超低ビットレートで補助情報の負担が無視できない場合がある．
+GP-ResLC では，制御信号を復号側で再計算可能な $\hat{\mathbf{z}}$ と $q$ に制限する．
+したがって，追加の重要度マップなしで GLCの復号処理と整合する量子化倍率制御を行える．
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/glc_gp_reslc_unified_overview.png}
+\caption{GLC圧縮モデルと GP-ResLC の概要．上段は GLCの主潜在表現 $\mathbf{y}$ と hyper潜在 $\hat{\mathbf{z}}$ の符号化経路，下段は訓練済みGLCに追加する復号側再計算可能な量子化倍率を示す．GP-ResLCは追加の重要度マップなしで 算術符号化された主潜在表現 $\mathbf{y}$ のビット列の符号長を削減する．}
+\label{fig:overview}
+\end{figure}
+
+\section{提案手法}
+\subsection{GLC における主潜在符号化}
+入力画像を $\mathbf{x}$，GLCの主潜在表現を $\mathbf{y}$，hyper潜在を $\mathbf{z}$ とする．
+GLC は量子化された $\hat{\mathbf{z}}$ から hyper復号器を通して，$\mathbf{y}$ を符号化するための確率分布パラメータを推定する．
+主潜在表現 $\mathbf{y}$ は4分割priorにより 4 つの互いに重ならない空間マスクに分割され，順番に符号化・復号される．
+第 1 部分は hyperprior 由来の共通パラメータから符号化され，第 2 部分以降はすでに復号済みの $\hat{\mathbf{y}}$ の一部を文脈情報として用いてスケールと平均を更新する．
+これにより，GLC は hyperprior と 自己回帰的な文脈情報 の両方を使って $\mathbf{y}$ の確率分布を推定する．
+
+通常の GLC では，ある段階における prior 平均を $\boldsymbol{\mu}_{\mathrm{GLC}}$，スケールを $\boldsymbol{\sigma}_{\mathrm{GLC}}$，量子化ステップを $\mathbf{Q}_{\mathrm{GLC}}$ とし，主潜在をこの prior の周りの残差として符号化する．
+Priorがよく予測できる値は短く符号化される一方，priorが予測しにくい値は高い符号長を要する．
+超低ビットレートでは，このような難しい残差にすでに多くの符号長が必要になるだけでなく，量子化ステップを十分細かくできないため，復元時には粗い残差としてしか送れない場合がある．
+したがって問題は，priorで予測困難な残差に単純に多くのビットを割くことではなく，限られた符号長の中で，どの残差精度を下げても知覚品質を大きく損なわないかを判断することにある．
+
+\subsection{復号側で再計算可能な量子化倍率}
+提案手法 GP-ResLC では，GLCの符号化器，復号器，hyperprior，4分割文脈priorを保持したまま，主潜在表現 $\mathbf{y}$ の符号化直前に量子化倍率 $\boldsymbol{\rho}_\theta$ を導入する．
+倍率は，ビット列から復号可能な $\hat{\mathbf{z}}$ と 品質インデックス $q$ から計算される．
+\begin{equation}
+\boldsymbol{\rho}_\theta = f_\theta(\hat{\mathbf{z}}, q), \quad
+\boldsymbol{\rho}_\theta \in [1,\rho_{\max}]^{C_y \times H_y \times W_y} .
+\end{equation}
+ここで $\boldsymbol{\rho}_\theta$ は $\mathbf{y}$ と同じサイズで定義される量子化倍率であり，各要素は 1 以上である．
+実装では1チャネルの空間マップを推定し，チャネル方向に複製することで同じサイズの倍率として用いる．
+この倍率により，GLCの量子化ステップを要素ごとに変調する．
+\begin{equation}
+\mathbf{Q}_{\mathrm{GP}} = \mathbf{Q}_{\mathrm{GLC}} \odot \boldsymbol{\rho}_\theta .
+\end{equation}
+$\boldsymbol{\rho}_\theta$ が大きい位置では量子化ステップが大きくなり，対応する残差値は粗く量子化されるため，算術符号化される主潜在表現の符号長が短くなりやすい．
+一方，$\boldsymbol{\rho}_\theta$ が 1 に近い位置では GLC に近い精度で残差を送る．
+これは単に画像全体の品質を一様に下げる調整ではなく，復号側で再計算可能な特徴に基づいて，知覚的に低感度または生成器が補いやすい領域の残差精度を下げる局所的な量子化倍率制御である．
+
+\subsection{学習目的と設計制約}
+GP-ResLCでは符号化器側でしか計算できない画像依存の重要度マップを送らない．
+制御信号は，$\hat{\mathbf{z}}$，品質インデックス，および GLC の復号順序で利用可能な文脈情報 から再計算できるものに限定する．
+この制約により，復号側は通常の復号過程で得られる情報だけから GLC と同じ順序で $\hat{\mathbf{z}}$ と $\hat{\mathbf{y}}$ を復元し，同じ $\boldsymbol{\rho}_\theta$ を再計算できる．
+
+実装では，訓練済み GLC\cite{jia2024} を凍結し，補助的な量子化倍率ネットワークを学習する．
+主結果で用いた学習目的は次式で表される．
+\begin{equation}
+\mathcal{L}
+= \lambda_R R_y
++ \mathcal{L}_{\mathrm{quality}}
++ \lambda_\rho \mathcal{L}_\rho
++ \lambda_{\mathrm{send}}\mathcal{L}_{\mathrm{send}}
++ \lambda_{\mathrm{align}}\mathcal{L}_{\mathrm{align}}
+\end{equation}
+\begin{equation}
+\mathcal{L}_{\mathrm{quality}}
+= \lambda_{\mathrm{MSE}}\mathcal{L}_{\mathrm{MSE}}(\mathbf{x},\hat{\mathbf{x}})
++ \lambda_{\mathrm{LPIPS}}\mathcal{L}_{\mathrm{LPIPS}}(\mathbf{x},\hat{\mathbf{x}})
+\end{equation}
+ここで $R_y$ は，GLCのエントロピー符号化モデルから得られる学習時の主潜在表現の推定符号量であり，$-\sum \log_2 p(\hat{\mathbf{y}}|\hat{\mathbf{z}},q)$ に対応する．
+$\mathcal{L}_{\mathrm{MSE}}$ は画素空間の平均二乗誤差，$\mathcal{L}_{\mathrm{LPIPS}}$ は VGG-LPIPS\cite{zhang2018}である．
+$\mathcal{L}_{\rho}=\max(0,\rho_{\mathrm{target}}-\mathrm{mean}(\boldsymbol{\rho}_\theta))$ は平均倍率を目標値へ保つ項，$\mathcal{L}_{\mathrm{send}}$ は低誤差・低勾配領域で倍率を大きくしやすくする 学習時のみ用いる送信しやすさの教師信号である．
+$\mathcal{L}_{\mathrm{align}}$ は GLC のVQコード予測の補助教師信号に基づく補助的なコード整合項であり，提案の主機構ではなく訓練済みGLCの生成潜在表現から大きく外れないために用いる．
+主結果では $\lambda_R=10$，$\lambda_{\mathrm{MSE}}=0.08$，$\lambda_{\mathrm{LPIPS}}=4$，$\lambda_\rho=2$，$\lambda_{\mathrm{send}}=5$，$\lambda_{\mathrm{align}}=1$，$\rho_{\mathrm{target}}=1.16$ とした．
+DISTS\cite{ding2022} は主評価指標として用いるが，主結果の学習損失には直接入れていない．
+DISTS損失を加えた 追加学習も検証したが，CLIC2020 testとDIV2K で主結果を上回らなかったため，本稿の主結果には採用しない．
+
+\section{実験}
+\subsection{評価設定}
+ベースラインは，訓練済み GLC\cite{jia2024} とする．
+提案手法は同じ訓練済み GLC に GP-ResLC の量子化倍率ネットワークを追加したモデルである．
+評価は，CLIC2020 test\cite{clic2020}，DIV2K validation\cite{agustsson2017}，Kodak\cite{kodak} で行う．
+CLIC2020 test は professional 250 枚と mobile 178 枚の合計 428 枚，DIV2K は validation 100 枚，Kodak は 24 枚である．
+
+bpp は，ヘッダ，固定長符号化された $\hat{\mathbf{z}}$ のインデックス，および4分割prior順序で算術符号化された主潜在表現 $\mathbf{y}$ のビット列を含む全体のビット列長から算出する．
+
+評価指標は，PSNR，MS-SSIM\cite{wang2003}，LPIPS\cite{zhang2018}，DISTS\cite{ding2022}，FID\cite{heusel2017}，KID\cite{binkowski2018}である．
+GLC/HiFiC 型の評価に合わせ\cite{mentzer2020,jia2024}，CLIC2020 testとDIV2K では 256$\times$256パッチ を通常分割に加えて 128 pixel shift でも抽出し，FID/KID を計算する．
+このプロトコルでのパッチ数は，CLIC2020 testで 28,650，DIV2K で 6,573である．
+Kodak は画像数が少ないため，DISTS，LPIPS，PSNR，MS-SSIM を主に見る．
+
+\begin{table*}[t]
+\centering
+\caption{訓練済み GLC に対する GP-ResLC の BD-rate．負の値は，Bj{\o}ntegaard 法\cite{bjontegaard2001} に基づき，同一品質に到達するための平均bppが GP-ResLC で小さいことを示す．}
+\label{tab:bd}
+\small
+\begin{tabular}{lrrrrrr}
+\hline
+Dataset & DISTS & LPIPS & PSNR & MS-SSIM & FID & KID \\
+\hline
+CLIC2020 test & $-10.28$ & $+0.19$ & $-0.98$ & $+0.38$ & $-7.30$ & $-7.10$ \\
+DIV2K val. & $-10.79$ & $-0.54$ & $-1.49$ & $-0.17$ & $-5.61$ & $-6.50$ \\
+Kodak & $-4.47$ & $-0.79$ & $-0.87$ & $+0.45$ & $-1.70$ & $-6.14$ \\
+\hline
+\end{tabular}
+\end{table*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/result_curves_clic_div2k_perceptual_2x4_readable.png}
+\caption{CLIC2020 testとDIV2K validation における知覚品質指標の符号量-品質曲線．各行がデータセット，各列が FID，KID，DISTS，LPIPS に対応する．各指標は低いほど良い．}
+\label{fig:curves}
+\end{figure*}
+
+\subsection{結果}
+表\ref{tab:bd} に BD-rate を示す．
+表の値は品質インデックスごとの一点比較ではなく，符号量-品質曲線間の平均符号量差である．
+CLIC2020 testでは DISTS で $-10.28\%$，FID で $-7.30\%$ の BD-rate 改善が得られた．
+DIV2K でも DISTS で $-10.79\%$，FID で $-5.61\%$ となり，同様の傾向を示した．
+Kodak では画像数が少ないため FID/KID は参考扱いだが，DISTS で $-4.47\%$ の改善を示した．
+LPIPS は CLIC2020 testでほぼ中立，DIV2K/Kodak では小幅改善に留まった．
+この結果は，本手法の主な効果が DISTS/FID に現れる 符号量-知覚品質寄りの改善であることを示している．
+なお，DISTS について各 GLC 評価点と同じ品質に対応する GP-ResLC の bppを曲線上で確認しても，CLIC2020 testで平均 $-10.26\%$，DIV2K で $-10.27\%$，Kodak で $-5.45\%$ の削減となり，表\ref{tab:bd} の BD-rate と同じ傾向を示した．
+
+\begin{table}[t]
+\centering
+\caption{CLIC2020 test における bpp の内訳．$\hat{z}$ の符号化部分とヘッダは GLCとGP-ResLC で同一であり，削減は算術符号化された主潜在表現 $y$ のビット列から生じる．}
+\label{tab:bpp_split}
+\small
+\begin{tabular}{crrrr}
+\hline
+手法 & q & total & $y$ & $z$+ヘッダ \\
+\hline
+GLC & 0 & 0.02134 & 0.01757 & 0.00377 \\
+GP-ResLC & 0 & 0.01892 & 0.01515 & 0.00377 \\
+GLC & 3 & 0.03369 & 0.02992 & 0.00377 \\
+GP-ResLC & 3 & 0.03102 & 0.02726 & 0.00377 \\
+\hline
+\end{tabular}
+\end{table}
+
+表\ref{tab:bpp_split} に示すように，$\hat{\mathbf{z}}$ の符号化部分とヘッダは GLCとGP-ResLC で同一であり，削減は算術符号化された主潜在表現 $\mathbf{y}$ のビット列から生じている．
+これは，提案手法による削減が主潜在表現の符号化部分から生じていることを示す．
+
+\subsection{可視化と機構分析}
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/clic_q3_rho_overlay_top4.png}
+\caption{CLIC2020 test q3 における復元例と量子化倍率 $\boldsymbol{\rho}_\theta$ の可視化．高い倍率は粗い残差量子化を表し，GLCの生成復号器に復元を委ねる領域に対応する．実際の符号長削減は表\ref{tab:bpp_split} の主潜在表現 $y$ の bpp 内訳で確認する．}
+\label{fig:rho}
+\end{figure}
+
+図\ref{fig:rho} に，CLIC2020 test の復元例と量子化倍率 $\boldsymbol{\rho}_\theta$ の可視化を示す．
+$\boldsymbol{\rho}_\theta$ が高い領域は，GP-ResLC が残差をより粗く量子化し，GLCの生成復号器に復元を委ねる領域に対応する．
+一方，構造境界や復元が難しい領域では相対的に低い倍率が割り当てられ，GLC に近い精度で残差が送られる．
+図\ref{fig:rho} は主にこの空間的な倍率分布を示すものであり，実際の符号長削減は表\ref{tab:bpp_split} の主潜在表現 $y$ の bpp 内訳で確認できる．
+補助解析として，q3 では高い倍率が割り当てられた領域ほど GLCベースラインの局所誤差や画像勾配が低い傾向を確認しており，知覚的に低感度な領域で符号長を削減するという設計と整合する．
+
+\section{考察とまとめ}
+本稿の結果は，超低ビットレート生成型圧縮において，復号側で再計算可能な情報に基づく量子化倍率制御が有効であることを示している．
+特に，$\hat{\mathbf{z}}$ やヘッダは変えず，削減が主潜在表現 $\mathbf{y}$ のビット列から生じている点は，本手法の設計と整合する．
+
+一方で，現時点の GP-ResLC は訓練済みGLCに追加したモジュールであり，VQ-VAE，変換符号化，エントロピー符号化モデルを最初から一貫して学習したゼロから一貫学習した圧縮モデル ではない．
+また，PSNR/MS-SSIM や LPIPS の改善は一貫して大きいわけではない．
+さらに，量子化倍率ネットワークは符号化器側と復号器側で共有され，復号時にも $\boldsymbol{\rho}_\theta$ を計算する必要があるため，わずかな計算量増加が生じる．
+ただし，追加の重要度マップは送信せず，評価では符号化/復号時間が GLCと同程度であることを確認している．
+
+本稿では，訓練済みGLCの生成潜在表現上で復号側と整合する量子化倍率を導入し，超低ビットレート画像圧縮において符号長を削減する GP-ResLC を示した．
+CLIC2020 test，DIV2K validation，Kodak で評価し，DISTS/FID を中心に GLC より少ない bpp で同等以上の知覚品質に到達できることを確認した．
+今後は，生成潜在空間そのものを GP-ResLC の目的に合わせて学習し，生成器が補える成分と送るべき残差成分の分離をより明示的に行う．
+
+\begin{thebibliography}{17}
+\bibitem{balle2018}
+J. Ball\'e, D. Minnen, S. Singh, S. J. Hwang, and N. Johnston,
+``Variational image compression with a スケール hyperprior,''
+Proc. ICLR, 2018.
+
+\bibitem{minnen2018}
+D. Minnen, J. Ball\'e, and G. D. Toderici,
+``Joint autoregressive and hierarchical priors for learned image compression,''
+Proc. NeurIPS, 2018.
+
+\bibitem{cheng2020}
+Z. Cheng, H. Sun, M. Takeuchi, and J. Katto,
+``Learned image compression with discretized Gaussian mixture likelihoods and attention modules,''
+Proc. CVPR, pp. 7939--7948, 2020.
+
+\bibitem{blau2019}
+Y. Blau and T. Michaeli,
+``Rethinking 損失y compression: The rate-distortion-perception tradeoff,''
+Proc. ICML, 2019.
+
+\bibitem{mentzer2020}
+F. Mentzer, G. D. Toderici, M. Tschannen, and E. Agustsson,
+``High-fidelity generative image compression,''
+Proc. NeurIPS, 2020.
+
+\bibitem{jia2024}
+Z. Jia, J. Li, B. Li, H. Li, and Y. Lu,
+``Generative latent coding for ultra-low bitrate image compression,''
+Proc. CVPR, pp. 26088--26098, 2024.
+
+\bibitem{esser2021}
+P. Esser, R. Rombach, and B. Ommer,
+``Taming transformers for high-resolution image synthesis,''
+Proc. CVPR, 2021.
+
+\bibitem{oord2017}
+A. van den Oord, O. Vinyals, and K. Kavukcuoglu,
+``Neural discrete representation learning,''
+Proc. NeurIPS, 2017.
+
+\bibitem{clic2020}
+Challenge on Learned Image Compression,
+``CLIC 2020,''
+\url{https://www.compression.cc/} (accessed 2026-06-22).
+
+\bibitem{agustsson2017}
+E. Agustsson and R. Timofte,
+``NTIRE 2017 challenge on single image super-resolution: Dataset and study,''
+Proc. CVPR Workshops, 2017.
+
+\bibitem{kodak}
+Eastman Kodak Company,
+``Kodak 損失less true color image suite,''
+\url{http://r0k.us/graphics/kodak/} (accessed 2026-06-22).
+
+\bibitem{zhang2018}
+R. Zhang, P. Isola, A. A. Efros, E. Shechtman, and O. Wang,
+``The unreasonable effectiveness of deep features as a perceptual metric,''
+Proc. CVPR, 2018.
+
+\bibitem{ding2022}
+K. Ding, K. Ma, S. Wang, and E. P. Simoncelli,
+``Image quality assessment: Unifying structure and texture similarity,''
+IEEE Trans. Pattern Analysis and Machine Intelligence, 2022.
+
+\bibitem{wang2003}
+Z. Wang, E. P. Simoncelli, and A. C. Bovik,
+``Multiスケール structural similarity for image quality assessment,''
+Proc. Asilomar Conference on Signals, Systems and Computers, 2003.
+
+\bibitem{heusel2017}
+M. Heusel, H. Ramsauer, T. Unterthiner, B. Nessler, and S. Hochreiter,
+``GANs trained by a two time-スケール update rule converge to a local Nash equilibrium,''
+Proc. NeurIPS, 2017.
+
+\bibitem{binkowski2018}
+M. Bi\'nkowski, D. J. Sutherland, M. Arbel, and A. Gretton,
+``Demystifying MMD GANs,''
+Proc. ICLR, 2018.
+
+\bibitem{bjontegaard2001}
+G. Bj{\o}ntegaard,
+``Calculation of average PSNR differences between RD-curves,''
+ITU-T VCEG-M33, 2001.
+\end{thebibliography}
+
+\end{document}

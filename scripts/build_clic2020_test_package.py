@@ -92,7 +92,7 @@ def merge_run(prof_root: Path, mobile_root: Path, out_root: Path, q_indexes: lis
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--orig_out", default="datasets/clic2020_test")
+    ap.add_argument("--orig_out", default="data/clic2020_test_combined")
     ap.add_argument("--glc_prof", default="experiments/real_codec/clic_prof_test_glc")
     ap.add_argument("--glc_mobile", default="experiments/real_codec/clic_mobile_test_glc")
     ap.add_argument("--glc_out", default="experiments/real_codec/clic2020_test_glc")

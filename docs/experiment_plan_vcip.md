@@ -251,7 +251,7 @@ Next priority:
 
 OpenImages32 sanity:
 
-- Fixed subset: `data_subsets/openimages_v6_test_32`.
+- Fixed subset: `data/subsets/openimages_v6_test_32`.
 - Current best versus GLC: DISTS BD-rate -5.18%, FID BD-rate -6.12%, but q3 DISTS is slightly worse and KID is unstable.
 - Use only as robustness evidence; primary tables should remain Kodak and CLIC professional valid.
 

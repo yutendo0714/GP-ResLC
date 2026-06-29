@@ -33,7 +33,7 @@ from PIL import Image
 from torchvision.transforms import ToTensor
 
 from gp_reslc.perceptual_gate import PerceptualGate
-from gp_reslc.prior_predictor import PriorPredictor, train_forward
+from gp_reslc.prior_predictor import PriorPredictor, StageResidualPredictor, StageQuantGate, train_forward
 from gp_reslc.real_codec import (
     compress_to_real_bitstream,
     crop_to_original,
@@ -59,14 +59,39 @@ def build_glc(weights: str, device: str) -> GLC_Image:
     return net.to(device).eval()
 
 
+class GateAlphaWrapper(torch.nn.Module):
+    """Scale a learned perceptual gate deterministically without side bits."""
+
+    def __init__(self, base: torch.nn.Module, alpha: float = 1.0) -> None:
+        super().__init__()
+        self.base = base
+        self.alpha = float(alpha)
+
+    def set_alpha(self, alpha: float) -> None:
+        self.alpha = float(alpha)
+
+    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        rho, p_tex = self.base(z)
+        rho = 1.0 + self.alpha * (rho - 1.0)
+        return rho.clamp_min(1.0), p_tex
+
+
 def build_gp_reslc(weights: str, ckpt_path: str, interpolate: bool, device: str) -> GLC_Image:
     net = GLC_Image(inplace=True)
     net.load_state_dict(get_state_dict(weights), strict=True)
-    net.prior_predictor = PriorPredictor(net.N)
-
     ck = torch.load(ckpt_path, map_location="cpu")
-    net.prior_predictor.load_state_dict(ck["prior_predictor"])
-    q_embed = ck["q_embed"]
+    if "prior_predictor" in ck:
+        net.prior_predictor = PriorPredictor(net.N)
+        net.prior_predictor.load_state_dict(ck["prior_predictor"])
+    else:
+        net.prior_predictor = None
+    if "stage_residual_predictor" in ck:
+        net.stage_residual_predictor = StageResidualPredictor(net.N)
+        net.stage_residual_predictor.load_state_dict(ck["stage_residual_predictor"])
+    if "stage_quant_gate" in ck:
+        net.stage_quant_gate = StageQuantGate(net.N, rho_max=ck.get("stage_rho_max", 1.5))
+        net.stage_quant_gate.load_state_dict(ck["stage_quant_gate"])
+    q_embed = ck.get("q_embed")
     if ck.get("use_gate", False):
         net.perceptual_gate = PerceptualGate(
             net.N,
@@ -77,13 +102,24 @@ def build_gp_reslc(weights: str, ckpt_path: str, interpolate: bool, device: str)
             softplus_tau=ck.get("gate_softplus_tau", 1.0),
         )
         net.perceptual_gate.load_state_dict(ck["perceptual_gate"])
+        net.perceptual_gate = GateAlphaWrapper(net.perceptual_gate, alpha=1.0)
     else:
         net.perceptual_gate = None
 
+    if "model_state_dict" in ck:
+        missing, unexpected = net.load_state_dict(ck["model_state_dict"], strict=False)
+        print(
+            f"[model_state_dict] loaded tuned GLC state: missing={len(missing)} unexpected={len(unexpected)}",
+            flush=True,
+        )
+
+    if interpolate and q_embed is None:
+        raise ValueError("--interpolate requires a q-conditioned checkpoint with q_embed")
     if interpolate:
         net.interpolate_q()
         q_embed = expand_qembed(q_embed)
-    net.q_embed = q_embed.to(device)
+    if q_embed is not None:
+        net.q_embed = q_embed.to(device)
     return net.to(device).eval()
 
 
@@ -107,8 +143,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--out", required=True)
     ap.add_argument("--q_indexes", type=int, nargs="+", default=[0, 1, 2, 3])
     ap.add_argument("--interpolate", action="store_true")
-    ap.add_argument("--predictor_param_mode", choices=["mean", "scale_mean", "all"], default="mean")
+    ap.add_argument("--predictor_param_mode", choices=["mean", "scale_mean", "all", "latent_residual", "stage_latent_residual", "stage_quant_gate"], default="mean")
     ap.add_argument("--predictor_delta_bound", type=float, default=0.0)
+    ap.add_argument("--gate_alpha", type=float, default=1.0,
+                    help="Scale learned gate strength as rho = 1 + alpha * (rho - 1).")
+    ap.add_argument("--gate_alpha_by_q", type=float, nargs="+", default=None,
+                    help="Optional q-indexed gate alpha table, e.g. 0.25 0.25 0.75 0.75.")
     ap.add_argument("--max_images", type=int, default=0)
     ap.add_argument("--save_streams", action="store_true", help="Write .gprc payload files next to reconstructions.")
     ap.add_argument("--skip_recon", action="store_true", help="Do not write decoded PNG reconstructions.")
@@ -138,12 +178,23 @@ def main() -> None:
         paths = paths[:args.max_images]
 
     qmax = net.q_enc.shape[0]
+    if args.gate_alpha_by_q is not None and len(args.gate_alpha_by_q) < qmax:
+        raise ValueError(f"--gate_alpha_by_q needs at least {qmax} values, got {len(args.gate_alpha_by_q)}")
     os.makedirs(args.out, exist_ok=True)
-    summary = {"method": method, "input": args.input, "q": {}}
+    summary = {
+        "method": method,
+        "input": args.input,
+        "gate_alpha": args.gate_alpha,
+        "gate_alpha_by_q": args.gate_alpha_by_q,
+        "q": {},
+    }
 
     for q in args.q_indexes:
         if not 0 <= q < qmax:
             raise ValueError(f"q={q} out of range 0..{qmax - 1}")
+        gate_alpha = args.gate_alpha_by_q[q] if args.gate_alpha_by_q is not None else args.gate_alpha
+        if hasattr(getattr(net, "perceptual_gate", None), "set_alpha"):
+            net.perceptual_gate.set_alpha(gate_alpha)
         save_dir = Path(args.out) / f"q{q}"
         save_dir.mkdir(parents=True, exist_ok=True)
         if args.save_streams:
@@ -158,8 +209,10 @@ def main() -> None:
                 "method": method,
                 "q": q,
                 "real_codec": True,
+                "gate_alpha": gate_alpha,
                 "images": {},
             }
+        manifest["gate_alpha"] = gate_alpha
         totals = {
             "bpp": 0.0,
             "bpp_y": 0.0,
@@ -222,7 +275,8 @@ def main() -> None:
                             q,
                             use_predictor=True,
                             gate=net.perceptual_gate,
-                            q_shift=net.q_embed[q:q + 1],
+                            q_shift=getattr(net, "q_embed", None)[q:q + 1]
+                            if getattr(net, "q_embed", None) is not None else None,
                             predictor_param_mode=args.predictor_param_mode,
                             predictor_delta_bound=args.predictor_delta_bound,
                         )["x_hat"]
@@ -255,6 +309,7 @@ def main() -> None:
                 "decode_time_s": dec_t,
                 "height": h,
                 "width": w,
+                "gate_alpha": gate_alpha,
             }
             if consistency_max_abs is not None:
                 item["consistency_max_abs"] = consistency_max_abs
@@ -301,4 +356,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

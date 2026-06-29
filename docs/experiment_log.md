@@ -720,7 +720,7 @@ Sanity check:
 Purpose:
 
 - Check whether the current best `rho_min=1.0,rho_max=1.4` behavior transfers beyond Kodak and CLIC.
-- This is a small fixed subset, not a final benchmark: first 32 images from `/dpl/open-images-v6/test/data` symlinked into `data_subsets/openimages_v6_test_32`.
+- This is a small fixed subset, not a final benchmark: first 32 images from `/dpl/open-images-v6/test/data` symlinked into `data/subsets/openimages_v6_test_32`.
 
 Evaluation note:
 
@@ -1619,7 +1619,7 @@ This exactly matches the GLC/HiFiC-style CLIC2020 test patch count. The previous
 Changes:
 
 - Updated `scripts/audit_glc_protocol.py` to include `clic2020_test`, `clic_prof_test`, and `clic_mobile_test` separately.
-- Built `datasets/clic2020_test/` as the 428-image professional+mobile symlink set.
+- Built canonical `data/clic2020_test_combined/` as the 428-image professional+mobile symlink set.
 - Merged existing professional real-codec outputs with newly evaluated mobile-test outputs into `experiments/real_codec/clic2020_test_glc/` and `experiments/real_codec/clic2020_test_gp_reslc_rho116/`.
 - Recomputed full CLIC2020 real-codec metrics with 28,650 FID/KID patches.
 - Updated `scripts/compare_official_curves.py` and `scripts/build_vcip_key_tables.py` so paper-facing CLIC uses the full 428-image test set.
@@ -1633,3 +1633,3111 @@ Full CLIC2020 real-codec result versus local real-codec GLC:
 Official graph-extracted GLC comparison is now usable for CLIC: local real-codec GLC matches official GLC FID closely after adding the mobile test subset. GP-ResLC versus official GLC gives CLIC2020 DISTS/FID BD-rate -9.07% / -6.10%.
 
 Decision: use full CLIC2020 test, DIV2K validation, and Kodak as the VCIP real-codec package. Keep professional-only CLIC results as historical/development artifacts, not paper-facing headline results.
+
+## 2026-06-20 JST - Latent-residual complete-design implementation start
+
+Goal: move GP-ResLC closer to the original design: predict the generator-recoverable latent component from transmitted `z_hat` and q, then entropy-code only the unpredictable residual.
+
+Changes:
+
+- `gp_reslc/real_codec.py` now supports `predictor_param_mode=latent_residual` for actual arithmetic-coded real bitstreams.
+- The real encoder codes symbols from `y_scaled - base_mean - mu_theta(z_hat, q)`, while the decoder recomputes `mu_theta(z_hat, q)` from transmitted `z_hat` and adds it back. No side map is transmitted.
+- `scripts/evaluate_real_codec.py` now accepts `--predictor_param_mode latent_residual`.
+- `scripts/train_v2.py` now has `--lambda_mean_pred` for q-conditioned latent residual training; in `latent_residual` mode it applies Smooth-L1 to `mu_theta(z_hat, q)` versus `y_scaled - base_mean`.
+
+Verification:
+
+- One-image Kodak real-codec smoke with existing checkpoint and `latent_residual` passed: real decode matches estimated train_forward with `max_abs=0.000e+00`.
+- Two-iteration V2 training smoke passed with `--no_gate --predictor_param_mode latent_residual --lambda_mean_pred 0.05`.
+
+Next run:
+
+`v3_latent_residual_lR10_lp4_mp005_nogate_12k`: no gate, all-q q-conditioned latent residual predictor, frozen GLC, OpenImages training, Kodak quick A/B validation. This is a complete-design warm-start route rather than the current rho-gate shortcut.
+
+## 2026-06-20 JST - V3 latent-residual direct R-P run stopped early
+
+Run: `v3_latent_residual_lR10_lp4_mp005_nogate_12k`, W&B `sgs83602`.
+
+Configuration: frozen GLC, q-conditioned V2, no gate, `predictor_param_mode=latent_residual`, `lambda_R=10`, `lambda_lpips=4`, `lambda_d=0.08`, `lambda_mean_pred=0.05`.
+
+Observation through ~2.7k iterations:
+
+- A/B at it=1000 and it=2000 showed positive `delta_bpp_y` on all q values, so the learned latent residual path was using slightly more y bits than baseline.
+- `latent_pred_abs` grew only to roughly 0.009-0.011 while target residual magnitude was roughly 0.03-0.04.
+- Direct R-P optimization is therefore too weak to learn the generator-predictable latent mean from scratch in the q-conditioned setting.
+
+Decision: stop early and pivot to staged residual-target pretraining. Next run should strongly train `mu_theta(z_hat,q)` toward `y_scaled - base_mean` with weak rate pressure, then fine-tune perceptually after A/B bpp_y turns negative.
+
+## 2026-06-20 JST - Latent-residual pretraining run stopped early
+
+Run: `v3_latent_residual_pretrain_mp5_lR0p1_nogate_8k`, W&B `nju3here`.
+
+Configuration: frozen GLC, q-conditioned V2, no gate, `predictor_param_mode=latent_residual`, `lambda_mean_pred=5.0`, `lambda_R=0.1`, no distortion/perceptual loss.
+
+Observation through it=2000:
+
+- `latent_pred_abs` increased to about 0.014-0.022 while target residual magnitude was about 0.03-0.045.
+- A/B bpp_y became strongly worse: at it=2000, q0/q1/q2/q3 deltas were roughly +0.0045/+0.0040/+0.0047/+0.0054.
+- Therefore forcing the predictor toward the full residual target breaks the frozen GLC four-part entropy model rather than reducing entropy.
+
+Interpretation:
+
+- In frozen GLC, `base_mean` and the spatial prior are co-adapted. A global `z_hat,q -> residual mean` added at every spatial-prior stage can shift contexts out of the distribution learned by GLC.
+- The full design likely needs either a conservative bounded residual mean, q-specific training, stage-aware residual prediction, or partial unfreezing of the entropy/fusion modules.
+
+Next run: q-specific V1 latent residual with `predictor_delta_bound=0.02`, stronger rate pressure, and no gate. This tests whether a small conservative residual subtraction can help without corrupting the spatial context.
+
+## 2026-06-20 JST - V1 bounded latent-residual q2 stopped early
+
+Run: `v3_latent_residual_v1q2_bound002_lR10_mp1_4k`, W&B `iv4elzaj`.
+
+Configuration: q-specific V1, frozen GLC, no gate, `predictor_param_mode=latent_residual`, `predictor_delta_bound=0.02`, `lambda_R=10`, `lambda_mean_pred=1.0`.
+
+Observation through it=1000:
+
+- A/B `delta_bpp_y` stayed slightly positive: it=500 `+0.0001`, it=1000 `+0.0001`.
+- The conservative global residual mean did not reduce the arithmetic model entropy, even when q-specific and bounded.
+
+Decision:
+
+- Stop this branch early. Frozen GLC does not appear to benefit from adding a decoder-recomputable residual mean that depends only on `z_hat`/q.
+- Pivot to a stage-aware residual predictor that adds a small mean correction inside each four-part spatial prior stage, conditioned only on information already available at the decoder (`common_params` and, for stages 1-3, `y_hat_so_far`). This keeps the original GP-ResLC principle but moves the prediction to the correct autoregressive context.
+
+Implementation note:
+
+- Added `StageResidualPredictor` and `predictor_param_mode=stage_latent_residual` to `gp_reslc/prior_predictor.py` and `scripts/train_v1.py`.
+- Smoke training passed; start state is exactly GLC-equivalent and checkpointing now saves `stage_residual_predictor`.
+
+## 2026-06-20 JST - Stage-aware quantization gate real-codec q2 result
+
+Motivation: latent-residual mean subtraction did not move rounded residual symbols because the learned mean corrections were much smaller than one quantized symbol. To keep the original principle while affecting actual transmitted bits, I added a decoder-recomputable stage-aware quantization gate: each four-part prior stage predicts `rho >= 1` from information already available to the decoder (`common_params`, and `y_hat_so_far` for stages 1-3). Larger `rho` means coarser residual quantization, i.e. predictable residuals are sent with fewer bits.
+
+Implementation:
+
+- Added `StageQuantGate` and `predictor_param_mode=stage_quant_gate`.
+- Added a real arithmetic-codec path for stage quantization; one-image consistency passed with `max_abs=0.000e+00`.
+- Added optional DISTS loss to `scripts/train_v1.py`.
+
+Runs:
+
+- Probe: `v3_stage_quant_v1q2_rhomax20_lR50_lr3e4_probe2k`, W&B `f40mzry2`. Strong rate pressure moved rho aggressively (`rho_mean` about 1.46) and reduced q2 Kodak crop `bpp_y` by about 0.006, but PSNR dropped about 0.7 dB. Full Kodak q2 real-codec metrics: `bpp=0.02922`, `DISTS=0.1070`, `LPIPS=0.1912`, `PSNR=21.39`. Too aggressive for q2-quality claims, but confirms the no-send mechanism works in real codec.
+- Balanced DISTS run: `v3_stage_quant_v1q2_rhomax20_lR30_lr2e4_lp4_dists8_d02_3k`, W&B `y6z248p3`. W&B crop A/B summary: `bpp_y 0.03226 -> 0.02818`, `delta=-0.00408`, PSNR `19.93 -> 19.70`, `rho_mean=1.2446`. Full Kodak q2 real-codec metrics: `bpp=0.03088`, `DISTS=0.1002`, `LPIPS=0.1787`, `PSNR=21.71`, `MS-SSIM=0.7675`.
+
+Comparison against existing Kodak real-codec table:
+
+- GLC q1: `bpp=0.03013`, `DISTS=0.1040`, `LPIPS=0.1802`, `PSNR=21.73`. Stage-quant q2 at similar bpp improves DISTS/LPIPS.
+- GLC q2: `bpp=0.03472`, `DISTS=0.0983`, `LPIPS=0.1680`, `PSNR=22.07`. Stage-quant q2 is about 11% lower bpp with modest quality loss.
+- GP-ResLC rho1.16 q2: `bpp=0.03197`, `DISTS=0.0995`, `LPIPS=0.1746`, `PSNR=21.88`. Stage-quant q2 is lower bpp but slightly worse DISTS/LPIPS; this is promising but not yet dominant over the current best curve.
+
+Decision:
+
+- Stage-aware quantization is the first complete-design variant that clearly moves actual arithmetic-coded bits while staying on the original axis.
+- Next: train q0/q1/q3 with the balanced DISTS setting to obtain a provisional real-codec curve, then compare BD-rate against GLC and rho1.16.
+
+## 2026-06-20 JST - Stage-quant Kodak curve audit
+
+Goal: check whether the more design-faithful stage-aware quantization gate actually beats the current rho1.16 real-codec package on a curve, not only at one visually plausible operating point.
+
+Artifacts:
+
+- Curve CSV: `experiments/real_codec/kodak_stage_quant_curve_metrics.csv`
+- BD summary: `experiments/real_codec/kodak_stage_quant_bd_rate_summary.md`
+- Matched-metric summary: `experiments/real_codec/kodak_stage_quant_matched_metric_summary.md`
+
+Protocol note: Kodak FID/KID are intentionally excluded from this comparison because the stage-quant diagnostic runs and the historical Kodak real-codec table used different patch settings, and GLC itself does not use Kodak FID/KID as a main paper metric. The comparison below uses real serialized bpp and full-reference PSNR/MS-SSIM/LPIPS/DISTS.
+
+Stage-quant real-codec points:
+
+| q | bpp | bpp_y | PSNR | MS-SSIM | LPIPS | DISTS | note |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 0 | 0.02620 | 0.02109 | 21.3202 | 0.7487 | 0.1961 | 0.1129 | no-op GLC q0 anchor; q0 learned gate did not move |
+| 1 | 0.02908 | 0.02398 | 21.6100 | 0.7631 | 0.1843 | 0.1045 | learned stage gate |
+| 2 | 0.03088 | 0.02578 | 21.7133 | 0.7675 | 0.1787 | 0.1002 | learned stage gate |
+| 3 | 0.03366 | 0.02855 | 21.8304 | 0.7732 | 0.1752 | 0.0982 | learned stage gate |
+
+Curve comparison versus GLC real codec on Kodak:
+
+| run | DISTS BD-rate | LPIPS BD-rate | PSNR BD-rate | MS-SSIM BD-rate |
+|---|---:|---:|---:|---:|
+| rho1.16 real | -4.47% | -0.79% | -0.87% | +0.45% |
+| stage-quant DISTS | -1.23% | +1.52% | +1.28% | +0.90% |
+
+Matched-DISTS bpp summary:
+
+- rho1.16 real: mean `-5.45%` over four GLC targets.
+- stage-quant DISTS: mean `-2.03%` over three GLC targets.
+
+Interpretation:
+
+- Stage-quant is closer to the original GP-ResLC mechanism: the decoder predicts which residual precision is unnecessary, and no extra rho/mask side stream is sent.
+- However, the current q-specific stage-quant training is not yet the paper lead. It underperforms rho1.16 on Kodak DISTS BD-rate and worsens LPIPS/PSNR/MS-SSIM curve summaries.
+- The main failure mode is not codec mismatch. It is optimization/control: the gate can reduce real y-stream bits, but the reconstruction penalty is not keeping the generated image on the same perceptual manifold as well as rho1.16.
+
+Next decision:
+
+- Keep rho1.16 as the current paper-facing real-codec baseline.
+- Continue stage-quant as the complete-design branch, but change the training objective from "reduce rate while paying DISTS/LPIPS" to "match or improve GLC/rho1.16 perceptual quality while reducing residual precision." Concretely, try a quality-preserving curriculum: start from rho=1, use strong GLC reconstruction distillation plus DISTS/LPIPS constraints, then slowly increase rate pressure.
+
+## 2026-06-20 JST - Quality-preserving stage-quant improves Kodak curve
+
+Goal: fix the first stage-quant curve, which was closer to the GP-ResLC design but underperformed rho1.16 because it reduced precision too aggressively. I added and tested a quality-preserving training objective with rate pressure plus weak GLC reconstruction distillation and LPIPS/DISTS hinge penalties against the frozen GLC baseline.
+
+Code changes:
+
+- `scripts/train_v1.py` now supports `lambda_lpips_distill`, `lambda_dists_distill`, `lambda_lpips_hinge`, `lambda_dists_hinge`, `lambda_R_start`, and `rate_warmup_iters`.
+- The failed warmup run `v3_stage_quant_v1q2_quality_hinge_rhomax17_lR18_5k` (W&B `ps0xtsz9`) showed no practical rho movement: `rho=1.000/1.000`, A/B `delta_bpp_y=0` through it=1500. Decision: too little rate pressure.
+- The successful setting uses immediate `lambda_R=35`, `rho_max=2.0`, and mild quality constraints.
+
+Successful W&B runs:
+
+| q | run | W&B | final A/B delta bpp_y | final A/B PSNR delta | rho mean/max |
+|---|---|---|---:|---:|---:|
+| 1 | `v3_stage_quant_v1q1_quality_hinge_fast_lR35_rhomax20_3k` | `hhvfn387` | -0.00106 | -0.2207 dB | 1.0548 / 1.1574 |
+| 2 | `v3_stage_quant_v1q2_quality_hinge_fast_lR35_rhomax20_3k` | `naog9hjt` | -0.00271 | -0.1629 dB | 1.1413 / 1.2526 |
+| 3 | `v3_stage_quant_v1q3_quality_hinge_fast_lR35_rhomax20_3k` | `mirujwwo` | -0.00366 | -0.2561 dB | 1.2377 / 1.4168 |
+
+Real-codec Kodak artifacts:
+
+- q1: `experiments/real_codec/kodak_stage_quant_q1_quality_hinge_fast/`
+- q2: `experiments/real_codec/kodak_stage_quant_q2_quality_hinge_fast/`
+- q3: `experiments/real_codec/kodak_stage_quant_q3_quality_hinge_fast/`
+- Merged curve: `experiments/real_codec/kodak_stage_quant_quality_curve_metrics.csv`
+- BD summary: `experiments/real_codec/kodak_stage_quant_quality_bd_rate_summary.md`
+- Matched summary: `experiments/real_codec/kodak_stage_quant_quality_matched_metric_summary.md`
+
+All real-codec runs passed estimated/decode consistency with `max_abs=0.000e+00` on all Kodak images.
+
+Quality-preserving stage-quant real-codec points:
+
+| q | bpp | bpp_y | PSNR | MS-SSIM | LPIPS | DISTS |
+|---|---:|---:|---:|---:|---:|---:|
+| 0 | 0.02620 | 0.02109 | 21.3202 | 0.7487 | 0.1961 | 0.1129 |
+| 1 | 0.02956 | 0.02446 | 21.6777 | 0.7653 | 0.1811 | 0.1029 |
+| 2 | 0.03263 | 0.02753 | 21.9264 | 0.7757 | 0.1725 | 0.0993 |
+| 3 | 0.03535 | 0.03025 | 22.0524 | 0.7817 | 0.1676 | 0.0952 |
+
+Kodak BD-rate versus GLC real codec:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM |
+|---|---:|---:|---:|---:|
+| rho1.16 real | -4.47% | -0.79% | -0.87% | +0.45% |
+| stage-quant quality | -4.96% | -0.47% | +0.32% | +0.70% |
+
+Matched-metric bpp deltas versus GLC real codec:
+
+| run | DISTS mean | LPIPS mean | PSNR mean | MS-SSIM mean |
+|---|---:|---:|---:|---:|
+| rho1.16 real | -5.45% | +0.34% | -0.41% | +0.80% |
+| stage-quant quality | -4.22% | +0.10% | +0.08% | +0.42% |
+
+Interpretation:
+
+- This is the first complete-design branch that beats the rho1.16 shortcut on Kodak DISTS BD-rate while also making LPIPS BD-rate negative.
+- The method is now much closer to the original claim: decoder-recomputable stage gates decide where residual precision can be reduced, and the real arithmetic-coded y stream shrinks without any transmitted gate map.
+- q3 is especially strong: `0.03535 bpp / DISTS 0.09521`, compared with GLC q3 `0.03897 / 0.09539`. This is equal-or-better DISTS at about 9.3% lower serialized bpp.
+- Remaining risk: q0 is still a no-op GLC point, and matched-DISTS mean is slightly weaker than rho1.16. Next priority is transfer evaluation on DIV2K/CLIC and possibly q0/low-rate-specific training.
+
+## 2026-06-20 JST - Stage-quant quality transfer check on DIV2K
+
+Goal: test whether the Kodak-improved quality-preserving stage-quant branch transfers to DIV2K validation under the same real arithmetic codec protocol.
+
+Artifacts:
+
+- q1: `experiments/real_codec/div2k_stage_quant_q1_quality_hinge_fast/`
+- q2: `experiments/real_codec/div2k_stage_quant_q2_quality_hinge_fast/`
+- q3: `experiments/real_codec/div2k_stage_quant_q3_quality_hinge_fast/`
+- Curve CSV: `experiments/real_codec/div2k_stage_quant_quality_curve_metrics.csv`
+- BD summary: `experiments/real_codec/div2k_stage_quant_quality_bd_rate_summary.md`
+- Matched summary: `experiments/real_codec/div2k_stage_quant_quality_matched_metric_summary.md`
+
+All q1-q3 real-codec runs passed estimated/decode consistency with `max_abs=0.000e+00` on all DIV2K images.
+
+DIV2K stage-quant quality points:
+
+| q | bpp | bpp_y | PSNR | MS-SSIM | LPIPS | DISTS |
+|---|---:|---:|---:|---:|---:|---:|
+| 0 | 0.02381 | 0.02004 | 21.5114 | 0.7836 | 0.1842 | 0.0905 |
+| 1 | 0.02710 | 0.02334 | 21.8484 | 0.7981 | 0.1713 | 0.0831 |
+| 2 | 0.03023 | 0.02646 | 22.1441 | 0.8081 | 0.1627 | 0.0773 |
+| 3 | 0.03302 | 0.02925 | 22.3730 | 0.8139 | 0.1583 | 0.0745 |
+
+DIV2K BD-rate versus GLC real codec:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM |
+|---|---:|---:|---:|---:|
+| rho1.16 real | -10.79% | -0.54% | -1.49% | -0.17% |
+| stage-quant quality | -4.05% | -0.10% | -0.19% | +0.11% |
+
+Matched-metric bpp deltas versus GLC real codec:
+
+| run | DISTS mean | LPIPS mean | PSNR mean | MS-SSIM mean |
+|---|---:|---:|---:|---:|
+| rho1.16 real | -10.27% | +0.36% | -1.16% | +0.68% |
+| stage-quant quality | -5.64% | +0.26% | -0.20% | +0.54% |
+
+Interpretation:
+
+- The complete-design stage-quant branch transfers beyond Kodak: q1-q3 all give lower bpp than GLC at equal-or-better DISTS.
+- DIV2K is not yet a stage-quant win over rho1.16. The rho1.16 shortcut remains much stronger on DIV2K DISTS-rate.
+- The best stage-quant DIV2K point is q3: `0.03302 bpp / DISTS 0.07454`, beating both GLC q3 (`0.03649 / 0.07563`) and rho1.16 q3 (`0.03388 / 0.07508`) pointwise on DISTS and bpp, but the full curve is held back by q0 no-op and smaller q1/q2 savings.
+
+
+## 2026-06-20 JST - Stage-quant quality branch on CLIC2020 full test
+
+Goal: evaluate the decoder-recomputable stage-wise quantization gate on the official-protocol CLIC2020 full test set. This branch is closer to the original GP-ResLC claim than the global rho1.16 shortcut because each four-part prior stage predicts a no-side-bit rho >= 1 from already decoded context and reduces only residual precision that the decoder-side generator is expected to absorb.
+
+Training runs:
+
+- q1: v3_stage_quant_v1q1_quality_hinge_fast_lR35_rhomax20_3k, W&B hhvfn387
+- q2: v3_stage_quant_v1q2_quality_hinge_fast_lR35_rhomax20_3k, W&B naog9hjt
+- q3: v3_stage_quant_v1q3_quality_hinge_fast_lR35_rhomax20_3k, W&B mirujwwo
+- q3 tuned: v3_stage_quant_v1q3_quality_tune_lR32_lp8_dists4_2k, W&B j9cottz9
+
+Artifacts:
+
+- Main CLIC curve: experiments/real_codec/clic2020_test_stage_quant_quality_curve_metrics.csv
+- Main BD summary: experiments/real_codec/clic2020_test_stage_quant_quality_bd_rate_summary.md
+- Main matched summary: experiments/real_codec/clic2020_test_stage_quant_quality_matched_metric_summary.md
+- q3-tuned curve: experiments/real_codec/clic2020_test_stage_quant_quality_q3_tuned_curve_metrics.csv
+- q3-tuned BD summary: experiments/real_codec/clic2020_test_stage_quant_quality_q3_tuned_bd_rate_summary.md
+- q3-tuned official comparison: experiments/paper_assets/official_curve_comparison_stage_quant_q3_tuned/
+
+All real-codec CLIC runs used the combined professional+mobile 428-image test set and shifted 256-patch FID/KID protocol, producing 28,650 patches. The real codec consistency check passed with max_abs=0.000e+00 for q1-q3 and for the q3-tuned run.
+
+Main stage-quant CLIC points:
+
+| q | bpp | bpp_y | PSNR | MS-SSIM | LPIPS | DISTS | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0.02134 | 0.01757 | 24.0733 | 0.8362 | 0.1542 | 0.08219 | 6.2655 | 0.001333 |
+| 1 | 0.02456 | 0.02079 | 24.4729 | 0.8475 | 0.1413 | 0.07388 | 5.2823 | 0.001054 |
+| 2 | 0.02771 | 0.02394 | 24.7660 | 0.8552 | 0.1338 | 0.06831 | 4.6622 | 0.000812 |
+| 3 | 0.03043 | 0.02666 | 24.9472 | 0.8594 | 0.1301 | 0.06579 | 4.4788 | 0.000769 |
+
+BD-rate versus local GLC real codec:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| rho1.16 real | -10.28% | +0.19% | -0.98% | +0.38% | -7.30% | -7.10% |
+| stage-quant quality | -3.56% | +0.06% | +0.25% | +0.45% | -1.81% | +0.37% |
+| stage-quant q3-tuned | -3.41% | +0.01% | +0.28% | +0.42% | -2.03% | -0.57% |
+
+Matched-metric bpp deltas versus local GLC real codec:
+
+| run | DISTS mean | FID mean | LPIPS mean | note |
+|---|---:|---:|---:|---|
+| rho1.16 real | -10.26% | -6.02% | +1.24% | strongest current CLIC headline |
+| stage-quant quality | -5.29% | -2.48% | +0.63% | more faithful complete-design branch |
+| stage-quant q3-tuned | -5.13% | -2.48% | +0.57% | improves q3 FID/KID/LPIPS but weakens q3 DISTS |
+
+Official graph-extracted GLC comparison for q3-tuned CLIC curve:
+
+| metric | BD-rate | matched bpp delta |
+|---|---:|---:|
+| FID | -0.74% | -0.92% over 3 points |
+| KID | -0.55% | -3.77% over 3 points |
+| DISTS | -2.02% | -3.97% over 4 points |
+| LPIPS | +1.26% | +1.96% over 2 points |
+
+Interpretation:
+
+- The q3-tuned run is not a clean replacement for the main q3. It recovers FID from 4.4788 to 4.4611, KID from 0.000769 to 0.000736, and LPIPS from 0.13006 to 0.12976, but DISTS worsens from 0.06579 to 0.06590 and bpp rises from 0.03043 to 0.03059.
+- For the VCIP short-track R-P story, the main stage-quant curve is still the cleaner DISTS result, while q3-tuned is evidence that quality recovery is possible but needs a better objective than simply increasing LPIPS/DISTS pressure.
+- The complete-design branch is technically aligned with the original claim, but it is not yet competitive with the rho1.16 shortcut or large enough against official GLC. Next research should relax frozen-GLC limits: train a residual-predictive latent decomposition from pretrained weights first, then attempt scratch once the pretrained path shows a real-codec CLIC gain beyond the shortcut.
+
+
+## 2026-06-20 JST - Complete-design escalation checks after CLIC stage-quant
+
+Goal: test whether the more faithful GP-ResLC mechanisms can be pushed beyond the current rho1.16 shortcut without breaking the real arithmetic-codec accounting. These checks focused on two routes: residual mean prediction with partially trainable entropy modules, and stage-wise decoder-recomputable quantization with stronger rho targets.
+
+Implementation updates:
+
+- `gp_reslc/real_codec.py` now supports `predictor_param_mode=stage_latent_residual` for real arithmetic-coded payloads.
+- `scripts/evaluate_real_codec.py` can attach `StageResidualPredictor`, load `stage_latent_residual` checkpoints, and restore optional `model_state_dict` snapshots.
+- `scripts/train_v1.py` now supports `--unfreeze_entropy`, `--unfreeze_hyper_dec`, `--save_model_state`, `--freeze_aux_module`, and `--lambda_rho_target/--rho_target` for stage-quant control.
+- Real-codec smoke for `stage_latent_residual` passed on a one-image Kodak check with `max_abs=0.000e+00`.
+
+Runs and outcomes:
+
+| branch | run | W&B | outcome |
+|---|---|---|---|
+| latent residual + entropy unfreeze | `v4_latres_v1q2_unfreeze_entropy_b005_lR8_lp4_dists1_mp005_6k` | `raeuurk3` | A/B estimated bpp moved slightly negative, but Kodak8 real codec was worse than GLC: bpp `0.03639` vs `0.03572`, DISTS `0.10246` vs `0.10171`. Reject. |
+| stage residual + entropy unfreeze | `v4_stage_residual_v1q2_unfreeze_entropy_b005_lR8_lp4_dists1_mp05_4k` | `rz0olu2p` | Similar failure: Kodak8 bpp `0.03606`, DISTS `0.10324`, both worse than GLC q2. Reject. |
+| stage quant + entropy unfreeze | `v4_stage_quant_v1q2_unfreeze_entropy_from_quality_lR24_lp8_dists4_2k` | `0s1p2c25` | rho collapsed toward identity and the rate saving disappeared. Reject. |
+| stage quant, gate frozen, entropy only | `v4_stage_quant_v1q2_entropy_only_from_quality_lR12_lp8_dists8_1500` | `i97xp9i7` | Even with the gate frozen, changing the GLC entropy features changed the gate inputs and collapsed effective rho. Reject. |
+| stage quant + entropy unfreeze + rho target | `v4_stage_quant_v1q2_unfreeze_entropy_rhotarget112_lR12_lp8_dists8_rt30_1500` | `k7cci11q` | Estimated A/B looked good (`delta_bpp_y≈-0.0029`, `rho≈1.12`), but Kodak8 real bpp rose to about `0.0378`. Real arithmetic length exposed a mismatch. Reject. |
+| stage quant, fixed GLC, rho target 1.22 | `v4_stage_quant_v1q2_rhotarget122_quality_hinge_lR30_lp8_dists8_rt20_1500` | `ukqx3wbn` | Real Kodak8 bpp dropped to `0.03228` versus stage-quant-quality q2 `0.03360` and GLC q2 `0.03572`, but DISTS worsened to `0.10352` and LPIPS to `0.17888`. Keep as an upper-rate knob, not a lead. |
+
+Interpretation:
+
+- Unfreezing GLC entropy/prior modules is dangerous under the current pretrained decomposition. It can improve estimated or crop-level A/B likelihood, but the serialized bitstream gets longer once arithmetic support, CDF calibration, and actual symbol lengths are counted.
+- Direct residual mean prediction is now real-codec correct, but not yet competitive. The likely cause is that pretrained GLC did not learn a clean `generator-predictable component + residual` factorization, so adding a mean correction perturbs the four-part spatial context rather than simplifying it.
+- The fixed-GLC stage-quant route remains the only complete-design branch that reliably reduces real y-stream bits. However, stronger rho targets trade too much perceptual quality for rate.
+
+Decision:
+
+- For the VCIP short-track package, keep `rho1.16` as the headline because it is robust on CLIC2020 full test, DIV2K, Kodak, and against the official GLC curves.
+- Keep stage-quant as the method-faithful secondary branch and continue with fixed-GLC, no-unfreeze training. The next useful sweep is an intermediate q2 target (`rho_target≈1.17-1.18`) with stronger DISTS/LPIPS hinge protection, not entropy unfreezing.
+- Scratch GP-ResLC remains high-upside, but the pretrained branch shows that the decomposition must be trained jointly from the start; it should be developed as a separate staged branch rather than by forcing frozen GLC priors to absorb large residual-prediction changes.
+
+
+## 2026-06-20 JST - Stage-quant q2 intermediate rho-target check
+
+Goal: test whether the method-faithful stage-quant branch can gain additional q2 rate saving without the quality loss seen at `rho_target=1.22`.
+
+Run:
+
+- `v4_stage_quant_v1q2_rhotarget117_quality_hinge_lR24_lp10_dists10_rt20_1500_r2`
+- W&B: `7wab1b19`
+- initialization: weights-only resume from `v3_stage_quant_v1q2_quality_hinge_fast_lR35_rhomax20_3k/train_state.pt`
+- settings: fixed GLC, `stage_quant_gate`, `rho_target=1.17`, `lambda_rho_target=20`, `lambda_R=24`, `lambda_lpips=10`, `lambda_dists=10`, strong LPIPS/DISTS hinges.
+
+Training summary:
+
+- The gate stayed near the intended target: final W&B `rho_mean=1.1708`, `rho_max=1.3410`.
+- Kodak A/B estimated check stayed positive from a rate perspective: `delta_bpp_y=-0.00287`, PSNR `19.24 -> 19.27`.
+- Real-codec consistency passed on Kodak8 with `max_abs=0.000e+00`.
+
+Kodak8 real-codec comparison at q2:
+
+| run | bpp | PSNR | LPIPS | DISTS | FID | decision |
+|---|---:|---:|---:|---:|---:|---|
+| GLC q2 | 0.03572 | 21.6311 | 0.1706 | 0.1017 | 53.77 | anchor |
+| stage-quant quality q2 | 0.03360 | 21.4731 | 0.1748 | 0.1030 | 55.06 | current stage q2 |
+| stage-quant rho_target=1.17 | 0.03299 | 21.4174 | 0.1775 | 0.1041 | 55.70 | reject as q2 replacement |
+| stage-quant rho_target=1.22 | 0.03228 | 21.3334 | 0.1789 | 0.1035 | 55.67 | upper-rate knob |
+
+Interpretation:
+
+- The intermediate target successfully reduces serialized bpp, but the quality protection is not sufficient. It is worse than the existing q2 quality checkpoint on DISTS/LPIPS/FID and not clearly better than the more aggressive target1.22 in perceptual quality.
+- This argues against pushing q2 harder. The stage-quant curve's larger weakness is q0 being a no-op anchor, so the next experiment should target a conservative q0 stage gate (`rho_target≈1.08-1.10`) with strict quality hinges.
+
+
+## 2026-06-20 JST - Stage-quant q0 rho_target=1.08 check
+
+Goal: improve the stage-quant curve's weakest point. Previous stage-quant quality curves used q0 as a no-op GLC anchor, which hurts BD-rate. This run tested whether a conservative q0 gate can reduce real bpp while preserving perceptual quality.
+
+Run:
+
+- `v4_stage_quant_v1q0_rhotarget108_quality_hinge_lR18_lp12_dists12_rt30_2k`
+- W&B: `v7s5xquu`
+- stopped early after the 1000-iteration checkpoint because A/B PSNR degradation persisted.
+- settings: fixed GLC, `stage_quant_gate`, `rho_target=1.08`, `lambda_rho_target=30`, `lambda_R=18`, strong LPIPS/DISTS hinges.
+
+Training / real-codec summary:
+
+- rho reached target quickly and stayed near `1.08`.
+- Kodak A/B at it=500/1000: `delta_bpp_y≈-0.0015..-0.0016`, but PSNR dropped by about `0.19-0.22 dB`.
+- Real-codec consistency passed on Kodak8 with `max_abs=0.000e+00`.
+
+Kodak8 real-codec q0 comparison:
+
+| run | bpp | PSNR | LPIPS | DISTS | FID | decision |
+|---|---:|---:|---:|---:|---:|---|
+| GLC q0 | 0.02699 | 20.8504 | 0.2028 | 0.1190 | 61.1080 | anchor |
+| stage-quant q0 target1.08 | 0.02564 | 20.7668 | 0.2088 | 0.1198 | 60.7882 | not a clean DISTS/LPIPS point |
+
+Interpretation:
+
+- The q0 gate does reduce real serialized bpp by about 5%, so the mechanism works even at the lowest rate point.
+- However, q0 has little perceptual slack. DISTS and LPIPS worsen enough that this checkpoint is risky as a curve replacement.
+- Next: lower the q0 target to `rho_target≈1.05` and reduce rate pressure. The goal is a smaller 2-3% rate cut with DISTS closer to neutral.
+
+
+## 2026-06-20 JST - Stage-quant q0 rho_target=1.05 check
+
+Goal: recover a safer q0 stage-quant point after `rho_target=1.08` reduced real bpp but worsened DISTS/LPIPS.
+
+Run:
+
+- `v4_stage_quant_v1q0_rhotarget105_quality_hinge_lR12_lp12_dists14_rt30_1200`
+- W&B: `7r0j5hy3`
+- settings: fixed GLC, `stage_quant_gate`, `rho_target=1.05`, `lambda_rho_target=30`, lower `lambda_R=12`, tighter LPIPS/DISTS hinges.
+
+Training / real-codec summary:
+
+- Final W&B `rho_mean=1.0498`, `rho_max=1.0615`.
+- A/B at it=400: `delta_bpp_y=-0.0010`, PSNR equal. A/B at it=800 and final summary: same bpp saving with about `0.04 dB` PSNR loss.
+- Real-codec consistency passed on Kodak8 with `max_abs=0.000e+00`.
+
+Kodak8 real-codec q0 comparison:
+
+| run | bpp | PSNR | LPIPS | DISTS | FID | decision |
+|---|---:|---:|---:|---:|---:|---|
+| GLC q0 | 0.02699 | 20.8504 | 0.2028 | 0.1190 | 61.1080 | anchor |
+| stage q0 target1.05 | 0.02610 | 20.7860 | 0.2051 | 0.1203 | 60.4096 | reject for DISTS curve |
+| stage q0 target1.08 | 0.02564 | 20.7668 | 0.2088 | 0.1198 | 60.7882 | also not clean |
+
+Interpretation:
+
+- Lowering the q0 target reduced the LPIPS damage but did not protect DISTS. On this Kodak8 subset, q0 is too rate-starved for simple stage-wise coarsening to be a clean DISTS improvement.
+- Do not replace the stage-quant q0 anchor with either target1.05 or target1.08 yet.
+- If q0 is revisited, add explicit baseline reconstruction distillation or a sendability teacher; otherwise keep q0 as GLC/no-op and focus complete-design improvements on q1-q3.
+
+
+## 2026-06-20 JST - Stage-quant q0 rho_target=1.04 with baseline distillation stopped
+
+Goal: check whether explicit GLC-reconstruction distillation can make a very conservative q0 stage gate usable after target1.08 and target1.05 both hurt DISTS.
+
+Run:
+
+- `v4_stage_quant_v1q0_rhotarget104_baseDist_lR10_lp10_dists14_rt30_1000`
+- W&B: `zgu6f2zj`
+- settings: fixed GLC, `rho_target=1.04`, `lambda_R=10`, `lambda_lpips_distill=4`, `lambda_dists_distill=8`, strong LPIPS/DISTS hinges.
+- stopped after the 500-iteration A/B check.
+
+Observation:
+
+- rho reached about `1.04` as intended.
+- A/B at it=500: baseline `bpp_y=0.0226`, PSNR `18.50`; ours `bpp_y=0.0221`, PSNR `18.31`, so the saving was only `-0.0006` bpp_y with about `-0.19 dB` PSNR.
+
+Decision:
+
+- Do not continue this q0 direction for now. Even with conservative rho and baseline distillation, q0 does not offer a clean rate-perception tradeoff on the quick Kodak A/B signal.
+- Keep q0 as a no-op GLC anchor in the stage-quant curve until a better q0-specific mechanism exists. Continue complete-design work on q1-q3 or move to a jointly trained scratch decomposition.
+
+
+## 2026-06-20 JST - Scratch GP-ResLC Stage-A scaffold
+
+Goal: start the high-upside scratch branch that can learn the original GP-ResLC decomposition without being constrained by pretrained GLC latents. Stage A learns a compact semantic/generative VQ code `s`; later stages will add `mu_theta(s)` and entropy-code only the unpredictable residual.
+
+Implementation:
+
+- Added `gp_reslc/scratch/vq_autoencoder.py` with:
+  - residual Conv encoder/decoder,
+  - straight-through `VectorQuantizer`,
+  - fixed semantic index bpp reporting,
+  - default 16x16 latent grid for 256x256 crops.
+- Added `scripts/train_scratch_stage_a.py` with L1 + LPIPS + DISTS + VQ loss, W&B logging, validation panels, checkpointing, and a GPU guard.
+- Added `gp_reslc/scratch/__init__.py` exports.
+
+Smoke test:
+
+```bash
+.venv/bin/python scripts/train_scratch_stage_a.py \
+  --data /dpl/openimages/train --val /dpl/kodak \
+  --out experiments/scratch_stage_a_smoke \
+  --iters 2 --bs 1 --base_ch 32 --latent_dim 64 --codebook_size 128 \
+  --num_workers 0 --log_every 1 --eval_every 1 --no_wandb
+```
+
+Result:
+
+- `py_compile` passed for `gp_reslc/scratch/vq_autoencoder.py` and `scripts/train_scratch_stage_a.py`.
+- Two-iteration smoke completed on CUDA.
+- Semantic bpp for the small smoke model was `0.02734` because `codebook_size=128` gives 7 bits/index on a 16x16 grid.
+- Validation panel images and `stage_a_final.pt` were written to `experiments/scratch_stage_a_smoke/`.
+
+Interpretation:
+
+- This is not yet a codec result. It is the first runnable scaffold for the scratch semantic branch.
+- The next pilot should use `codebook_size=1024`, giving semantic fixed-index bpp about `0.03906` for 256 crops, which matches the GLC ultra-low-bitrate operating range.
+- Exit criterion for Stage A is not PSNR; it is whether `s`-only reconstructions become perceptually plausible without codebook collapse. Then Stage B can add `y = mu_theta(s) + r`.
+
+
+## 2026-06-20/21 JST - Scratch Stage-A VQ collapse and soft-entropy fix
+
+Goal: start the scratch semantic-code branch and check whether a 0.039 bpp VQ semantic code can train without codebook collapse.
+
+Runs:
+
+| run | W&B | setting | outcome |
+|---|---|---|---|
+| `scratch_stage_a_vq1024_b64_z128_lp1_dists1_3k` | `429wuhqo` | VQ-1024, base64, z128, no entropy regularization | stopped around it=700; hard perplexity collapsed to about 2-3. |
+| `scratch_stage_a_vq1024_b64_z128_entropy03_beta01_3k` | `tfc1gins` | hard one-hot entropy regularization | stopped around it=500; hard entropy has no useful gradient through argmin and collapse persisted. |
+| `scratch_stage_a_vq1024_b64_z128_softent_tau001_lam05_1500` | `sxfjozwa` | differentiable soft assignment entropy, `tau=0.01`, `lambda_codebook_entropy=0.5`, `vq_beta=0.1` | completed 1500 iters; hard perplexity stayed around 30-40 instead of collapsing. |
+
+Implementation updates:
+
+- `VectorQuantizer` now exposes soft assignment entropy from `softmax(-dist/tau)` in addition to hard code usage entropy.
+- `ScratchVQAutoencoder` accepts `vq_beta` and `vq_entropy_tau`.
+- `scripts/train_scratch_stage_a.py` logs hard/soft perplexity, hard/soft entropy, usage fraction, and supports `--lambda_codebook_entropy`.
+
+Best scratch Stage-A pilot so far:
+
+- run: `scratch_stage_a_vq1024_b64_z128_softent_tau001_lam05_1500`
+- W&B: `sxfjozwa`
+- fixed semantic index bpp: `0.03906` for 256 crops.
+- validation at it=500: L1 `0.1301`, LPIPS `0.5493`, DISTS `0.4470`, hard perplexity `34.0`, soft perplexity `63.6`.
+- validation at it=1000: L1 `0.0946`, LPIPS `0.5097`, DISTS `0.4589`, hard perplexity `31.0`, soft perplexity `34.6`.
+- final train summary: hard perplexity `37.3`, hard entropy norm `0.522`, usage fraction about `0.055`.
+
+Interpretation:
+
+- Stage A is now runnable and does not immediately collapse with soft entropy regularization.
+- The reconstruction quality is far from GLC and not paper-usable yet. This is expected: the model is small, trained only 1500 iterations, and has no GAN/perceptual decoder pretraining.
+- The key technical lesson is that hard assignment entropy is not a valid anti-collapse loss; soft assignment entropy or EMA/codebook reset is required.
+- Next scratch steps: add EMA or dead-code restart, lower the VQ loss instability, train Stage A longer, then introduce Stage B residual decomposition only after semantic reconstructions are plausible.
+
+
+## 2026-06-21 JST - Scratch Stage-A dead-code restart and low-rate grid support
+
+Goal: make the scratch semantic-code branch usable enough for the full GP-ResLC design. The key question is whether the VQ code can avoid collapse and whether the semantic stream can be made cheap enough that a residual stream can still fit below the official GLC curve.
+
+Run:
+
+| run | W&B | setting | outcome |
+|---|---|---|---|
+| `scratch_stage_a_vq1024_b64_z128_softent_restart_2k` | `2d7yi3uk` | VQ-1024, base64, z128, `vq_beta=0.1`, soft entropy `tau=0.01`, `lambda_codebook_entropy=0.5`, dead-code restart every 200 iters | completed 2000 iters; dead-code restart raised hard perplexity and usage far above the no-restart pilot. |
+
+Key scalar observations:
+
+- fixed semantic index bpp for the 16x16 grid remains `0.03906`.
+- validation at it=500: L1 `0.1654`, LPIPS `0.5334`, DISTS `0.5119`, hard perplexity `120.4`, hard entropy norm `0.691`, usage fraction `0.209`.
+- validation at it=1000: L1 `0.1770`, LPIPS `0.6269`, DISTS `0.4900`, hard perplexity `18.6`, hard entropy norm `0.422`, usage fraction `0.133`; this was a transient post-restart instability.
+- validation at it=1500: L1 `0.0980`, LPIPS `0.4610`, DISTS `0.4752`, hard perplexity `143.7`, hard entropy norm `0.717`, usage fraction `0.303`.
+- final train summary at it=1950: L1 `0.1096`, LPIPS `0.4211`, DISTS `0.4547`, hard perplexity `150.5`, hard entropy norm `0.723`, usage fraction `0.314`.
+
+Decision:
+
+- Dead-code restart is useful and should remain in Stage A. It improves codebook utilization much more than soft entropy alone, whose previous hard perplexity was around 30-40.
+- This branch is still not paper-leading. Reconstruction quality is far from GLC and the 16x16 fixed semantic cost is too high once a residual stream is added.
+- Added configurable `num_down` to `ScratchVQAutoencoder`: `num_down=4` gives a 16x16 semantic grid at `0.03906` bpp, while `num_down=5` gives an 8x8 grid at `0.00977` bpp for 256 crops. The latter is much closer to the intended full design: cheap semantic code plus unpredictable residual only.
+- Added `--resume` and `--num_down` to `scripts/train_scratch_stage_a.py`. Next high-upside experiment should train the 8x8 semantic code, then Stage B should learn `y = mu_theta(s) + r` on top of it.
+
+
+## 2026-06-21 JST - Scratch Stage-B semantic-conditioned residual proof signal
+
+Goal: implement and test the full GP-ResLC decomposition more directly than the pretrained GLC gate branch: transmit a cheap semantic code `s`, predict `mu_theta(s)` at the decoder, and entropy-code only the unpredictable residual `r = y - mu_theta(s)`.
+
+Implementation:
+
+- Added `gp_reslc/scratch/residual_autoencoder.py`.
+- Added `scripts/train_scratch_stage_b.py`.
+- Added `scripts/evaluate_scratch_stage_b.py` for deterministic Kodak center-crop evaluation.
+- Stage B freezes the Stage-A VQ semantic autoencoder, predicts `mu_theta(z_s)`, quantizes residual symbols with hard rounding at eval time, estimates residual rate with a Gaussian entropy proxy, and reconstructs through a residual decoder.
+- Important fix: residual decoder final convolution is zero-initialized, so the initial Stage-B reconstruction is exactly the Stage-A base reconstruction. This makes base/ours comparisons clean.
+- Important design fix: residual bottleneck now uses independent `residual_dim`; using the semantic latent width (`160ch`) made the residual stream start around `0.28 bpp`, which is incompatible with ultra-low-rate operation. `residual_dim=16`, `quant_step=1.0` starts around `0.02 residual bpp`.
+
+Stage-A source checkpoint:
+
+- `experiments/scratch_stage_a_vq1024_b80_z160_down5_softent_restart_8k/stage_a_0006000.pt`
+- W&B Stage A: `75mqqysy`
+- deterministic Kodak center Stage-A base: fixed semantic bpp `0.00977`, LPIPS `0.4578`, DISTS `0.4526`.
+
+Stage-B runs:
+
+| run | W&B | setting | outcome |
+|---|---|---|---|
+| `scratch_stage_b_down5_r16_q1_lR2_5k` | `7nk1zgmf` | `residual_dim=16`, `quant_step=1.0`, `lambda_R=2.0`, `lambda_pred=0.1` | stopped around it=1050; residual collapsed to near-zero hard bpp and validation did not improve over base. Negative result: rate pressure too strong and/or predictor collapse. |
+| `scratch_stage_b_down5_r16_q1_lR0p1_pred001_3k` | `8fgx365x` | `residual_dim=16`, `quant_step=1.0`, `lambda_R=0.1`, `lambda_pred=0.01` | completed 3000 iters; hard-quantized residual improves LPIPS and DISTS on deterministic Kodak center evaluation. |
+
+Deterministic Kodak center evaluation for `scratch_stage_b_down5_r16_q1_lR0p1_pred001_3k`:
+
+| ckpt | semantic bpp | residual bpp | total bpp | base LPIPS | ours LPIPS | base DISTS | ours DISTS | note |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `stage_b_0001000.pt` | 0.00977 | 0.01388 | 0.02364 | 0.45782 | 0.44830 | 0.45264 | 0.45627 | LPIPS improves, DISTS worsens. |
+| `stage_b_0002000.pt` | 0.00977 | 0.02365 | 0.03342 | 0.45782 | 0.43959 | 0.45264 | 0.44981 | first clean LPIPS+DISTS improvement. |
+| `stage_b_final.pt` | 0.00977 | 0.02872 | 0.03848 | 0.45782 | 0.43485 | 0.45264 | 0.43711 | strongest current Stage-B quality; rate is high. |
+
+Decision:
+
+- This is a real proof signal for the original design axis: a cheap semantic stream plus hard-quantized residual can improve perceptual quality, and the residual is explicitly represented as `y - mu_theta(s)`.
+- It is not yet competitive with GLC; absolute DISTS is still around `0.44`, far from the pretrained GLC real-codec curve. Keep pretrained rho/stage-quant as the VCIP safety lead.
+- Next scratch research should optimize the Stage-B tradeoff, not just train longer: try `lambda_R=0.3-0.5`, higher DISTS weight, and possibly `residual_dim=8/16` sweeps. Then add a real residual entropy coder only after the proxy curve is meaningful.
+
+
+## 2026-06-21 JST - Scratch Stage-B DISTS-weighted tradeoff improvement
+
+Goal: reduce the Stage-B residual bpp while keeping the hard-quantized residual useful for both LPIPS and DISTS.
+
+Run:
+
+| run | W&B | setting | outcome |
+|---|---|---|---|
+| `scratch_stage_b_down5_r16_q1_lR0p3_d2_3k` | `2ii44jvx` | `residual_dim=16`, `quant_step=1.0`, `lambda_R=0.3`, `lambda_lpips=0.7`, `lambda_dists=2.0`, `lambda_pred=0.01` | completed 3000 iters; much better rate-quality tradeoff than the previous `lambda_R=0.1` run. |
+
+Deterministic Kodak center evaluation:
+
+| ckpt | semantic bpp | residual bpp | total bpp | base LPIPS | ours LPIPS | base DISTS | ours DISTS | note |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `stage_b_0001000.pt` | 0.00977 | 0.00628 | 0.01604 | 0.45782 | 0.45291 | 0.45264 | 0.44885 | efficient early point. |
+| `stage_b_0002000.pt` | 0.00977 | 0.00861 | 0.01838 | 0.45782 | 0.45164 | 0.45264 | 0.44077 | best current Stage-B tradeoff. |
+| `stage_b_final.pt` | 0.00977 | 0.01015 | 0.01991 | 0.45782 | 0.44792 | 0.45264 | 0.44211 | better LPIPS, slightly worse DISTS than 2000. |
+
+Comparison to previous Stage-B `lambda_R=0.1` final:
+
+- Previous final: total bpp `0.03848`, LPIPS `0.43485`, DISTS `0.43711`.
+- New 2000 ckpt: total bpp `0.01838`, LPIPS `0.45164`, DISTS `0.44077`.
+
+Decision:
+
+- `lambda_R=0.3` + DISTS-heavy loss is the better Stage-B operating region for the current weak Stage-A base. It gives most of the DISTS gain at less than half the residual rate.
+- The next sweep should test `residual_dim=8` and maybe `quant_step=0.75/1.0` to see whether the residual stream can be kept near `0.005-0.008 bpp` without losing the DISTS gain.
+- This remains a scratch proof-of-concept, not a GLC-competitive curve.
+
+
+## 2026-06-21 JST - Scratch Stage-B residual_dim=8 sweep
+
+Goal: test whether the residual stream can be narrowed below 16 channels while preserving the DISTS-heavy Stage-B gain.
+
+Run:
+
+| run | W&B | setting | outcome |
+|---|---|---|---|
+| `scratch_stage_b_down5_r8_q1_lR0p3_d2_3k` | `r925d692` | `residual_dim=8`, `quant_step=1.0`, `lambda_R=0.3`, `lambda_lpips=0.7`, `lambda_dists=2.0`, `lambda_pred=0.01` | completed 3000 iters; strongest DISTS improvement so far, with slightly higher bpp than the best r16 efficiency point. |
+
+Deterministic Kodak center evaluation:
+
+| ckpt | semantic bpp | residual bpp | total bpp | base LPIPS | ours LPIPS | base DISTS | ours DISTS | note |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `stage_b_0001000.pt` | 0.00977 | 0.01010 | 0.01987 | 0.45782 | 0.45169 | 0.45264 | 0.44540 | improves both, but weaker than r16 2000. |
+| `stage_b_0002000.pt` | 0.00977 | 0.01163 | 0.02140 | 0.45782 | 0.45110 | 0.45264 | 0.43932 | slightly better DISTS than r16 2000, higher bpp. |
+| `stage_b_final.pt` | 0.00977 | 0.01369 | 0.02345 | 0.45782 | 0.44438 | 0.45264 | 0.43024 | strongest current Stage-B perceptual result. |
+
+Current scratch Stage-B Pareto points:
+
+| model | total bpp | LPIPS | DISTS | interpretation |
+|---|---:|---:|---:|---|
+| Stage-A base | 0.00977 | 0.45782 | 0.45264 | semantic-only generator. |
+| r16 DISTS-heavy 1000 | 0.01604 | 0.45291 | 0.44885 | efficient first residual point. |
+| r16 DISTS-heavy 2000 | 0.01838 | 0.45164 | 0.44077 | best efficiency point. |
+| r8 DISTS-heavy final | 0.02345 | 0.44438 | 0.43024 | best current quality point. |
+
+Decision:
+
+- `residual_dim=8` is not too narrow; it can produce the strongest DISTS improvement, likely because the narrow bottleneck regularizes the residual decoder and avoids sending broad noisy corrections.
+- For the next scratch run, test `residual_dim=8`, `lambda_R=0.5`, or `quant_step=1.25` to seek a point near total bpp `0.018-0.020` with DISTS closer to `0.43`.
+- Longer-term blocker remains Stage-A generator quality. Even the best Stage-B scratch result is far from GLC, so this branch is method-faithful but not yet competitive.
+
+
+## 2026-06-21 JST - Scratch Stage-B residual_dim=8 lambda_R=0.5 sweep
+
+Goal: tighten the `residual_dim=8` DISTS-heavy run and search for a lower-bpp point than `lambda_R=0.3` while preserving perceptual gains.
+
+Run:
+
+| run | W&B | setting | outcome |
+|---|---|---|---|
+| `scratch_stage_b_down5_r8_q1_lR0p5_d2_3k` | `wwi995cn` | `residual_dim=8`, `quant_step=1.0`, `lambda_R=0.5`, `lambda_lpips=0.7`, `lambda_dists=2.0`, `lambda_pred=0.01` | completed 3000 iters; best current low-rate Stage-B sweep. |
+
+Deterministic Kodak center evaluation:
+
+| ckpt | semantic bpp | residual bpp | total bpp | base LPIPS | ours LPIPS | base DISTS | ours DISTS | note |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `stage_b_0001000.pt` | 0.00977 | 0.00655 | 0.01631 | 0.45782 | 0.45442 | 0.45264 | 0.44100 | low-rate point, DISTS clearly improves. |
+| `stage_b_0002000.pt` | 0.00977 | 0.00798 | 0.01775 | 0.45782 | 0.45258 | 0.45264 | 0.43456 | best current DISTS-efficiency point. |
+| `stage_b_best.pt` | 0.00977 | 0.00826 | 0.01803 | 0.45782 | 0.45001 | 0.45264 | 0.43529 | random-val best, fixed eval slightly behind 2000. |
+| `stage_b_final.pt` | 0.00977 | 0.00838 | 0.01815 | 0.45782 | 0.44694 | 0.45264 | 0.43709 | LPIPS-best among low-rate r8 points. |
+
+Updated scratch Stage-B Pareto:
+
+| model | total bpp | LPIPS | DISTS | interpretation |
+|---|---:|---:|---:|---|
+| Stage-A base | 0.00977 | 0.45782 | 0.45264 | semantic-only generator. |
+| r8 lR0.5 1000 | 0.01631 | 0.45442 | 0.44100 | lowest useful residual point. |
+| r8 lR0.5 2000 | 0.01775 | 0.45258 | 0.43456 | best current DISTS-efficient point. |
+| r8 lR0.5 final | 0.01815 | 0.44694 | 0.43709 | best current LPIPS-efficient low-rate point. |
+| r8 lR0.3 final | 0.02345 | 0.44438 | 0.43024 | best current DISTS quality point. |
+
+Decision:
+
+- `residual_dim=8`, `lambda_R=0.5`, DISTS-heavy loss is the best current scratch Stage-B operating region.
+- This produces a coherent low-rate residual curve from total bpp `0.0163` to `0.0235`, all improving DISTS over the semantic-only base.
+- This is still far from GLC absolute quality, so the next high-impact work is Stage-A/generator improvement or adding a stronger perceptual generator/discriminator, not squeezing Stage-B proxy further.
+
+
+## 2026-06-21 JST - Scratch Stage-A continuation check
+
+Goal: test whether simply continuing the down5 Stage-A semantic generator improves the absolute base quality that currently bottlenecks Stage B.
+
+Run:
+
+| run | W&B | setting | outcome |
+|---|---|---|---|
+| `scratch_stage_a_down5_from6000_continue30k_lr1e4` | `2j544u3v` | resumed `stage_a_0006000.pt`, lower lr `1e-4`, planned 30k but stopped after 10k checkpoint due weak validation trend | no meaningful fixed-eval improvement; simple continuation is not the right next lever. |
+
+Deterministic Kodak center evaluation:
+
+| checkpoint | bpp | LPIPS | DISTS | note |
+|---|---:|---:|---:|---|
+| original `stage_a_0006000.pt` | 0.00977 | 0.45782 | 0.45264 | Stage-B source checkpoint. |
+| continued `stage_a_best.pt` | 0.00977 | 0.45730 | 0.45180 | tiny DISTS/LPIPS improvement only. |
+| continued `stage_a_0010000.pt` | 0.00977 | 0.44929 | 0.45899 | LPIPS improves, DISTS worsens. |
+
+Decision:
+
+- Do not spend more time on plain Stage-A continuation with the same loss. It does not materially improve the generator bottleneck.
+- Next Stage-A work should change the objective/model, e.g. adversarial fine-tuning, stronger decoder, or multi-scale perceptual losses.
+
+
+## 2026-06-21 JST - Scratch Stage-A adversarial fine-tuning negative result
+
+Goal: test whether a lightweight PatchGAN fine-tune can improve the weak Stage-A generator that currently bottlenecks scratch Stage-B absolute quality.
+
+Implementation:
+
+- Added `gp_reslc/scratch/discriminator.py` with a spectral-normalized PatchDiscriminator.
+- Added `scripts/train_scratch_stage_a_adv.py`.
+- Added checkpoint compatibility fallback so adversarial Stage-A checkpoints can be loaded by `evaluate_scratch_stage_a.py` and Stage-B scripts.
+
+Run:
+
+| run | W&B | setting | outcome |
+|---|---|---|---|
+| `scratch_stage_a_adv_down5_ladv001_3k` | `7uwfab18` | resumed Stage-A 6000, `lambda_adv=0.01`, PatchGAN, reconstruction+LPIPS+DISTS retained | stopped around it=1150; validation DISTS/LPIPS worsened. |
+
+Observed validation:
+
+- val0: LPIPS `0.4609`, DISTS `0.4173`.
+- val500: LPIPS `0.4950`, DISTS `0.4480`.
+- val1000: LPIPS `0.4731`, DISTS `0.4912`.
+
+Decision:
+
+- This adversarial setting is not useful for the current Stage-A objective. The discriminator becomes strong quickly and DISTS degrades.
+- Do not continue this GAN direction without a more careful setup: lower `lambda_adv`, delayed adversarial start, feature matching, or a discriminator trained on larger crops/multi-scale patches.
+- For now, the best scratch route remains Stage-B residual factorization with the current Stage-A base; Stage-A generator improvement needs a more deliberate redesign.
+
+
+## 2026-06-21 JST - Scratch Stage-A DISTS-heavy fine-tune
+
+Goal: improve the Stage-A generator bottleneck without GAN by applying the DISTS-heavy objective that worked for Stage B.
+
+Run:
+
+| run | W&B | setting | outcome |
+|---|---|---|---|
+| `scratch_stage_a_down5_from6000_dists2_lp05_12k` | `zd8omzv0` | resumed Stage-A 6000, `lambda_dists=2.0`, `lambda_lpips=0.5`, lr `1e-4`; stopped after 8000 checkpoint | small but real fixed-eval improvement; better than plain continuation. |
+
+Deterministic Kodak center evaluation:
+
+| checkpoint | bpp | LPIPS | DISTS | note |
+|---|---:|---:|---:|---|
+| original `stage_a_0006000.pt` | 0.00977 | 0.45782 | 0.45264 | previous Stage-B source. |
+| DISTS-heavy `stage_a_best.pt` | 0.00977 | 0.45757 | 0.45266 | random-val best did not transfer. |
+| DISTS-heavy `stage_a_0008000.pt` | 0.00977 | 0.45221 | 0.44797 | best fixed Stage-A so far. |
+
+Decision:
+
+- DISTS-heavy Stage-A fine-tuning is mildly useful and should replace the original 6000 checkpoint for the next Stage-B sweep.
+- The gain is small, so it does not solve the scratch absolute-quality gap by itself.
+
+
+
+## 2026-06-21 JST - Scratch Stage-B from DISTS-heavy Stage-A, lower rate pressure
+
+Goal: test whether the improved Stage-A base (`stage_a_0008000.pt` from the DISTS-heavy fine-tune) gives a better residual decomposition when Stage B is allowed to spend more residual bits.
+
+Run:
+
+| run | W&B | Stage-A source | setting |
+|---|---|---|---|
+| `scratch_stage_b_from_stageA_d2_8000_r8_q1_lR0p1_d2_3k` | `9gbu1r38` | `experiments/scratch_stage_a_down5_from6000_dists2_lp05_12k/stage_a_0008000.pt` | `residual_dim=8`, `quant_step=1.0`, `lambda_R=0.1`, `lambda_lpips=0.7`, `lambda_dists=2.0`, `lambda_pred=0.01` |
+
+Deterministic Kodak center evaluation:
+
+| checkpoint | total bpp | residual bpp | base LPIPS | LPIPS | base DISTS | DISTS |
+|---|---:|---:|---:|---:|---:|---:|
+| `stage_b_0001000.pt` | 0.02098 | 0.01121 | 0.45221 | 0.44131 | 0.44797 | 0.44371 |
+| `stage_b_0002000.pt` | 0.02052 | 0.01075 | 0.45221 | 0.43713 | 0.44797 | 0.44182 |
+| `stage_b_best.pt` | 0.02257 | 0.01280 | 0.45221 | 0.43354 | 0.44797 | 0.43681 |
+| `stage_b_final.pt` | 0.02212 | 0.01236 | 0.45221 | 0.43832 | 0.44797 | 0.43195 |
+
+Interpretation:
+
+- The hard-quantized residual stream again improves both LPIPS and DISTS over the Stage-A base, so the residual decomposition mechanism remains valid.
+- This run does not update the scratch Pareto frontier: the previous `lambda_R=0.5` r8 run gives DISTS `0.43456` at bpp `0.01775`, and the r8 `lambda_R=0.3` final gives DISTS `0.43024` at bpp `0.02345`.
+- Lowering `lambda_R` to `0.1` spends bits less efficiently on this Stage-A source. The better Stage-A base helps absolute DISTS slightly, but the residual model does not convert the extra bpp into a clear quality-rate win.
+
+Decision:
+
+- Do not promote this run as the scratch lead.
+- Keep the current scratch lead as `scratch_stage_b_down5_r8_q1_lR0p5_d2_3k` for low-rate efficiency and `scratch_stage_b_down5_r8_q1_lR0p3_d2_3k` for the higher-quality point.
+- The next high-value experiment should change the generator/Stage-A architecture or objective rather than simply relaxing the residual rate term.
+
+
+
+## 2026-06-21 JST - Scratch Stage-A latent refinement and Stage-B Pareto update
+
+Goal: improve the weak scratch Stage-A generator without changing semantic rate, then test whether the residual stream benefits from the stronger semantic generator.
+
+Implementation:
+
+- Added optional `decoder_attention` and `extra_decoder_blocks` to `ScratchVQAutoencoder`.
+- The new modules live in `latent_refine` before the original decoder, so existing decoder weights keep identical names and can be fully reused.
+- Added `--resume_partial` to `scripts/train_scratch_stage_a.py`; the attention/refine experiment loaded all 138 existing tensors from the DISTS-heavy Stage-A checkpoint and skipped 0 old tensors.
+- New latent-refine blocks are identity-initialized, and attention output projection is zero-initialized. A direct output-difference check against the source checkpoint gave max/mean diff `0.0/0.0` before fine-tuning.
+
+Stage-A run:
+
+| run | W&B | source | setting |
+|---|---|---|---|
+| `scratch_stage_a_down5_attn_refine_from_d2_8000_6k` | `lbzhch1m` | `scratch_stage_a_down5_from6000_dists2_lp05_12k/stage_a_0008000.pt` | `decoder_attention`, `extra_decoder_blocks=2`, lr `5e-5`, DISTS-heavy objective |
+
+Deterministic Kodak center Stage-A evaluation:
+
+| checkpoint | bpp | LPIPS | DISTS | note |
+|---|---:|---:|---:|---|
+| source `stage_a_0008000.pt` | 0.00977 | 0.45221 | 0.44797 | previous best Stage-A base. |
+| attn `stage_a_best.pt` / `stage_a_0002000.pt` | 0.00977 | 0.45767 | 0.43546 | strong DISTS gain, LPIPS worsens. |
+| attn `stage_a_final.pt` | 0.00977 | 0.44733 | 0.45193 | LPIPS improves, DISTS worsens. |
+
+Stage-B run from DISTS-best attention Stage-A:
+
+| run | W&B | Stage-A source | setting |
+|---|---|---|---|
+| `scratch_stage_b_from_attnA_best_r8_q1_lR0p5_d2_3k` | `4a1jwvsw` | `scratch_stage_a_down5_attn_refine_from_d2_8000_6k/stage_a_best.pt` | `residual_dim=8`, `quant_step=1.0`, `lambda_R=0.5`, `lambda_lpips=0.7`, `lambda_dists=2.0` |
+
+Deterministic Kodak center Stage-B evaluation:
+
+| checkpoint | total bpp | residual bpp | base LPIPS | LPIPS | base DISTS | DISTS |
+|---|---:|---:|---:|---:|---:|---:|
+| `stage_b_0001000.pt` | 0.01489 | 0.00512 | 0.45767 | 0.44398 | 0.43546 | 0.43239 |
+| `stage_b_0002000.pt` | 0.01315 | 0.00339 | 0.45767 | 0.43685 | 0.43546 | 0.42912 |
+| `stage_b_best.pt` | 0.01390 | 0.00414 | 0.45767 | 0.43918 | 0.43546 | 0.42890 |
+| `stage_b_final.pt` | 0.01328 | 0.00352 | 0.45767 | 0.43770 | 0.43546 | 0.42446 |
+
+Interpretation:
+
+- This is the first clear scratch Pareto update. The previous scratch low-rate lead was `0.01775` bpp / DISTS `0.43456`; the new final point reaches `0.01328` bpp / DISTS `0.42446`.
+- The result directly supports the original decomposition: a cheap 8x8 semantic/generator code (`0.00977` bpp) plus only `0.0035` residual proxy bpp improves both LPIPS and DISTS over the stronger Stage-A base.
+- Absolute quality remains far below the pretrained GLC real-codec lead, so this is not the submission lead yet. It is now a credible complete-design branch rather than just a proof-of-concept.
+
+Decision:
+
+- Promote `scratch_stage_b_from_attnA_best_r8_q1_lR0p5_d2_3k/stage_b_final.pt` as the current scratch low-rate lead.
+- Next: run a lower-rate-pressure Stage-B from the same attention Stage-A (`lambda_R=0.3` or `0.2`) to see whether a quality-side scratch point can move below DISTS `0.42` while staying under roughly `0.02` bpp.
+
+
+
+## 2026-06-21 JST - Scratch Stage-B quality-side sweep from attention Stage-A
+
+Goal: after the strong `lambda_R=0.5` low-rate update, test whether lower rate pressure gives a useful quality-side scratch point from the same attention-refined Stage-A.
+
+Run:
+
+| run | W&B | Stage-A source | setting |
+|---|---|---|---|
+| `scratch_stage_b_from_attnA_best_r8_q1_lR0p3_d2_3k` | `vo5d3dkz` | `scratch_stage_a_down5_attn_refine_from_d2_8000_6k/stage_a_best.pt` | `residual_dim=8`, `quant_step=1.0`, `lambda_R=0.3`, `lambda_lpips=0.7`, `lambda_dists=2.0` |
+
+Deterministic Kodak center evaluation:
+
+| checkpoint | total bpp | residual bpp | base LPIPS | LPIPS | base DISTS | DISTS |
+|---|---:|---:|---:|---:|---:|---:|
+| `stage_b_0001000.pt` | 0.01761 | 0.00784 | 0.45767 | 0.44674 | 0.43546 | 0.42673 |
+| `stage_b_0002000.pt` | 0.01417 | 0.00440 | 0.45767 | 0.43985 | 0.43546 | 0.43012 |
+| `stage_b_best.pt` | 0.01847 | 0.00871 | 0.45767 | 0.44850 | 0.43546 | 0.43254 |
+| `stage_b_final.pt` | 0.01588 | 0.00611 | 0.45767 | 0.43752 | 0.43546 | 0.42396 |
+
+Interpretation:
+
+- `lambda_R=0.3` final gives a slightly better DISTS point than `lambda_R=0.5` final (`0.42396` vs `0.42446`) at higher bpp (`0.01588` vs `0.01328`).
+- The gain is small, but it forms a reasonable second point for a scratch rate-perception curve.
+- The random-val `stage_b_best.pt` did not transfer to fixed Kodak evaluation, so fixed deterministic evaluation remains necessary for checkpoint selection.
+
+Decision:
+
+- Keep `lambda_R=0.5` final as the best low-rate scratch point.
+- Keep `lambda_R=0.3` final as the current scratch quality-side point.
+- Further gains are more likely from residual modeling/progressive residual coding than simply lowering `lambda_R` again.
+
+
+
+## 2026-06-21 JST - Scratch Stage-B continuation from lambda_R 0.5 lead
+
+Goal: continue the best `lambda_R=0.5` Stage-B model at lower lr to see whether the scratch lead can improve without changing architecture.
+
+Implementation:
+
+- Added `--resume` support to `scripts/train_scratch_stage_b.py`.
+- Continued `scratch_stage_b_from_attnA_best_r8_q1_lR0p5_d2_3k/stage_b_final.pt` from it=3000 to it=6000 with lr `1e-4`.
+
+Run:
+
+| run | W&B | resume | setting |
+|---|---|---|---|
+| `scratch_stage_b_from_attnA_best_r8_q1_lR0p5_continue6k` | `vektoxqk` | `scratch_stage_b_from_attnA_best_r8_q1_lR0p5_d2_3k/stage_b_final.pt` | same objective, lr `1e-4`, total iters `6000` |
+
+Deterministic Kodak center evaluation:
+
+| checkpoint | total bpp | residual bpp | LPIPS | DISTS | note |
+|---|---:|---:|---:|---:|---|
+| source final | 0.01328 | 0.00352 | 0.43770 | 0.42446 | previous scratch low-rate lead. |
+| continued `stage_b_0004000.pt` | 0.01321 | 0.00345 | 0.43869 | 0.42313 | best DISTS update. |
+| continued `stage_b_0005000.pt` | 0.01310 | 0.00333 | 0.43657 | 0.42641 | better LPIPS, worse DISTS. |
+| continued `stage_b_best.pt` | 0.01328 | 0.00352 | 0.43733 | 0.42427 | random-val best; small. |
+| continued `stage_b_final.pt` | 0.01338 | 0.00362 | 0.43546 | 0.42642 | best LPIPS among this group. |
+
+Interpretation:
+
+- Continued training gives a small DISTS update at 4000: `0.01321` bpp / DISTS `0.42313`.
+- Later checkpoints move toward LPIPS/MSE improvement but sacrifice DISTS.
+- This reinforces that checkpoint selection should be metric-specific. For R-P/DISTS, use the 4000 checkpoint; for LPIPS auxiliary reporting, final/5000 can be referenced but not promoted.
+
+Decision:
+
+- Promote `scratch_stage_b_from_attnA_best_r8_q1_lR0p5_continue6k/stage_b_0004000.pt` as the current scratch DISTS lead.
+- Keep the original/continued final checkpoints only as auxiliary LPIPS-oriented variants.
+
+
+
+## 2026-06-21 JST - Scratch lead DIV2K center-crop generalization check
+
+Goal: verify that the current scratch DISTS lead is not only improving Kodak center crops.
+
+Evaluation note: this is not the official GLC/HiFiC DIV2K full-resolution shifted-patch FID protocol. It is the scratch evaluator's deterministic 256x256 center-crop sanity check over `/dpl/div2k` validation images.
+
+Run evaluated:
+
+| checkpoint | dataset | images | total bpp | residual bpp | base LPIPS | LPIPS | base DISTS | DISTS |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `scratch_stage_b_from_attnA_best_r8_q1_lR0p5_continue6k/stage_b_0004000.pt` | DIV2K val center crop | 100 | 0.01364 | 0.00388 | 0.44078 | 0.42058 | 0.42494 | 0.41563 |
+
+Interpretation:
+
+- The same checkpoint improves LPIPS and DISTS on DIV2K center crops, so the scratch improvement is not Kodak-only.
+- The absolute quality is still far below pretrained GLC, but the decomposition signal generalizes across at least Kodak and DIV2K center crops.
+
+
+
+## 2026-06-21 JST - Scratch Stage-B residual_dim=4 negative result
+
+Goal: test whether a narrower residual latent can create an even lower-rate scratch point.
+
+Implementation:
+
+- Updated scratch GroupNorm handling to choose a valid group count for small channel widths. Existing 8-divisible channels still use GroupNorm(8), so previous checkpoints remain compatible.
+- Trained `residual_dim=4` from the attention-refined Stage-A.
+
+Run:
+
+| run | W&B | setting |
+|---|---|---|
+| `scratch_stage_b_from_attnA_best_r4_q1_lR0p5_d2_3k` | `2sb82ffg` | `residual_dim=4`, `quant_step=1.0`, `lambda_R=0.5`, DISTS-heavy objective |
+
+Deterministic Kodak center evaluation:
+
+| checkpoint | total bpp | residual bpp | LPIPS | DISTS | scale mean |
+|---|---:|---:|---:|---:|---:|
+| `stage_b_0001000.pt` | 0.01540 | 0.00564 | 0.44545 | 0.42986 | 0.62947 |
+| `stage_b_best.pt` | 0.01376 | 0.00399 | 0.43780 | 0.42853 | 0.96634 |
+| `stage_b_final.pt` | 0.01404 | 0.00427 | 0.43943 | 0.42657 | 1.13993 |
+
+Interpretation:
+
+- Narrowing to `residual_dim=4` does not beat the r8 lead (`0.01321` bpp / DISTS `0.42313`).
+- The model compensates for the narrow residual by increasing scale and residual magnitude; lower dimension does not translate into better bitrate-quality efficiency.
+- r8 currently looks like the smallest useful residual width for this architecture.
+
+Decision:
+
+- Do not pursue narrower residual dimensions before changing residual coding structure.
+- Next residual-side idea should be progressive/RVQ residual stages or better entropy conditioning, not smaller single bottleneck width.
+
+
+
+## 2026-06-21 JST - Scratch Stage-B residual_dim=16 ablation
+
+Goal: test whether a wider residual bottleneck gives a better quality-side point from the attention-refined Stage-A.
+
+Run:
+
+| run | W&B | setting |
+|---|---|---|
+| `scratch_stage_b_from_attnA_best_r16_q1_lR0p5_d2_3k` | `kivq0tki` | `residual_dim=16`, `quant_step=1.0`, `lambda_R=0.5`, DISTS-heavy objective |
+
+Deterministic Kodak center evaluation:
+
+| checkpoint | total bpp | residual bpp | LPIPS | DISTS | note |
+|---|---:|---:|---:|---:|---|
+| `stage_b_0001000.pt` | 0.01147 | 0.00171 | 0.44868 | 0.43433 | very low rate, small gain. |
+| `stage_b_best.pt` | 0.03115 | 0.02138 | 0.45881 | 0.43478 | random-val best does not transfer; high bpp wasted. |
+| `stage_b_final.pt` | 0.01258 | 0.00281 | 0.43866 | 0.43298 | low-rate auxiliary point, not a quality update. |
+
+Interpretation:
+
+- With `lambda_R=0.5`, r16 is regularized so strongly that it mostly collapses residual transmission; it does not produce the desired quality-side point.
+- It can form an ultra-low-rate auxiliary point, but r8 remains much better at comparable bpp-quality tradeoff.
+- A wider residual bottleneck only makes sense with a different rate schedule, progressive stages, or lower `lambda_R`; simple r16 is not enough.
+
+Decision:
+
+- Do not promote r16 as quality lead.
+- Current best remains r8 continued 4000: `0.01321` bpp / DISTS `0.42313`.
+
+
+
+## 2026-06-21 JST - Scratch Stage-B quant_step=0.5 negative result
+
+Goal: test whether finer residual quantization improves the quality side of the r8 scratch curve.
+
+Run:
+
+| run | W&B | setting |
+|---|---|---|
+| `scratch_stage_b_from_attnA_best_r8_q0p5_lR0p5_d2_3k` | `5e0rulf9` | `residual_dim=8`, `quant_step=0.5`, `lambda_R=0.5`, DISTS-heavy objective |
+
+Deterministic Kodak center evaluation:
+
+| checkpoint | total bpp | residual bpp | LPIPS | DISTS |
+|---|---:|---:|---:|---:|
+| `stage_b_0002000.pt` | 0.01329 | 0.00353 | 0.43616 | 0.43199 |
+| `stage_b_best.pt` | 0.01592 | 0.00615 | 0.44979 | 0.43322 |
+| `stage_b_final.pt` | 0.01339 | 0.00362 | 0.43954 | 0.43302 |
+
+Interpretation:
+
+- Finer residual quantization does not improve fixed Kodak DISTS. It is consistently worse than `quant_step=1.0` r8.
+- The model appears to adjust residual magnitude/scale so the proxy bpp remains similar, but the residual correction is less perceptually efficient.
+
+Decision:
+
+- Keep `quant_step=1.0` for the current scratch Stage-B.
+- Do not spend more time on scalar quant_step sweeps until residual representation is changed.
+
+
+
+## 2026-06-21 JST - Scratch Stage-B stronger-DISTS objective negative result
+
+Goal: push the current r8/q1 Stage-B toward a better DISTS point by increasing DISTS weight and reducing LPIPS weight.
+
+Run:
+
+| run | W&B | setting |
+|---|---|---|
+| `scratch_stage_b_from_attnA_best_r8_q1_lR0p5_d3_lp05_3k` | `hanx5zoe` | `residual_dim=8`, `quant_step=1.0`, `lambda_R=0.5`, `lambda_dists=3.0`, `lambda_lpips=0.5` |
+
+Deterministic Kodak center evaluation:
+
+| checkpoint | total bpp | residual bpp | LPIPS | DISTS |
+|---|---:|---:|---:|---:|
+| `stage_b_best.pt` | 0.01341 | 0.00364 | 0.44364 | 0.42692 |
+| `stage_b_final.pt` | 0.01331 | 0.00354 | 0.44963 | 0.42984 |
+
+Interpretation:
+
+- Increasing DISTS loss weight does not improve fixed Kodak DISTS. The model still gravitates to a similar residual bpp but less effective correction.
+- The previous objective (`lambda_dists=2.0`, `lambda_lpips=0.7`) remains better.
+
+Decision:
+
+- Keep the current Stage-B objective. Further DISTS gains need architecture/residual-coding changes, not a simple DISTS weight increase.
+
+
+## 2026-06-21 Scratch Progressive Residual Experiments
+
+Implemented `ScratchProgressiveResidualBottleneck` with stage-wise bpp logging, optional decoder-side hard gate, and soft-train/hard-eval gating. The implementation can initialize from the best single-stage Stage-B checkpoint.
+
+W&B:
+- `337eca40`: non-gated two-stage progressive residual, `lambda_R=0.6`.
+- `ig60pxg2`: hard-gated constant-init pilot, stopped because stage 1 stayed closed.
+- `faev11ea`: hard-gated random-init pilot, stopped because stage 1 collapsed closed.
+- `4ht20cqw`: soft-train/hard-eval gated progressive residual.
+
+Kodak center-crop fixed evaluation:
+- Non-gated progressive 2000: bpp 0.01954, LPIPS 0.43337, DISTS 0.41948, stage1 bpp 0.00694. Quality improves, but bpp is too high.
+- Non-gated progressive final: bpp 0.02000, LPIPS 0.42979, DISTS 0.42299. LPIPS improves but DISTS not better enough.
+- Gated soft-train 1000: bpp 0.01299, LPIPS 0.43538, DISTS 0.42373, stage1 bpp near zero. Good lower-rate curve point, but stage 1 is not yet doing useful work.
+- Gated soft-train final: bpp 0.01312, LPIPS 0.43677, DISTS 0.42500.
+
+Conclusion: progressive residual is not yet the scratch lead. It exposes the next research need: stage 1 needs a stage-specific correction decoder or an explicit improvement hinge so it learns a non-redundant residual role instead of being pruned away by the rate term.
+
+
+## 2026-06-21 Progressive Gate Threshold Sweep
+
+Added `--gate_threshold_override` to `scripts/evaluate_scratch_stage_b.py` to test whether the decoder-side gate threshold can act as a no-side-info rate knob. The gated soft-train 1000 checkpoint was evaluated on Kodak center crops:
+
+- threshold 0.20: bpp 0.01299, LPIPS 0.43538, DISTS 0.42373, stage1 bpp ~0.
+- threshold 0.15: bpp 0.01326, LPIPS 0.43525, DISTS 0.42371, stage1 bpp 0.00028.
+- threshold 0.10: bpp 0.01478, LPIPS 0.43448, DISTS 0.42360, stage1 bpp 0.00179.
+- threshold 0.05: bpp 0.01658, LPIPS 0.43284, DISTS 0.42352, stage1 bpp 0.00359.
+
+The threshold knob is valid mechanically, but the current fine residual is not DISTS-efficient. Also tested a stage-specific fine correction decoder; 1000-step Kodak result was bpp 0.01323, LPIPS 0.43615, DISTS 0.42441, stage1 bpp 0. The next fix should explicitly train stage 1 to improve a stage-0 reconstruction.
+
+
+## 2026-06-21 Stage-Improvement Hinge Pilot
+
+Implemented `stage0_x_hat` in `ScratchProgressiveResidualBottleneck` and added `--lambda_stage_improve` / `--stage_improve_margin` to Stage-B training. Pilot W&B run `9g72335u` used fine correction decoder + soft train/hard eval gate + `lambda_stage_improve=5.0`, margin `0.001`; stopped after 1000 steps because hard stage 1 remained closed.
+
+Fixed evaluation:
+- Kodak center: bpp 0.01422, LPIPS 0.43778, DISTS 0.42232, stage1 bpp 0. This updates the scratch quality-side point but not the low-rate lead.
+- Kodak center threshold 0.10: bpp 0.01611, LPIPS 0.43780, DISTS 0.42234, stage1 bpp 0.00189. Opening stage 1 does not help.
+- DIV2K center: bpp 0.01553, LPIPS 0.42011, DISTS 0.41333, stage1 bpp 0.
+
+Conclusion: the hinge helps the residual model improve DISTS, but still through stage 0. Fine stage specialization needs a warmup or hard-gate-aware training objective.
+
+
+## 2026-06-21 Stage-1 Warmup and Gate Fine-Tune
+
+Added `--train_only_extra_stages` to freeze the base residual path and train only the extra stage modules. Ran W&B `rubquyfn` with stage 1 forced open. Kodak center final: bpp 0.02003, LPIPS 0.43720, DISTS 0.42222, stage1 bpp 0.00681. This confirms the fine stage can carry useful residual information, but it is too expensive when always transmitted.
+
+Then ran W&B `v0jqpxyq`, gate/rate fine-tuning from the warmup checkpoint. Kodak center final: bpp 0.01349, LPIPS 0.43748, DISTS 0.42283, stage1 bpp ~0.00001. Threshold 0.10 opens stage1 to 0.00186 bpp but does not improve DISTS. DIV2K center final: bpp 0.01428, LPIPS 0.41999, DISTS 0.41425.
+
+Conclusion: warmup -> gate fine-tune improves the scratch quality-side point, but the learned gate still prunes stage 1 almost completely. Future work should preserve sparse high-value stage1 positions, likely with a target gate budget or top-k gate constraint during fine-tuning.
+
+
+## 2026-06-21 Additional Gate Fine-Tune Sweep
+
+Ran W&B `12dmxux7`: warmup -> gate fine-tune with `lambda_R=0.3`. Kodak center final was bpp 0.01503, LPIPS 0.43645, DISTS 0.42452, stage1 bpp 0. The lower rate penalty did not preserve useful hard-gated stage1 residuals; it is worse than the `lambda_R=0.6` fine-tune.
+
+
+## 2026-06-21 Kodak Per-Image Scratch Comparison
+
+Created `experiments/scratch_per_image_comparison_kodak.md` comparing the current single-stage scratch lead against the newer quality-side checkpoints.
+
+Against `scratch_stage_b_from_attnA_best_r8_q1_lR0p5_continue6k/stage_b_0004000.pt`:
+- `stage_impr` improves DISTS on 14/24 Kodak images, mean ΔDISTS `-0.000815`, median `-0.000386`; best gains are `kodim22`, `kodim23`, `kodim03`, `kodim01`, `kodim15`.
+- `warm_gateft` improves DISTS on 13/24 images, mean ΔDISTS `-0.000300`; LPIPS improves on 13/24 images.
+
+Interpretation: the new scratch quality-side checkpoints are real but fragile. They improve some images clearly, while hurting others. Next work should inspect the best/worst images to learn whether gains correlate with texture, structure, or Stage-A failure modes.
+
+## 2026-06-21 Top-k Gate Budget Pilot
+
+Added `--gate_topk_frac` to `ScratchProgressiveResidualBottleneck`, training, and evaluation. The gate keeps exactly the highest-scoring fine-stage positions per sample and requires no transmitted side map because it is computed from decoder-available context. Ran W&B `oa3hchyt` from the forced-open stage-1 warmup checkpoint with `gate_topk_frac=0.05`, fine correction decoder, `lambda_R=0.5`, and stage-improvement hinge.
+
+Kodak center final:
+
+| total bpp | LPIPS | DISTS | stage0 bpp | stage1 bpp | stage1 gate mean |
+|---:|---:|---:|---:|---:|---:|
+| 0.01391 | 0.43889 | 0.42378 | 0.00380 | 0.00034 | 0.04883 |
+
+Per-image comparison versus the single-stage scratch lead:
+- mean ΔDISTS `+0.000646`, median `+0.000252`, wins `12/24`.
+- mean ΔLPIPS `+0.000201`, median `-0.000404`, wins `12/24`.
+- best DISTS gains: kodim22.png:-0.0093, kodim16.png:-0.0052, kodim03.png:-0.0046, kodim21.png:-0.0034, kodim23.png:-0.0032.
+- worst DISTS losses: kodim18.png:+0.0115, kodim20.png:+0.0085, kodim11.png:+0.0050, kodim06.png:+0.0046, kodim07.png:+0.0043.
+
+Conclusion: top-k gate budget successfully prevents gate collapse and realizes a true sparse residual mechanism, but the selected fine residual does not yet improve the Pareto point. Next work should train the selected subset with a hard-gate-aware DISTS/LPIPS improvement loss or make the gate conditional on stage-0 reconstruction error/texture proxies, then repeat the 5-10% budget sweep.
+
+## 2026-06-21 Top-k Gate Budget Sweep
+
+Evaluated the same top-k checkpoint with different deterministic gate budgets on Kodak center crops:
+
+| top-k frac | bpp | LPIPS | DISTS | stage1 bpp | stage1 gate mean |
+|---:|---:|---:|---:|---:|---:|
+| 0.02 | 0.01371 | 0.43889 | 0.42378 | 0.00014 | 0.01953 |
+| 0.05 | 0.01391 | 0.43889 | 0.42378 | 0.00034 | 0.04883 |
+| 0.10 | 0.01433 | 0.43888 | 0.42378 | 0.00077 | 0.09961 |
+| 0.20 | 0.01519 | 0.43888 | 0.42380 | 0.00163 | 0.19922 |
+
+DIV2K center at the trained 5% budget gives bpp `0.01515`, LPIPS `0.42036`, DISTS `0.41508`, stage1 bpp `0.00036`, gate mean `0.04883`.
+
+Interpretation: increasing the fine-stage budget from 2% to 20% mostly increases bpp while DISTS stays around `0.42378-0.42380`. LPIPS improves only in the fourth decimal place. This rules out a simple budget issue: the current fine stage needs a stronger hard-gated correction objective, not just a wider gate.
+
+## 2026-06-21 Top-k 10% Strong Stage-Improvement Pilot
+
+A final short pilot tested whether stronger hard-gated stage-improvement can make the selected fine residual positions useful.
+
+- Failed start: W&B `s1tbidjt` used `base_ch=128` by mistake, loaded only 73 tensors, produced invalid high-bpp validation, and was interrupted.
+- Correct run: W&B `7dyy6dpq`, output `experiments/scratch_stage_b_progressive2_finedec_stage1warm_topk010_si20_b64_from_attnA_r8_q1q05_lR0p5_1k/`.
+- Init: forced-open stage-1 warmup, fully compatible (`230 tensors`, `missing=0`, `skipped=0`).
+- Config: `gate_topk_frac=0.10`, `lambda_stage_improve=20.0`, `lambda_R=0.5`, fine correction decoder.
+
+Fixed center-crop results:
+
+| dataset | bpp | LPIPS | DISTS | stage0 bpp | stage1 bpp | gate mean |
+|---|---:|---:|---:|---:|---:|---:|
+| Kodak | 0.01504 | 0.44118 | 0.42219 | 0.00449 | 0.00078 | 0.09961 |
+| DIV2K | 0.01641 | 0.42225 | 0.41361 | 0.00587 | 0.00077 | 0.09961 |
+
+Interpretation: this is the best scratch Kodak DISTS point so far, but it is not the low-rate lead and LPIPS worsens. DIV2K does not beat the earlier stage-improvement checkpoint. The useful conclusion is that hard-gated sparse residuals can improve DISTS if the improvement pressure is strong enough, but the objective needs better regularization so gains do not come mainly from higher stage0 bpp and worse LPIPS.
+
+## 2026-06-21 Selected-Region Top-k Fine-Residual Update
+
+Implemented selected-region improvement loss for progressive Stage-B. The loss upsamples the decoder-side `stage1_gate_map` to image space and penalizes locations where the final reconstruction does not improve local L1 error over detached stage-0 reconstruction. This targets the original GP-ResLC axis more directly: if a fine residual position is selected for transmission, it must carry useful unpredictable correction. Also added a stage-1 scale guard to prevent entropy-scale inflation.
+
+Runs:
+
+| run | W&B | setting | outcome |
+|---|---|---|---|
+| `scratch_stage_b_progressive2_selected_extraonly_topk010_sel20_si8_from_warm_lR0p5_2k` | `r3i0z4f3` | extra-stage-only, top-k 10%, selected loss 20, no scale guard | Kodak DISTS improved, but stage1 scale inflated after 500-1000 steps. |
+| `scratch_stage_b_progressive2_selected_extraonly_topk010_sel20_si8_s1scale08_from_warm_lR0p5_1500` | `e6a0sh06` | same, plus `lambda_stage1_scale_guard=0.2`, `stage1_scale_target=0.8` | best scratch Kodak DISTS so far with controlled stage1 scale. |
+
+Fixed center-crop results:
+
+| checkpoint | dataset | bpp | LPIPS | DISTS | stage0 bpp | stage1 bpp | stage1 scale | note |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| no-guard 500 | Kodak | 0.01385 | 0.43758 | 0.42292 | 0.00345 | 0.00064 | 0.775 | good early point |
+| no-guard 1000 | Kodak | 0.01389 | 0.43964 | 0.42279 | 0.00345 | 0.00067 | 1.429 | DISTS improves, scale inflates |
+| scale-guard 500 | Kodak | 0.01386 | 0.43846 | 0.42274 | 0.00345 | 0.00065 | 0.680 | balanced update |
+| scale-guard 1000 | Kodak | 0.01377 | 0.44009 | 0.42195 | 0.00345 | 0.00056 | 0.687 | new scratch Kodak DISTS lead |
+| scale-guard final | Kodak | 0.01371 | 0.43921 | 0.42253 | 0.00345 | 0.00050 | 0.662 | lower rate, slightly worse DISTS |
+| scale-guard 1000 | DIV2K center | 0.01424 | 0.42176 | 0.41391 | 0.00388 | 0.00060 | 0.678 | lower-bpp DIV2K quality-side point |
+
+Per-image Kodak comparison for scale-guard 1000 versus the previous single-stage scratch lead:
+
+- DISTS: mean delta `-0.001177`, median `-0.001159`, wins `18/24`.
+- LPIPS: mean delta `+0.001398`, median `+0.001165`, wins `7/24`.
+- Best DISTS gains: `kodim22:-0.0071`, `kodim04:-0.0062`, `kodim17:-0.0051`, `kodim23:-0.0030`, `kodim02:-0.0030`.
+- Worst DISTS losses: `kodim20:+0.0037`, `kodim13:+0.0036`, `kodim16:+0.0027`, `kodim18:+0.0015`, `kodim09:+0.0004`.
+
+Decision: promote `scratch_stage_b_progressive2_selected_extraonly_topk010_sel20_si8_s1scale08_from_warm_lR0p5_1500/stage_b_0001000.pt` as the current scratch DISTS lead, but not as the LPIPS lead. The new objective confirms that sparse fine-stage residuals can help when the selected positions are explicitly trained and stage1 scale is guarded. Next work should add LPIPS/feature-region guidance or a DISTS-aligned local proxy so the gain is not purely DISTS-biased.
+
+
+## 2026-06-21 05:12 JST - Scratch LPIPS-balanced follow-ups
+
+### Runs
+- W&B `4sr7hpua`: `scratch_stage_b_progressive2_selected_extraonly_topk010_sel20_si8_s1scale08_lp12_from_warm_lR0p5_1500`
+  - Aim: increase global LPIPS weight from 0.7 to 1.2 under selected-region + stage1 scale guard.
+  - Kodak fixed final: bpp 0.013646, LPIPS 0.438245, DISTS 0.423436.
+  - DIV2K fixed final: bpp 0.014156, LPIPS 0.420427, DISTS 0.415380.
+  - Read: recovers LPIPS, but gives back the DISTS gain. Simple global LPIPS weighting is not enough.
+- W&B `njfmi964`: `scratch_stage_b_progressive2_selected_extraonly_topk010_sel20_si8_s1scale08_stageLP6_from_sel1000_lR0p5_1k`
+  - Code change: added `--lambda_stage_lpips_improve` and `--stage_lpips_improve_margin`, a detached stage0-vs-final LPIPS hinge.
+  - Kodak fixed 500: bpp 0.013739, LPIPS 0.438604, DISTS 0.423288.
+  - Kodak fixed final: bpp 0.013715, LPIPS 0.438228, DISTS 0.423569.
+  - Read: LPIPS no-regression is active and improves LPIPS, but it still does not preserve the selected-region DISTS lead. Current scratch DISTS lead remains `...s1scale08_from_warm_lR0p5_1500/stage_b_0001000.pt`.
+
+### Decision
+The selected fine-residual stage is useful for DISTS when guarded against scale inflation, but LPIPS and DISTS pull the correction decoder in different directions. Next scratch step should move from whole-image perceptual weighting to spatially targeted feature no-regression or gate selection based on residual unpredictability/texture value, not just selected-region L1.
+
+
+## 2026-06-21 05:35 JST - Stage-quant q1 low-rate target sweep
+
+Goal: improve the paper-facing complete-design stage-quant curve near the low-rate end. Since q0-specific gates previously reduced bpp but hurt quality, I tested whether q1 can be shifted left to act as a safer q0.5-like point.
+
+Runs:
+
+| run | W&B | init | setting |
+|---|---|---|---|
+| `v4_stage_quant_v1q1_rhotarget110_quality_hinge_lR28_lp12_dists12_rt20_700` | `u9i3v479` | q1 quality checkpoint | rho target 1.10, stage_rho_max 2.0 |
+| `v4_stage_quant_v1q1_rhotarget108_rhomax12_quality_hinge_lR24_lp12_dists12_rt15_700` | `09p6txjw` | q1 quality checkpoint | rho target 1.08, stage_rho_max 1.2 |
+
+Training signal:
+
+- target1.10 final: W&B A/B `delta_bpp_y=-0.00164`, PSNR `18.8447 -> 18.6981`, rho mean/max `1.0999/1.2448`.
+- target1.08/rhomax1.2 final: W&B A/B `delta_bpp_y=-0.00139`, PSNR `18.9299 -> 18.8299`, rho mean/max `1.0789/1.1707`.
+
+Kodak8 real-codec diagnostic, q1 only:
+
+| run | bpp | PSNR | LPIPS | DISTS | FID | KID | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| GLC q1 | 0.03104 | 21.3857 | 0.1852 | 0.1086 | 56.0845 | 0.0043 | anchor |
+| stage-quant q1 quality | 0.03044 | 21.3211 | 0.1855 | 0.1081 | 56.1878 | 0.0044 | keep current q1 |
+| target1.10 final | 0.02942 | 21.1612 | 0.1905 | 0.1109 | 56.7827 | 0.0045 | reject as replacement |
+| target1.08/rhomax1.2 final | 0.02968 | 21.2243 | 0.1891 | 0.1111 | 56.9105 | 0.0046 | reject as replacement |
+
+Read:
+
+- Both target runs reduce real serialized bpp substantially, so the decoder-recomputable residual precision control works.
+- However, Kodak8 LPIPS/DISTS regress enough that neither is suitable as a q1 curve replacement.
+- Restricting local `stage_rho_max` reduces rho spikes but does not fix perceptual degradation. The failure is not only extreme local rho; low-rate q1 residual precision itself is close to the quality floor.
+
+Decision:
+
+- Keep the existing stage-quant q1 quality checkpoint in the paper-facing complete-design branch.
+- Treat q1 target1.08/1.10 as upper-rate-knob ablations only.
+- If q1 is revisited, use explicit GLC reconstruction distillation or a sendability/texture teacher that predicts where coarsening is safe, not a global rho target.
+
+
+## 2026-06-21 05:45 JST - Stage-quant q1 sendability teacher trial
+
+Implementation update:
+
+- Ported a training-only sendability teacher from `train_v2.py` into `scripts/train_v1.py` for `predictor_param_mode=stage_quant_gate`.
+- Added CLI: `--lambda_gate_send`, `--gate_send_tau`, `--gate_send_texture_weight`, and `--gate_send_edge_weight`.
+- Added `stage_gate_p_from_rho_target()` to map a desired `rho_target` to the corresponding StageQuantGate `p_tex` mean under the softplus rho parameterization.
+- Smoke test passed: `gate_send` is nonzero, target mean/std are logged, and inference remains side-info-free.
+
+Run:
+
+| run | W&B | init | setting |
+|---|---|---|---|
+| `v4_stage_quant_v1q1_send_rhotarget108_rhomax12_lR24_lp12_dists12_rt15_send5_700` | `0fwt4hk1` | q1 quality checkpoint | rho target 1.08, stage_rho_max 1.2, sendability BCE weight 5, texture 0.2, edge 0.1 |
+
+Training was stopped after the 500 checkpoint because A/B PSNR stayed weak: q1 validation `delta_bpp_y=-0.0014`, PSNR `19.40 -> 19.15`.
+
+Kodak8 real-codec diagnostic, q1 only:
+
+| run | bpp | PSNR | LPIPS | DISTS | FID | KID | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| GLC q1 | 0.03104 | 21.3857 | 0.1852 | 0.1086 | 56.0845 | 0.0043 | anchor |
+| stage-quant q1 quality | 0.03044 | 21.3211 | 0.1855 | 0.1081 | 56.1878 | 0.0044 | keep current q1 |
+| target1.08/rhomax1.2 final | 0.02968 | 21.2243 | 0.1891 | 0.1111 | 56.9105 | 0.0046 | reject |
+| sendability target1.08 250 | 0.02958 | 21.1704 | 0.1898 | 0.1124 | 56.3093 | 0.0044 | reject |
+| sendability target1.08 500 | 0.02953 | 21.1695 | 0.1900 | 0.1126 | 56.0714 | 0.0043 | reject |
+
+Read:
+
+- The sendability teacher improves distribution metrics relative to the non-send target run, with FID/KID near GLC at lower bpp.
+- It does not protect DISTS/LPIPS or PSNR. The teacher's low-error/texture/edge proxy is too distribution-oriented and not sufficiently structure/perceptual-local for q1.
+- This mirrors the scratch branch: sparse/coarsened residual decisions need an explicit DISTS/feature-local payoff model, not only a heuristic sendability map.
+
+Decision:
+
+- Do not replace the current stage-quant q1 quality checkpoint.
+- Keep sendability-stage-quant as an implementation tool, but the next improvement should use a learned or measured local sensitivity teacher: e.g., compare baseline reconstruction against a synthetically coarsened reconstruction and train the gate toward positions where DISTS/LPIPS change is small.
+
+
+### 2026-06-21 q1 base-sendability target sweep real-codec result
+
+Run: `v4_stage_quant_v1q1_basesend_rhotarget108_rhomax12_lR24_lp12_dists12_rt15_send5_500` (W&B `2wkwx8vd`).
+
+Purpose: test whether a baseline-reconstruction sendability teacher can lower q1 bpp while preserving perceptual quality. This directly probes the GP-ResLC axis: do not send information that the generator/baseline can already recover.
+
+Kodak8 real codec / q1:
+
+| model | bpp | PSNR | LPIPS | DISTS | FID | KID | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| GLC | 0.0310 | 21.3857 | 0.1852 | 0.1086 | 56.0845 | 0.0043 | reference |
+| stage-quant quality q1 | 0.0304 | 21.3211 | 0.1855 | 0.1081 | 56.1878 | 0.0044 | keep |
+| base-send 250 | 0.0296 | 21.1773 | 0.1900 | 0.1119 | 56.0310 | 0.0043 | reject |
+| base-send final | 0.0296 | 21.1761 | 0.1891 | 0.1120 | 56.6404 | 0.0044 | reject |
+
+Conclusion: global rho target plus heuristic sendability can reduce bpp, but it does not preserve LPIPS/DISTS. It is a useful negative result: sendability cannot be approximated by simple reconstruction-error/texture/edge heuristics. The next viable direction is a measured local perceptual-sensitivity teacher or a stronger residual branch that explicitly checks whether suppressing a residual worsens local perceptual features.
+
+
+### 2026-06-21 q1 local LPIPS-spatial gate hinge
+
+Implemented `--lambda_lpips_spatial_gate_hinge` in `scripts/train_v1.py`. The loss uses a spatial LPIPS map and penalizes high stage-gate probability where the current reconstruction locally worsens versus frozen GLC baseline. This gives the decoder-side gate a local perceptual no-regression signal instead of only whole-image LPIPS/DISTS hinges.
+
+Smoke: `experiments/stage_quant_spatial_gate_smoke` passed.
+
+Run: `v4_stage_quant_v1q1_spgate_rhotarget108_rhomax12_lR22_lp12_dists14_rt15_sp20_700` (W&B `guyrrgo8`).
+
+Kodak8 real codec / q1 comparison:
+
+| run | bpp | PSNR | LPIPS | DISTS | FID | KID | note |
+|---|---:|---:|---:|---:|---:|---:|---|
+| stageq quality | 0.0304 | 21.3211 | 0.1855 | 0.1081 | 56.1878 | 0.0044 | current q1 keep |
+| old target108 | 0.0296 | 21.2318 | 0.1905 | 0.1121 | 57.2862 | 0.0047 | too much quality loss |
+| send108 | 0.0295 | 21.1695 | 0.1900 | 0.1126 | 56.0714 | 0.0043 | FID only |
+| spgate108 final | 0.0297 | 21.2427 | 0.1890 | 0.1104 | 56.8244 | 0.0046 | improves old target108 but not enough |
+
+Conclusion: the spatial hinge is directionally correct: at the same low-rate target it recovers a visible part of DISTS/LPIPS quality. It is not yet a q1 replacement because the existing quality checkpoint remains better. Next quick sweep: a moderate target (`rho_target=1.06`) to see whether the new local teacher gives a usable intermediate curve point.
+
+
+### 2026-06-21 q1 spgate target106 negative result
+
+Run: `v4_stage_quant_v1q1_spgate_rhotarget106_rhomax12_lR20_lp12_dists14_rt15_sp20_700` (W&B `5o1ta9hl`).
+
+Kodak8 real codec / q1:
+
+| run | bpp | PSNR | LPIPS | DISTS | FID | KID | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| stageq quality | 0.0304 | 21.3211 | 0.1855 | 0.1081 | 56.1878 | 0.0044 | keep |
+| target104 final | 0.0303 | 21.2998 | 0.1866 | 0.1100 | 55.8816 | 0.0044 | FID-only auxiliary |
+| spgate106 250 | 0.0300 | 21.2480 | 0.1879 | 0.1110 | 56.4058 | 0.0045 | reject |
+| spgate106 final | 0.0300 | 21.2607 | 0.1883 | 0.1103 | 56.5339 | 0.0046 | reject |
+| spgate108 final | 0.0297 | 21.2427 | 0.1890 | 0.1104 | 56.8244 | 0.0046 | reject |
+
+Conclusion: the LPIPS-spatial gate hinge improves the overly aggressive target108 run, but moderate target106 still pays too much DISTS/LPIPS. Do not promote any q1 target-sweep checkpoint. Keep `v3_stage_quant_v1q1_quality_hinge_fast_lR35_rhomax20_3k` as the q1 stage-quant point. The next on-axis improvement must estimate measured local sensitivity instead of relying on global rho targets plus proxy local LPIPS.
+
+
+### 2026-06-21 Stage-quant local sensitivity analysis
+
+Added `scripts/analyze_stage_quant_gate_sensitivity.py`. The analyzer runs GLC baseline and stage-quant reconstruction, upsamples `gate_rho`/`gate_p_tex`, computes local absolute error, texture variance, gradient, and Alex-LPIPS spatial delta, then reports correlations and high-rho/low-rho statistics.
+
+Kodak8 / q1 summaries:
+
+| checkpoint | delta bpp_y | rho mean | rho std | corr(rho, base err) | corr(rho, grad) | corr(rho, LPIPS delta) | high-rho LPIPS delta | low-rho LPIPS delta | read |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| stageq quality | -0.00059 | 1.0314 | 0.0089 | +0.193 | +0.165 | -0.016 | -0.00029 | +0.00156 | best q1; high-rho does not worsen LPIPS spatial |
+| target104 final | -0.00078 | 1.0395 | 0.0053 | +0.006 | -0.006 | -0.002 | +0.00147 | +0.00061 | gate becomes almost uniform; quality worsens |
+| spgate108 final | -0.00131 | 1.0739 | 0.0058 | -0.011 | -0.021 | +0.013 | +0.00579 | +0.00422 | stronger rate target becomes uniform and locally harmful |
+
+Interpretation: the failed q1 target sweeps are not failing merely because of rho magnitude. They lose spatial selectivity. The current q1 quality checkpoint coarsens more in difficult regions by absolute-error/gradient statistics, but those high-rho locations are not the places where LPIPS spatial worsens; that is why it survives. When a global target forces higher mean rho, the gate field becomes near-uniform and high-rho locations have worse LPIPS spatial delta.
+
+Next method implication: a stronger full-design stage-quant teacher should not be a global mean rho target. It should optimize a per-location budget: keep average bpp reduction, but explicitly push rho away from local LPIPS/DISTS-sensitive regions. The newly added analyzer provides the diagnostic needed for such a teacher.
+
+
+### 2026-06-21 q1 LPIPS-sensitivity teacher result
+
+Implemented `--lambda_gate_lpips_sens`, which builds a spatial teacher from the frozen GLC baseline LPIPS map. The teacher is recentered to the desired p-map mean implied by `rho_target`, so it reallocates the gate spatially without changing the intended average rate budget. Smoke test: `experiments/stage_quant_lpips_sens_smoke`.
+
+Run: `v4_stage_quant_v1q1_lpsens_rhotarget108_rhomax12_lR22_lp12_dists14_rt15_lps10_e01_700` (W&B `vec5867e`).
+
+Kodak8 real codec / q1:
+
+| run | bpp | PSNR | LPIPS | DISTS | FID | KID | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| stageq quality | 0.0304 | 21.3211 | 0.1855 | 0.1081 | 56.1878 | 0.0044 | keep |
+| target104 final | 0.0303 | 21.2998 | 0.1866 | 0.1100 | 55.8816 | 0.0044 | FID-only auxiliary |
+| spgate108 final | 0.0297 | 21.2427 | 0.1890 | 0.1104 | 56.8244 | 0.0045 | reject |
+| lpsens108 250 | 0.0298 | 21.2174 | 0.1892 | 0.1114 | 55.8860 | 0.0044 | reject |
+| lpsens108 final | 0.0297 | 21.2051 | 0.1895 | 0.1111 | 56.0831 | 0.0045 | reject |
+
+Conclusion: baseline LPIPS spatial maps alone are not sufficient sendability targets. They can improve distribution metrics/FID slightly, but do not protect DISTS/LPIPS enough. The q1 low-rate sweep is now closed: keep the q1 quality checkpoint. A stronger teacher must directly measure the effect of local coarsening, not infer it from baseline perceptual error.
+
+## 2026-06-21 Scratch selected-loss audit and LPIPS-spatial follow-up
+
+Discovered and fixed a critical scratch Stage-B issue: `selected_region_improvement_loss` in `scripts/train_scratch_stage_b.py` was accidentally decorated with `@torch.no_grad()`. The selected-region L1 loss therefore did not backpropagate in earlier selected-region runs. The previous scratch DISTS lead remains a valid measured checkpoint, but its mechanism should not be described as caused by the selected L1 term.
+
+Re-ran selected-region experiments after the fix:
+
+| run | W&B | setting | Kodak center result | decision |
+|---|---|---|---|---|
+| `scratch_stage_b_progressive2_selected_gradfix_extraonly_topk010_sel20_si8_s1scale08_from_warm_lR0p5_1500` | `e1jku5vo` | selected L1=20, DISTS=2 | best checked final/1000 around bpp `0.01364-0.01370`, LPIPS `0.4388-0.4392`, DISTS `0.4232` | true selected L1 improves L1/LPIPS slightly but worsens DISTS; reject as main scratch lead |
+| `scratch_stage_b_progressive2_selected_gradfix_extraonly_topk010_sel5_d4_s1scale08_from_warm_lR0p5_1500` | `7xk6rmuo` | selected L1=5, DISTS=4 | 500: `0.013694/0.440696/0.423637`; 1000: `0.013670/0.439949/0.423410`; final: `0.013642/0.441078/0.422958` for bpp/LPIPS/DISTS | lower rate and acceptable LPIPS, but still worse DISTS than old lead `0.421954`; reject as lead |
+
+Interpretation: local L1 selected improvement is the wrong proxy for the scratch perceptual objective. It makes the transmitted fine residual more locally faithful, but that does not align with the DISTS/FID-style R-P claim. Added a new `--lambda_selected_lpips_improve` path that uses LPIPS spatial maps only on decoder-selected fine-stage regions. This is closer to the paper axis: selected residual positions must improve perceptual feature distance over the generator-only stage0 reconstruction.
+
+Current follow-up running:
+
+| run | W&B | setting |
+|---|---|---|
+| `scratch_stage_b_progressive2_selected_lpipsmap_extraonly_topk010_sellp10_d4_s1scale08_from_warm_lR0p5_1500` | `tpauo0kk` | selected LPIPS-spatial=10, selected L1 disabled, DISTS=4, LPIPS=0.5, top-k 10%, extra-stage-only |
+
+### LPIPS-Spatial Selected Loss Result
+
+Evaluated `scratch_stage_b_progressive2_selected_lpipsmap_extraonly_topk010_sellp10_d4_s1scale08_from_warm_lR0p5_1500` (W&B `tpauo0kk`) on fixed Kodak center crops:
+
+| checkpoint | bpp | LPIPS | DISTS | stage0 bpp | stage1 bpp | stage1 scale | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 500 | 0.013835 | 0.438671 | 0.423115 | 0.003448 | 0.000621 | 0.607 | not lead |
+| 1000 | 0.013772 | 0.438635 | 0.423123 | 0.003448 | 0.000558 | 0.660 | not lead |
+| final | 0.013716 | 0.438633 | 0.423080 | 0.003448 | 0.000503 | 0.701 | not lead |
+
+Compared with the current scratch DISTS lead (`0.013768` bpp, LPIPS `0.440089`, DISTS `0.421954`), LPIPS-spatial selected loss improves LPIPS but loses DISTS. Decision: keep as an LPIPS-oriented auxiliary/reference, not the scratch lead. The selected fine-stage objective should next be DISTS/texture-statistic aligned, or the scratch branch should move to a stronger generator before spending more time on local selected losses.
+
+## 2026-06-21 rho1.16 DISTS Fine-Tune
+
+Purpose: improve the current paper-facing `rho1.16` real-codec lead without changing the zero-side-bit residual-suppression mechanism. Resumed from `experiments/v2_gate_send_lR10_lp4_rho14_target116_send5_all_6k/train_state.pt` at iteration 6000 and fine-tuned to 9000 with `lambda_dists=2`, lower LR `3e-5`, same `rho_target=1.16`, same always-on sendability teacher. W&B run: `kytm8hb5`.
+
+Checkpoint: `experiments/v2_gate_send_lR10_lp4_dists2_rho14_target116_send5_all_ft3k_from_lead/v2_final.pt`.
+
+Kodak forward metrics suggested a small DISTS gain versus the existing lead. Real-codec Kodak evaluation confirmed the gain with exact arithmetic coding and forward/decode consistency (`max_abs=0.000e+00` for all checked images):
+
+| run | DISTS BD | LPIPS BD | PSNR BD | MS-SSIM BD | FID BD | KID BD |
+|---|---:|---:|---:|---:|---:|---:|
+| `gp_rho116_real` existing lead | -4.47% | -0.79% | -0.87% | +0.45% | -1.70% | -6.14% |
+| `gp_rho116_dists2_ft` | -5.62% | -0.32% | -0.72% | +0.39% | -3.27% | -7.54% |
+
+Per-q real metrics for `gp_rho116_dists2_ft` on Kodak:
+
+| q | bpp | PSNR | LPIPS | DISTS | FID | KID |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0.023763 | 21.0708 | 0.2126 | 0.1145 | 29.2696 | 0.00358 |
+| 1 | 0.027473 | 21.5020 | 0.1886 | 0.1064 | 26.3078 | 0.00294 |
+| 2 | 0.032044 | 21.8904 | 0.1752 | 0.0990 | 24.9496 | 0.00262 |
+| 3 | 0.036273 | 22.1608 | 0.1653 | 0.0952 | 23.8925 | 0.00229 |
+
+Interpretation: DISTS fine-tuning gives a real-codec Kodak improvement over the current lead in DISTS/FID/KID, while LPIPS BD weakens. This is aligned with the short-track R-P emphasis but must be validated on DIV2K and CLIC before replacing `rho1.16` as paper lead. DIV2K real evaluation is currently running at `experiments/real_codec/div2k_gp_reslc_rho116_dists2_ft/`.
+
+
+
+### DISTS Fine-Tune Final Screening
+
+Completed the follow-up screening for both `lambda_dists=2` and a gentler `lambda_dists=1` fine-tune from the paper lead. The gentler run is `v2_gate_send_lR10_lp4_dists1_rho14_target116_send5_all_ft3k_from_lead` (W&B `8lct9ym0`). It keeps the same zero-side-bit rho gate mechanism and exact decoder recomputation as the paper lead.
+
+Real-codec Kodak comparison versus local GLC:
+
+| run | DISTS BD | LPIPS BD | PSNR BD | MS-SSIM BD | FID BD | KID BD | read |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `gp_rho116_real` | -4.47% | -0.79% | -0.87% | +0.45% | -1.70% | -6.14% | current paper lead |
+| `gp_rho116_dists2_ft` | -5.62% | -0.32% | -0.72% | +0.39% | -3.27% | -7.54% | best Kodak FID/KID among fine-tunes |
+| `gp_rho116_dists1_ft` | -5.96% | -0.68% | -1.35% | +0.19% | -2.28% | -6.08% | best Kodak DISTS among fine-tunes |
+
+Real-codec DIV2K comparison versus local GLC:
+
+| run | DISTS BD | LPIPS BD | PSNR BD | MS-SSIM BD | FID BD | KID BD | read |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `gp_rho116_real` | -10.79% | -0.54% | -1.49% | -0.17% | -5.61% | -6.50% | keep as DIV2K lead |
+| `gp_rho116_dists2_ft` | -10.53% | -0.52% | -1.42% | -0.17% | -5.99% | -5.46% | slightly better FID, worse DISTS/KID |
+| `gp_rho116_dists1_ft` | -10.47% | -0.51% | -1.41% | -0.20% | -5.90% | -5.19% | worse than lead on DISTS/KID |
+
+CLIC professional validation, compared to the existing `send5all` lead using DISTS/LPIPS/PSNR/MS-SSIM only because old and new FID/KID CSVs use different patch metadata:
+
+| run | DISTS BD vs `send5all` | LPIPS BD | PSNR BD | MS-SSIM BD | decision |
+|---|---:|---:|---:|---:|---|
+| `ft_dists2` final | +0.11% | +0.20% | -0.07% | +0.02% | not a lead replacement |
+| `ft_dists1` final | +0.63% | -0.04% | -0.17% | -0.05% | not a lead replacement |
+| `ft_dists1_6500` | +1.36% | +0.09% | -0.32% | -0.11% | early checkpoint also worse |
+
+Decision:
+
+- Do not replace the paper-facing `rho1.16` lead with DISTS fine-tuned checkpoints.
+- Keep `lambda_dists=1` as a Kodak-oriented auxiliary result: it is a real-codec improvement on Kodak DISTS, with exact decode consistency.
+- Keep `lambda_dists=2` as a Kodak/FID-oriented auxiliary result and as evidence that DISTS-heavy fine-tuning can overfit small/easier benchmarks.
+- For VCIP, the main CLIC2020/DIV2K story remains the original `rho1.16` real-codec result. Future improvement should target local sensitivity/sendability, not simply adding global DISTS loss during fine-tuning.
+
+
+## 2026-06-21 10:00 JST - Stage-quant measured-sensitivity and rho1.18 upper-knob screening
+
+Purpose: test two possible routes beyond the current paper lead: (1) a more method-faithful `stage_quant_gate` variant whose decoder-side gate is supervised by measured local LPIPS degradation versus frozen GLC, and (2) a pretrained global rho upper knob between the accepted `rho1.16` lead and rejected `rho1.20` ablation.
+
+Implementation update:
+
+- Added `--lambda_gate_measured_sens`, `--gate_measured_sens_tau`, `--gate_measured_sens_margin`, and `--gate_measured_sens_edge_weight` to `scripts/train_v1.py`.
+- The measured teacher compares frozen GLC reconstruction and current gated reconstruction with spatial LPIPS, then allocates higher coarsening probability where the current local LPIPS delta is small or negative. The teacher is recentered to the desired mean implied by `rho_target`, so it changes spatial allocation rather than the average rate budget.
+- Smoke test passed with `stage_quant_gate`; real-codec checks for evaluated checkpoints all had `max_abs=0.000e+00`.
+
+Stage-quant q1 Kodak8 real-codec diagnostics:
+
+| run | W&B | bpp | PSNR | LPIPS | DISTS | FID | KID | decision |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| existing stage-quant q1 quality | - | 0.03044 | 21.3211 | 0.1855 | 0.1081 | 56.1878 | 0.0044 | anchor |
+| measured-sens target1.08 | `syquq3py` | 0.02955 | 21.1616 | 0.1898 | 0.1116 | 55.9545 | 0.0044 | reject |
+| measured-sens + distill target1.04 | `rzkqxp6a` | 0.03027 | 21.3107 | 0.1864 | 0.1097 | 55.8798 | 0.0042 | reject as DISTS replacement |
+
+Read: the measured teacher can reduce serialized bpp and gives slightly better distribution metrics in conservative form, but it still fails to preserve DISTS/LPIPS versus the existing stage-quant q1 quality checkpoint. The bottleneck is not only spatial allocation; q1 residual precision is close to the perceptual floor under frozen GLC.
+
+Pretrained rho branch screening:
+
+- Run: `experiments/v2_gate_send_rho118_edge01_baseLP08_dists05_ft2k_from_lead`, W&B `x3sso91d`.
+- Init: `rho1.16` lead checkpoint at it=6000.
+- Setting: `rho_target=1.18`, `gate_send_edge_weight=0.1`, `lambda_base_l1=0.2`, `lambda_base_lpips=0.8`, `lambda_dists=0.5`. Stopped after the 7000 checkpoint because A/B trends stabilized.
+- Kodak real-codec output: `experiments/real_codec/kodak_gp_reslc_rho118_edge01_baseLP08_dists05_7000/`.
+- Metrics: `experiments/real_codec/kodak_gp_reslc_rho118_edge01_baseLP08_dists05_7000_metrics.csv`.
+
+Kodak BD-rate versus local real-codec GLC:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| `gp_rho116_real` | -4.47% | -0.79% | -0.87% | +0.45% | -1.70% | -6.14% |
+| `gp_rho116_dists1_ft` | -5.96% | -0.68% | -1.35% | +0.19% | -2.28% | -6.08% |
+| `gp_rho118_edge01_baseLP08_dists05_7000` | -4.03% | -0.13% | -0.46% | +0.68% | -0.64% | -5.30% |
+
+Decision: reject rho1.18 as a paper lead. It reduces bpp but does not improve Kodak DISTS/FID enough, and q0 degrades. The main paper checkpoint remains `rho1.16`; DISTS fine-tunes remain Kodak-only auxiliary checkpoints because they fail DIV2K/CLIC validation.
+
+
+## 2026-06-21 10:10 JST - Scratch selected VGG feature improvement loss
+
+Implementation update:
+
+- Added `--lambda_selected_vgg_improve`, `--selected_vgg_improve_margin`, and `--selected_vgg_layers` to `scripts/train_scratch_stage_b.py`.
+- The new loss uses the VGG feature stages inside `DISTS_pytorch.DISTS.forward_once()` and penalizes decoder-selected fine-stage regions where the final reconstruction's local feature error is worse than detached stage-0. This is a DISTS-adjacent local selected-region proxy, intended to be closer to structure/texture fidelity than local L1 or LPIPS-spatial alone.
+- Smoke test passed: checkpoint loading was fully compatible (`230 tensors`, `missing=0`, `skipped=0`) and `selvggimpr` was nonzero at startup.
+
+Run:
+
+- `experiments/scratch_stage_b_progressive2_selected_vgg_extraonly_topk010_selvgg10_d4_s1scale08_from_warm_lR0p5_1500`
+- W&B: `0vkyk0iu`
+- Setting: extra-stage-only, top-k 10%, selected VGG improvement weight 10, DISTS weight 4, LPIPS weight 0.5, stage1 scale guard 0.2/0.8.
+
+Fixed Kodak center-crop results:
+
+| checkpoint | bpp | LPIPS | DISTS | stage0 bpp | stage1 bpp | stage1 scale | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 500 | 0.014087 | 0.437148 | 0.424297 | 0.003718 | 0.000603 | 0.693 | not lead |
+| 1000 | 0.014063 | 0.437081 | 0.424611 | 0.003718 | 0.000579 | 0.718 | not lead |
+| final | 0.014053 | 0.437388 | 0.424407 | 0.003718 | 0.000569 | 0.669 | not lead |
+
+Decision: reject as scratch lead. The VGG selected no-regression loss becomes zero quickly, so it mainly behaves like another DISTS-heavy extra-stage run. If this path is revisited, require a positive feature-improvement margin rather than only no-regression. Current scratch DISTS lead remains `scratch_stage_b_progressive2_selected_extraonly_topk010_sel20_si8_s1scale08_from_warm_lR0p5_1500/stage_b_0001000.pt` at Kodak bpp `0.013768`, LPIPS `0.440089`, DISTS `0.421954`.
+
+
+## 2026-06-21 10:18 JST - Scratch selected VGG margin follow-up
+
+Follow-up run:
+
+- `experiments/scratch_stage_b_progressive2_selected_vggmargin_extraonly_topk010_selvgg30m003_d4_s1scale08_from_warm_lR0p5_1000`
+- W&B: `bw5cnko1`
+- Change from selected VGG no-regression: `lambda_selected_vgg_improve=30`, `selected_vgg_improve_margin=0.003`, 1000 iterations.
+
+Fixed Kodak center-crop results:
+
+| checkpoint | bpp | LPIPS | DISTS | stage0 bpp | stage1 bpp | stage1 scale | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 500 | 0.014102 | 0.437569 | 0.431100 | 0.003718 | 0.000618 | 0.666 | reject |
+| final | 0.014070 | 0.437357 | 0.432706 | 0.003718 | 0.000587 | 0.737 | reject |
+
+Decision: positive-margin VGG selected improvement is worse than no-regression and much worse than the current scratch lead. The feature-improvement pressure appears to fight the DISTS objective under the current weak generator/fine decoder. Stop this local VGG selected-loss path for now. Next scratch work should prioritize stronger Stage-A/generator quality or a true DISTS-statistic local proxy, not more VGG/L1 selected losses.
+
+
+## 2026-06-21 10:35 JST - Scratch decoder-only and gate-error-target screening
+
+### Stage-A decoder-only fine-tune from attention Stage-A best
+
+- Run: `scratch_stage_a_decoder_only_from_attn_best_d3_lp08_l103_4k`
+- W&B: `gsyo72t9`
+- Change: froze Stage-A encoder and VQ codebook, trained decoder/latent-refine only with stronger perceptual loss (`lambda_dists=3.0`, `lambda_lpips=0.8`, `lambda_l1=0.3`).
+- Outcome: stopped early at ~2500 iters because validation DISTS did not recover.
+- Deterministic Kodak center:
+  - `stage_a_best.pt`: bpp `0.0097656`, LPIPS `0.45655`, DISTS `0.43722`
+  - `stage_a_0001000.pt`: bpp `0.0097656`, LPIPS `0.45191`, DISTS `0.45155`
+  - `stage_a_0002000.pt`: bpp `0.0097656`, LPIPS `0.44913`, DISTS `0.44866`
+- Decision: reject as Stage-A replacement. Decoder-only improves L1/LPIPS slightly but damages DISTS relative to the existing Stage-A best (`DISTS=0.43546`). This suggests the fixed 8x8 semantic latent is the bottleneck; decoder polishing alone cannot supply the missing perceptual structure.
+
+### Stage-B decoder-side gate error-target auxiliary loss
+
+- Code change: `ScratchProgressiveResidualBottleneck` now exposes `stage{i}_gate_prob` and `stage{i}_gate_logit`. `scripts/train_scratch_stage_b.py` adds `--lambda_gate_error_target` and `--gate_error_target_topk_frac`.
+- Purpose: teach the decoder-computable fine-stage gate to select regions where Stage-A base reconstruction fails, without transmitting any extra side information.
+- Run: `scratch_stage_b_gateerr_from_selected1000_ge02_1200`
+- W&B: `k8a2znzk`
+- Init: resumed from `experiments/scratch_stage_b_progressive2_selected_extraonly_topk010_sel20_si8_s1scale08_from_warm_lR0p5_1500/stage_b_0001000.pt`.
+- Key settings: `lambda_gate_error_target=0.2`, top-k `0.10`, extra-stage-only training, existing selected-region improvement losses retained.
+- Deterministic Kodak center:
+  - `stage_b_best.pt`/`stage_b_0001500.pt`: bpp `0.013935`, LPIPS `0.43914`, DISTS `0.42309`
+  - `stage_b_0002000.pt`: bpp `0.013912`, LPIPS `0.43939`, DISTS `0.42327`
+  - `stage_b_final.pt`: bpp `0.013940`, LPIPS `0.43895`, DISTS `0.42306`
+- Comparison: previous scratch lead remains `stage_b_0001000.pt` from `scratch_stage_b_progressive2_selected_extraonly_topk010_sel20_si8_s1scale08_from_warm_lR0p5_1500` with bpp `0.013768`, LPIPS `0.44009`, DISTS `0.42195`.
+- Decision: reject as DISTS lead, keep as useful ablation. Gate-target improves LPIPS slightly and is conceptually aligned, but DISTS worsens by ~0.0011 and bpp is slightly higher.
+
+
+## 2026-06-21 10:55 JST - Pretrained gate-only measured-sensitivity screening
+
+Implementation update:
+
+- Ported the measured LPIPS-spatial gate teacher from `scripts/train_v1.py` into `scripts/train_v2.py`.
+- Added `--lambda_gate_measured_sens`, `--gate_measured_sens_until`, `--gate_measured_sens_tau`, `--gate_measured_sens_margin`, and `--gate_measured_sens_edge_weight`.
+- Added `--freeze_q_embed` so gate-only allocation experiments can freeze both `prior_predictor` and q conditioning.
+
+Runs:
+
+- `v2_gate_meassens_rho116_lR10_lp4_ms1_edge01_ft1500_from_lead`, W&B `r5lcsjhu`: predictor/q_embed trainable. Rejected early. At 500 A/B bpp_y became worse than GLC by about `+0.025` and PSNR collapsed; stopped around 600. Interpretation: measured teacher destabilizes the prior predictor when it is allowed to move.
+- `v2_gateonly_meassens_rho116_lR10_lp4_ms05_edge01_ft1000_from_lead`, W&B `43kunfkw`: predictor and q_embed frozen, only gate trained. Real codec consistency passed (`max_abs=0` for Kodak q0-q3).
+
+Kodak real-codec metrics for gate-only measured (`patch=64`, `split=2` for FID/KID, matching existing Kodak CSV protocol):
+
+| q | bpp | PSNR | MS-SSIM | LPIPS | DISTS | FID | KID |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0.023752 | 21.0371 | 0.7320 | 0.2122 | 0.1152 | 28.9731 | 0.0035 |
+| 1 | 0.027518 | 21.4991 | 0.7566 | 0.1880 | 0.1065 | 26.6874 | 0.0031 |
+| 2 | 0.032067 | 21.8782 | 0.7737 | 0.1744 | 0.1001 | 24.9466 | 0.0027 |
+| 3 | 0.036274 | 22.1651 | 0.7860 | 0.1653 | 0.0965 | 24.0547 | 0.0023 |
+
+BD-rate vs local GLC on Kodak:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| `gp_rho116_real` | -4.47 | -0.79 | -0.87 | +0.45 | -1.70 | -6.14 |
+| `gp_gateonly_meassens_ms05_1000` | -4.16 | -0.89 | -0.35 | +0.34 | -0.59 | -3.16 |
+
+Decision: reject as paper lead. It slightly improves LPIPS BD but worsens DISTS/FID/KID and does not help official-curve strength. The useful finding is that gate-only updates are stable; future pretrained allocation fine-tunes should freeze predictor/q_embed and use direct perceptual objectives rather than measured teacher alone.
+
+
+## 2026-06-21 11:05 JST - Pretrained gate-only DISTS direct fine-tune screening
+
+Run: `v2_gateonly_dists1_rho116_lR10_lp4_ft1000_from_lead`, W&B `0pgb0zn7`.
+
+Setup: resumed from the `rho1.16` paper lead, froze `prior_predictor` and `q_embed`, trained only the decoder-computable perceptual gate with direct DISTS loss (`lambda_dists=1.0`) plus the original LPIPS/rate terms. This isolates zero-side-bit spatial allocation and avoids the measured-sensitivity instability seen when the predictor moved.
+
+Real codec: Kodak q0-q3, exact arithmetic coding, all `max_abs=0`.
+
+Kodak metrics using the existing local protocol (`patch=64`, `split=2` for FID/KID):
+
+| q | bpp | PSNR | MS-SSIM | LPIPS | DISTS | FID | KID |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0.023754 | 21.0409 | 0.7324 | 0.2121 | 0.1149 | 28.8918 | 0.0035 |
+| 1 | 0.027509 | 21.4910 | 0.7566 | 0.1884 | 0.1070 | 26.5137 | 0.0030 |
+| 2 | 0.032053 | 21.8862 | 0.7739 | 0.1746 | 0.0999 | 24.9132 | 0.0027 |
+| 3 | 0.036257 | 22.1692 | 0.7858 | 0.1652 | 0.0962 | 23.8719 | 0.0022 |
+
+BD-rate vs local GLC on Kodak:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| `gp_rho116_real` | -4.47 | -0.79 | -0.87 | +0.45 | -1.70 | -6.14 |
+| `gp_rho116_dists1_ft` | -5.96 | -0.68 | -1.35 | +0.19 | -2.28 | -6.08 |
+| `gp_rho116_dists2_ft` | -5.62 | -0.32 | -0.72 | +0.39 | -3.27 | -7.54 |
+| `gp_gateonly_dists1_1000` | -3.95 | -0.65 | -0.44 | +0.24 | -2.01 | -5.04 |
+
+Decision: reject as lead. It is stable and slightly improves FID over the paper lead, but DISTS/LPIPS BD are weaker. Next attempt: stronger DISTS-only gate allocation with `lambda_align=0` so the gate actually follows DISTS/rate rather than being numerically dominated by the frozen CE term.
+
+
+## 2026-06-21 - Pretrained gate-only DISTS-heavy screening
+
+- Run: `v2_gateonly_dists4_rho116_lR10_lp2_align0_ft1000_from_lead`
+- W&B: `6dg3powh`
+- Change: resumed from the `rho1.16` real-codec lead, froze `prior_predictor` and `q_embed`, trained only the decoder-side gate with `lambda_dists=4`, `lambda_lpips=2`, `lambda_align=0`.
+- Exact real codec: arithmetic compress/decompress, Kodak q0-q3, all decoded images matched the model output with `max_abs=0`.
+- Kodak real-codec metrics:
+  - q0: bpp `0.023770`, LPIPS `0.2120`, DISTS `0.1154`, FID `29.0295`, KID `0.0035`
+  - q1: bpp `0.027508`, LPIPS `0.1882`, DISTS `0.1069`, FID `26.4583`, KID `0.0030`
+  - q2: bpp `0.032036`, LPIPS `0.1748`, DISTS `0.1003`, FID `24.9985`, KID `0.0026`
+  - q3: bpp `0.036225`, LPIPS `0.1654`, DISTS `0.0955`, FID `24.0121`, KID `0.0023`
+- BD-rate vs local real-codec GLC on Kodak: DISTS `-4.02%`, LPIPS `-0.66%`, PSNR `-0.54%`, MS-SSIM `+0.35%`, FID `-1.80%`, KID `-5.99%`.
+- Decision: reject as lead. FID improves slightly relative to the current `rho1.16` lead, but DISTS/LPIPS and most distortion-side curves weaken at essentially the same exact bpp.
+
+
+## 2026-06-21 - V2 q0/q1 baseline-hinge gate-only screening
+
+Implementation:
+
+- Added `--q_choices` to `scripts/train_v2.py` so V2 can fine-tune selected rates instead of sampling all q uniformly.
+- Added `--resume_weights_only` to load an existing V2 checkpoint with a fresh optimizer, needed when trainable modules change.
+- Added GLC-baseline perceptual constraints: `--lambda_dists_distill`, `--lambda_lpips_hinge`, `--lambda_dists_hinge`, plus hinge margins.
+
+Runs:
+
+- Failed/aborted: `v2_gateonly_q01_basehinge_lR10_lp4_d1_hinge15_1500_from_lead`, W&B `ne8nvlck`. I forgot to restore `gate_rho_min=1.0`; rho collapsed below 1 and the model spent more bits, so the run was stopped.
+- Valid: `v2_gateonly_q01_basehinge_rhomin1_rt112_lR10_lp4_d1_hinge10_1000_from_lead`, W&B `mdoc94xd`. Resumed from `rho1.16`, froze predictor/q_embed, trained gate only on q0/q1 with `rho_min=1.0`, `rho_target=1.12`, `lambda_R=10`, `lambda_lpips=4`, `lambda_dists=1`, DISTS hinge 10, LPIPS hinge 1.
+
+Real codec consistency:
+
+- Kodak q0-q3 and DIV2K q0-q3 completed with arithmetic compress/decompress and `max_abs=0.000e+00` against the forward path.
+- DIV2K average bpp: q0 `0.02197`, q1 `0.02571`, q2 `0.03025`, q3 `0.03446`.
+
+BD-rate vs local real-codec GLC:
+
+| dataset | run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID | decision |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| Kodak | q01 hinge | -4.90 | -1.00 | -1.43 | -0.21 | -2.01 | -4.67 | better than rho1.16 on most Kodak metrics, not enough alone |
+| DIV2K | q01 hinge | -8.69 | -0.87 | -1.10 | -0.46 | -4.97 | -8.02 | reject as lead; DISTS/FID weaker than rho1.16 |
+
+Interpretation: q-specific baseline hinge improves point quality and LPIPS, but it is too conservative for the main R-P claim. The current `rho1.16` paper lead remains stronger on DIV2K DISTS/FID and should remain the lead unless a future run preserves rate saving while adding only local safety.
+
+
+## 2026-06-21 - V2 q0/q1 weak baseline-hinge follow-up
+
+Run: `v2_gateonly_q01_weakhinge_rhomin1_rt114_lR10_lp4_d05_hinge5_800_from_lead`, W&B `8xffwful`.
+
+Goal: recover more of the `rho1.16` rate saving than the conservative q01 hinge run by using `rho_target=1.14`, weaker DISTS/LPIPS hinges, and lower direct DISTS weight.
+
+Real codec: Kodak q0-q3 completed with arithmetic compress/decompress and `max_abs=0.000e+00`.
+
+Kodak BD-rate vs local real-codec GLC:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| `gp_rho116_real` | -4.47 | -0.79 | -0.87 | +0.45 | -1.70 | -6.14 |
+| `q01 weak hinge` | -4.78 | -0.99 | -1.12 | +0.03 | +0.26 | -3.14 |
+
+Decision: reject and do not spend CLIC/DIV2K time. It gives small Kodak DISTS/LPIPS improvements but FID becomes worse than GLC on the Kodak patch protocol, so it weakens the perceptual-compression claim.
+
+
+## 2026-06-21 12:55 JST - V2 predictor-only mean correction from rho1.16 lead
+
+Goal: test whether the original GP-ResLC axis can be strengthened beyond pure quantization gating by letting a decoder-computable `z_hat,q -> prior mean` correction remove a small predictable latent component, while keeping the successful rho1.16 gate fixed.
+
+Implementation:
+
+- Added `--freeze_gate` to `scripts/train_v2.py` so fine-tunes can freeze the loaded perceptual gate.
+- Smoke passed with `max`-bounded mean correction and frozen q embedding.
+- Run: `v2_predonly_mean_b003_lR6_lp4_d1_hinge_from_lead_1200`, W&B `06468x7k`.
+- Init: `experiments/v2_gate_send_lR10_lp4_rho14_target116_send5_all_6k/v2_final.pt`.
+- Settings: `predictor_param_mode=mean`, `predictor_delta_bound=0.003`, `freeze_gate=true`, `freeze_q_embed=true`, `lambda_R=6`, `lambda_lpips=4`, `lambda_dists=1`, DISTS hinge 3, LPIPS hinge 0.5 with margin 0.02.
+
+Training read:
+
+- The predictor remained small: `delta_abs` stayed around `9.2e-4`, well below the `0.003` bound.
+- Kodak validation A/B stayed stable: q0-q3 `delta_bpp_y` roughly `-0.0026..-0.0028` vs frozen GLC, with no catastrophic PSNR collapse.
+
+Kodak exact real-codec evaluation:
+
+- Output: `experiments/real_codec/kodak_gp_reslc_predonly_mean_b003_1200/`.
+- Codec consistency: `max_abs=0.000e+00` for all q/images.
+- Average bpp q0-q3: `0.02364 / 0.02741 / 0.03194 / 0.03610`.
+- Comparison output: `experiments/real_codec/kodak_predonly_mean_b003_compare/`.
+
+BD-rate vs local GLC on Kodak:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| rho1.16 lead | -4.47% | -0.79% | -0.87% | +0.45% | -1.70% | -6.33% |
+| predonly_b003 | -4.28% | -0.70% | -0.96% | +0.36% | -2.30% | -8.97% |
+
+BD-rate vs rho1.16 lead:
+
+| metric | predonly_b003 |
+|---|---:|
+| PSNR | -0.19% |
+| MS-SSIM | -0.06% |
+| LPIPS | +0.55% |
+| DISTS | +0.21% |
+| FID | -0.45% |
+| KID | -2.69% |
+
+Decision:
+
+- Do not replace the paper lead. DISTS and LPIPS are slightly weaker than rho1.16, and the gain is not large enough for the official-curve story.
+- Keep as positive mechanism evidence: a tiny decoder-computable mean correction can reduce serialized bpp a bit and improve distribution metrics without breaking exact decoding. This suggests the full design should combine gate-based residual precision suppression with a better-trained, stage-aware residual mean predictor rather than a global mean head.
+
+
+## 2026-06-21 13:16 JST - DIV2K real-codec evaluation for predictor-only mean b003
+
+After the Kodak probe, I evaluated `v2_predonly_mean_b003_lR6_lp4_d1_hinge_from_lead_1200` on full-resolution DIV2K validation using the exact real codec.
+
+Artifacts:
+
+- Recon/payload manifests: `experiments/real_codec/div2k_gp_reslc_predonly_mean_b003_1200/`
+- Metrics CSV: `experiments/real_codec/div2k_gp_reslc_predonly_mean_b003_1200_metrics.csv`
+- Comparison CSV: `experiments/real_codec/div2k_predonly_mean_b003_compare_metrics.csv`
+- BD summary vs GLC: `experiments/real_codec/div2k_predonly_mean_b003_compare_bd.md`
+- BD summary vs rho1.16: `experiments/real_codec/div2k_predonly_mean_b003_compare_vs_rho116_bd.md`
+
+Exact codec status:
+
+- All q/images decode with `max_abs=0.000e+00` versus the differentiable forward path.
+- Average bpp q0-q3: `0.02129 / 0.02505 / 0.02952 / 0.03372`.
+- This is substantially lower than the rho1.16 DIV2K bpp curve (`0.02347 / 0.02728 / 0.03184 / 0.03601`).
+
+DIV2K metrics for predonly_b003:
+
+| q | bpp | PSNR | MS-SSIM | LPIPS | DISTS | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0.02129 | 21.2496 | 0.7697 | 0.1959 | 0.09106 | 15.0914 | 0.001258 |
+| 1 | 0.02505 | 21.6995 | 0.7901 | 0.1779 | 0.08320 | 13.3201 | 0.000923 |
+| 2 | 0.02952 | 22.1004 | 0.8064 | 0.1645 | 0.07779 | 12.4485 | 0.000749 |
+| 3 | 0.03372 | 22.4531 | 0.8164 | 0.1563 | 0.07514 | 11.8356 | 0.000670 |
+
+BD-rate vs local GLC on DIV2K:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| rho1.16 | -10.79% | -0.54% | -1.49% | -0.17% | -5.61% | -6.50% |
+| predonly_b003 | -9.76% | -0.80% | -1.61% | -0.45% | -6.73% | -8.27% |
+
+BD-rate predonly_b003 vs rho1.16:
+
+| metric | BD-rate |
+|---|---:|
+| DISTS | +1.12% |
+| LPIPS | -0.30% |
+| PSNR | -0.16% |
+| MS-SSIM | -0.25% |
+| FID | -1.68% |
+| KID | -2.69% |
+
+Decision:
+
+- Do not replace the DISTS lead: rho1.16 remains stronger on the primary DISTS curve.
+- predonly_b003 is a useful FID/KID/LPIPS auxiliary variant. It shows that bounded decoder-computable mean prediction can lower serialized bits more aggressively and improve distribution metrics, but it slightly underperforms rho1.16 on DIV2K DISTS.
+- CLIC full evaluation is optional rather than mandatory for the paper lead. If run, it should be framed as checking whether the FID gain transfers, not as a likely DISTS replacement.
+
+
+## 2026-06-21 14:55 JST - CLIC2020 full-test real-codec evaluation for predictor-only mean b003
+
+I completed full CLIC2020 test evaluation for `v2_predonly_mean_b003_lR6_lp4_d1_hinge_from_lead_1200` using the exact arithmetic real codec. This uses the 428-image CLIC2020 Professional+Mobile test union and official-style 256x256 patches with half-patch shift.
+
+Artifacts:
+
+- Recon/payload manifests: `experiments/real_codec/clic2020_test_gp_reslc_predonly_mean_b003_1200/`
+- q1-q3 metrics CSV: `experiments/real_codec/clic2020_test_gp_reslc_predonly_mean_b003_1200_q123_metrics.csv`
+- Hybrid metrics CSV: `experiments/real_codec/clic2020_test_predonly_mean_b003_hybrid_metrics.csv`
+- Local BD summaries: `experiments/real_codec/clic2020_hybrid_rhoq0_predq123_vs_GLC_bd.md`, `experiments/real_codec/clic2020_hybrid_rhoq0_predq123_vs_rho1p16_bd.md`
+- Official graph comparison: `experiments/paper_assets/official_curve_comparison_predonly_mean_b003/`
+
+Exact codec status:
+
+- q1, q2, q3 all decode with `max_abs=0.000e+00` versus the forward reconstruction.
+- Average bpp q1-q3: `0.02241 / 0.02689 / 0.03089`.
+- Average encode/decode time: q1 `0.728s / 1.013s`, q2 `0.821s / 1.106s`, q3 `0.912s / 1.196s` per full-resolution image.
+- FID/KID patch count is exactly `28,650` for every q, matching the CLIC2020 test protocol.
+
+CLIC2020 metrics for predonly_b003 q1-q3:
+
+| q | bpp | PSNR | MS-SSIM | LPIPS | DISTS | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.02241 | 24.2608 | 0.8408 | 0.1489 | 0.07493 | 5.4279 | 0.001010 |
+| 2 | 0.02689 | 24.7280 | 0.8536 | 0.1358 | 0.06880 | 4.7164 | 0.000764 |
+| 3 | 0.03089 | 25.0132 | 0.8611 | 0.1288 | 0.06621 | 4.4755 | 0.000714 |
+
+Hybrid curve uses rho1.16 q0 plus predonly_b003 q1-q3. BD-rate vs local real-codec GLC:
+
+| metric | BD-rate |
+|---|---:|
+| DISTS | -9.22% |
+| LPIPS | -0.13% |
+| PSNR | -1.17% |
+| MS-SSIM | -0.07% |
+| FID | -7.19% |
+| KID | -5.36% |
+
+BD-rate of the same hybrid curve vs rho1.16 lead:
+
+| metric | BD-rate |
+|---|---:|
+| DISTS | +1.15% |
+| LPIPS | -0.20% |
+| PSNR | -0.19% |
+| MS-SSIM | -0.36% |
+| FID | +0.22% |
+| KID | +2.50% |
+
+Official graph-extracted CLIC GLC comparison for the hybrid curve:
+
+| metric | BD-rate |
+|---|---:|
+| DISTS | -8.00% |
+| FID | -5.99% |
+| KID | -4.59% |
+| LPIPS | +1.12% |
+| PSNR | +0.49% |
+| MS-SSIM | +1.32% |
+
+Decision:
+
+- Do not replace the VCIP paper lead. The predictor-only hybrid is strong versus GLC, but it is weaker than rho1.16 on the primary CLIC DISTS curve and slightly weaker on FID/KID versus rho1.16.
+- The experiment is valuable mechanistic evidence: bounded decoder-computable mean prediction reduces serialized y bits and works with exact arithmetic coding, but a global mean correction is too blunt for DISTS.
+- Next high-upside pretrained direction: combine the rho1.16 residual-precision gate with a stage-aware or sensitivity-aware mean predictor, using explicit DISTS/LPIPS safety hinges. Avoid globally unfreezing entropy/prior modules until estimated bpp and serialized bpp are calibrated.
+
+
+## 2026-06-21 15:25 JST - Stage residual real-codec audit
+
+Goal: test a more literal GP-ResLC mechanism: a decoder-recomputable four-part residual-mean predictor, so bits are spent on the part of `y` not predictable from `z_hat`, GLC common prior parameters, and already decoded latent parts.
+
+Implementation/protocol fix:
+- Added `stage_latent_residual` support to `scripts/train_v2.py` and `gp_reslc/real_codec.py`.
+- Fixed a real-codec graph mismatch: the real codec skipped the pretrained perceptual gate for stage-aware modes, while `train_forward` applied it before the four-part prior. Before the fix, Kodak real-codec checks showed `consistency_max_abs ~= 1.4..2.3`, so those outputs were invalid for paper claims. After applying the same gate in `_apply_gp_reslc_params`, the debug real-codec run gives `max_abs=0` for q0/q3 on Kodak.
+
+Run audited:
+- Checkpoint: `experiments/v2_stage_resid_b006_lR6_lp4_d1_mean05_hinge_from_lead_1k/v2_final.pt`
+- W&B: `07r6rjhl`
+- Real codec: `experiments/real_codec/kodak_gp_reslc_stage_resid_b006_1k_gatefix/`
+- Metrics: `experiments/real_codec/kodak_gp_reslc_stage_resid_b006_1k_gatefix_metrics.csv`
+- BD comparison: `experiments/real_codec/kodak_stage_resid_b006_compare_bd.md`
+
+Kodak real-codec metrics after the fix:
+
+| q | bpp | DISTS | LPIPS | PSNR | MS-SSIM | FID |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0.021331 | 0.131313 | 0.248151 | 20.4510 | 0.6994 | 35.2075 |
+| 1 | 0.024864 | 0.114594 | 0.212862 | 21.0427 | 0.7322 | 29.4786 |
+| 2 | 0.029455 | 0.104397 | 0.189971 | 21.5613 | 0.7575 | 26.2882 |
+| 3 | 0.033588 | 0.098321 | 0.175090 | 21.9389 | 0.7747 | 24.7416 |
+
+BD-rate versus local real-codec GLC:
+- rho1.16 lead: DISTS `-4.47%`, LPIPS `-0.79%`, PSNR `-0.87%`, MS-SSIM `+0.45%`, FID `-1.70%`, KID `-6.14%`.
+- stage residual b006: DISTS `-2.32%`, LPIPS `+6.48%`, PSNR `+3.46%`, MS-SSIM `+5.93%`, FID `+4.34%`, KID `+1.23%`.
+
+Decision: reject `b006` as paper lead. It is closer to the original residual-coding thesis than pure rho scaling, but the residual-mean predictor is too aggressive: it lowers bits by moving necessary latent content into a mean prediction that the generator/prior cannot reconstruct perceptually well. This is a useful negative result and suggests the complete design needs either a much more constrained residual predictor, a reconstruction-preserving distillation term, or a staged training schedule where the entropy model is adapted around the residual path instead of only attaching a predictor to a fixed GLC prior.
+
+Follow-up launched:
+- `experiments/v2_stage_resid_b002_lR6_lp4_d1_mean01_hinge_from_lead_1k/`, W&B `o7mnj6mq`.
+- Changes: `predictor_delta_bound=0.002`, `lambda_mean_pred=0.1` to keep only a small decoder-predictable residual correction.
+
+
+## 2026-06-21 15:55 JST - Conservative and delta-regularized stage residual follow-ups
+
+Follow-up runs after rejecting the unconstrained `b006` stage residual:
+
+1. Conservative bound run
+- Checkpoint: `experiments/v2_stage_resid_b002_lR6_lp4_d1_mean01_hinge_from_lead_1k/v2_final.pt`
+- W&B: `o7mnj6mq`
+- Real codec: `experiments/real_codec/kodak_gp_reslc_stage_resid_b002_1k_gatefix/`
+- Metrics: `experiments/real_codec/kodak_gp_reslc_stage_resid_b002_1k_gatefix_metrics.csv`
+- BD table: `experiments/real_codec/kodak_stage_resid_b002_compare_bd.md`
+- Result vs local GLC on Kodak: DISTS `+0.65%`, LPIPS `+7.30%`, PSNR `+4.84%`, MS-SSIM `+6.73%`, FID `+4.84%`, KID `-0.75%`.
+- Decision: reject. Lowering the bound to `0.002` does not recover quality; DISTS is worse than GLC.
+
+2. Delta-L1 regularized run
+- Code change: added `--lambda_stage_delta_abs` to `scripts/train_v2.py` and W&B logging for `train/stage_delta_l1`.
+- Checkpoint: `experiments/v2_stage_resid_b006_stageL20_lR6_lp4_d1_mean01_hinge_from_lead_800/v2_final.pt`
+- W&B: `9ovci19c`
+- Real codec: `experiments/real_codec/kodak_gp_reslc_stage_resid_b006_stageL20_800_gatefix/`
+- Metrics: `experiments/real_codec/kodak_gp_reslc_stage_resid_b006_stageL20_800_gatefix_metrics.csv`
+- BD table: `experiments/real_codec/kodak_stage_resid_b006_stageL20_compare_bd.md`
+- Result vs local GLC on Kodak: DISTS `-2.52%`, LPIPS `+6.62%`, PSNR `+3.85%`, MS-SSIM `+5.96%`, FID `+5.22%`, KID `+1.54%`.
+- Decision: reject as paper lead. It slightly improves DISTS over unconstrained `b006` (`-2.32%`) but remains far behind rho1.16 (`-4.47%`) and worsens the other metrics.
+
+Stage residual failure analysis:
+- CSV: `experiments/real_codec/stage_residual_saturation_kodak.csv`
+- L1 run q0/q3 CSV: `experiments/real_codec/stage_residual_stageL20_saturation_kodak_q03.csv`
+- `b002` saturates the bounded delta almost everywhere: stage-wise saturation fraction is roughly `0.84..0.96`, while delta-target correlation is only `0.03..0.10` on q0/q3.
+- `b006` and `b006_stageL20` reduce saturation but still have weak image-wise delta/target correlation (`~0.05..0.14`) and broad bound-seeking shifts.
+
+Interpretation: the pretrained fixed-GLC-prior attachment does not yet realize the intended principle. It can lower arithmetic-coded `y` bits, but the learned mean correction is not selective enough to represent only generator-predictable residual. For a complete GP-ResLC version, the residual predictor must be trained jointly with the entropy model / synthesis path, or gated by an uncertainty/sendability signal tied to perceptual sensitivity. This supports moving beyond post-hoc mean correction toward a scratch or staged full-model training path.
+
+
+## 2026-06-21 16:00 JST - Scratch Stage-A basis audit
+
+Purpose: check whether the scratch branch has a better semantic/generative Stage-A foundation than the current attention-refined Stage-A used by Stage-B residual experiments.
+
+Deterministic Kodak center-crop Stage-A evaluations:
+
+| checkpoint | semantic bpp | LPIPS | DISTS | note |
+|---|---:|---:|---:|---|
+| `scratch_stage_a_vq1024_b80_z160_down5_softent_restart_from6000_30k/stage_a_best.pt` | 0.00977 | 0.45730 | 0.45180 | long soft-entropy run; not better |
+| `scratch_stage_a_down5_attn_refine_from_d2_8000_6k/stage_a_best.pt` | 0.00977 | 0.45767 | 0.43546 | best DISTS foundation among checked Stage-A models |
+| `scratch_stage_a_decoder_only_from_attn_best_d3_lp08_l103_4k/stage_a_best.pt` | 0.00977 | 0.45655 | 0.43722 | slightly better LPIPS, worse DISTS |
+
+Tried a new decoder-only DISTS-heavy continuation from the attention-refined Stage-A:
+- Failed setup run: W&B `e7zk9101`, structure mismatch (`extra_decoder_blocks` omitted); no training, ignore.
+- Correct run: `scratch_stage_a_decoder_only_dists5_lp03_l102_from_attn_best_plus1200`, W&B `n14pag52`.
+- Settings: freeze encoder+quantizer, resume `scratch_stage_a_down5_attn_refine_from_d2_8000_6k/stage_a_best.pt`, decoder attention + `extra_decoder_blocks=2`, `lambda_dists=5`, `lambda_lpips=0.3`, `lambda_l1=0.2`, +1200 steps.
+- Deterministic Kodak center results: best checkpoint LPIPS/DISTS `0.46299/0.44128`, final `0.46312/0.44256`.
+
+Decision: reject the new Stage-A continuation. DISTS-heavy decoder-only training does not improve the Stage-A basis and hurts LPIPS. Keep `scratch_stage_a_down5_attn_refine_from_d2_8000_6k/stage_a_best.pt` as the scratch Stage-A foundation. The scratch bottleneck's remaining limitation is not simply Stage-A decoder loss weighting; it likely needs either a stronger generator architecture/training schedule or better residual-stage objectives after Stage-A.
+
+## 2026-06-21 16:00 JST - Stage-quant gate placement sensitivity audit
+
+Purpose: diagnose why the complete-design `stage_quant_gate` branch is on-axis but weaker than the paper-facing `rho1.16` lead on CLIC/DIV2K. I analyzed the quality-preserving q1/q2/q3 stage-quant gates on Kodak against local reconstruction error, LPIPS-spatial delta, texture variance, and image gradient. Artifacts:
+
+- `experiments/analysis/stage_quant_quality_q1_gate_sensitivity_kodak.csv/json`
+- `experiments/analysis/stage_quant_quality_q2_gate_sensitivity_kodak.csv/json`
+- `experiments/analysis/stage_quant_quality_q3_gate_sensitivity_kodak.csv/json`
+
+Summary over 24 Kodak images:
+
+| q | delta bpp_y | rho mean | corr rho/base error | corr rho/texture | corr rho/gradient | corr rho/LPIPS delta | high-rho LPIPS delta | low-rho LPIPS delta |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | -0.00032 | 1.015 | +0.231 | +0.236 | +0.209 | +0.013 | 0.00142 | -0.00011 |
+| 2 | -0.00113 | 1.061 | +0.237 | +0.244 | +0.216 | +0.024 | 0.00458 | 0.00151 |
+| 3 | -0.00205 | 1.118 | +0.200 | +0.178 | +0.172 | +0.027 | 0.00437 | 0.00152 |
+
+Interpretation: the gate reduces real y-stream bits, but its spatial allocation is not the intended one. High-rho locations are positively correlated with local baseline error, texture, and gradient, and they also show larger local LPIPS-spatial degradation than low-rho locations. This means the learned gate is using entropy pressure to coarsen difficult/high-energy regions, not safely generator-predictable regions. That explains why stage-quant is method-faithful and real-codec exact, yet still underperforms the global rho1.16 shortcut on the main CLIC/DIV2K curves.
+
+Decision: do not spend more time on unconstrained stage-quant rate pressure. The next complete-design experiment should invert this placement bias: either train a measured local sensitivity teacher from synthetic coarsening trials, add an explicit high-rho penalty on edge/texture/high-LPIPS-delta regions, or jointly train the synthesis path so high-rho regions become genuinely generator-recoverable.
+
+## 2026-06-21 16:15 JST - q2 stage-quant spatial-guard diagnostic
+
+Purpose: test whether the bad `stage_quant_gate` placement found above can be corrected by a direct LPIPS-spatial high-rho penalty. This was a short diagnostic, not a paper-lead candidate.
+
+Run:
+
+- `v4_stage_quant_v1q2_spgate_fixalloc_rhotarget106_lR20_lp10_dists10_sp80_500`
+- W&B: `d096tn7c`
+- Init: weights-only resume from `v3_stage_quant_v1q2_quality_hinge_fast_lR35_rhomax20_3k/train_state.pt`
+- Key setting: `lambda_lpips_spatial_gate_hinge=80`, `rho_target=1.06`, fixed GLC, q2 only.
+
+Training A/B at iteration 250: baseline `bpp_y=0.03239`, ours `bpp_y=0.03134`, delta `-0.00104`, baseline PSNR `19.2848`, ours PSNR `19.2611`. The penalty roughly halves the rate saving but almost closes the PSNR gap.
+
+Gate-placement audit on Kodak after the fine-tune:
+
+| run | delta bpp_y | rho mean | corr rho/base error | corr rho/texture | corr rho/gradient | corr rho/LPIPS delta | high-rho LPIPS delta | low-rho LPIPS delta |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| q2 quality | -0.00113 | 1.061 | +0.237 | +0.244 | +0.216 | +0.024 | 0.00458 | 0.00151 |
+| q2 spatial-guard | -0.00055 | 1.028 | -0.057 | +0.027 | -0.048 | +0.004 | 0.00129 | 0.00109 |
+
+Kodak8 real-codec q2 diagnostic for `q2 spatial-guard`:
+
+- real bpp `0.03470`, bpp_y `0.02959`, encode/decode `0.1269s/0.1092s`, consistency `max_abs=0`.
+- PSNR `21.5381`, MS-SSIM `0.7671`, LPIPS `0.1731`, DISTS `0.1028`, FID `54.2086`, KID `0.0038`.
+- Artifacts: `experiments/analysis/stage_quant_q2_spgate_fixalloc_sensitivity_kodak.json`, `experiments/real_codec/kodak8_stage_quant_q2_spgate_fixalloc_metrics.csv`, `experiments/real_codec/kodak8_stage_quant_q2_spgate_fixalloc_recon/`.
+
+Interpretation: the spatial guard successfully flips the gate placement away from high-error/high-gradient regions and improves local safety. However, it also gives back roughly half of the y-stream saving and lands between GLC q2 and the existing stage-quant quality q2. This is not a lead, but it proves the placement problem is controllable. The next credible complete-design experiment should combine this guard with a stronger generator/reconstruction path or a two-objective budget: keep a fixed bpp_y saving while moving high rho only to low-sensitivity regions.
+
+### Kodak full q2 result for spatial-guard diagnostic
+
+The q2 spatial-guard diagnostic was expanded from Kodak8 to all 24 Kodak images with the exact real codec:
+
+| run | q | bpp | bpp_y | PSNR | MS-SSIM | LPIPS | DISTS | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| stage-quant quality | 2 | 0.03263 | 0.02753 | 21.9264 | 0.7757 | 0.1725 | 0.0993 | n/a | n/a |
+| q2 spatial-guard | 2 | 0.03366 | 0.02855 | 21.9877 | 0.7792 | 0.1705 | 0.0993 | 24.6837 | 0.0025 |
+| GLC local | 2 | 0.03472 | n/a | 22.0767 | 0.7819 | 0.1671 | 0.0979 | n/a | n/a |
+
+Artifact: `experiments/real_codec/kodak_stage_quant_q2_spgate_fixalloc_metrics.csv`.
+
+Read: the spatial guard trades back about `0.0010` bpp compared with the existing stage-quant q2 point, but improves LPIPS, PSNR, and MS-SSIM while keeping DISTS essentially tied. It is still not enough to beat the full GLC q2 quality point at equal quality, and it is not a curve lead. The important result is mechanistic: once high-rho placement is moved away from high-error/high-gradient regions, perceptual quality recovers, so the next version should preserve the corrected placement while enforcing a fixed rate-saving budget.
+
+## 2026-06-21 Scratch-v2 top-conference pivot
+
+- Direction: VCIP short-cycle optimization is no longer the main target. Move toward a top-conference GP-ResLC design: keep the semantic/generative stream extremely cheap, and spend residual bits only where the generator cannot plausibly recover content.
+- Finding: pretrained GLC-based variants have a solid local lead but are structurally constrained by the frozen/partially frozen GLC generator and do not fully enforce the predictable-vs-unpredictable decomposition.
+- Fix implemented: scripts/train_scratch_stage_a_adv.py now loads attention/refined Stage-A checkpoints correctly and supports delayed adversarial training, discriminator feature matching, and encoder/quantizer freezing.
+- Smoke test: experiments/smoke_stage_a_adv_load ran 1 iteration from experiments/scratch_stage_a_down5_attn_refine_from_d2_8000_6k/stage_a_best.pt; CUDA visible; semantic fixed bpp stayed 0.00977; Kodak quick-val LPIPS/DISTS were roughly 0.4067/0.3927 for the sampled batch.
+- Next run: long Stage-A generator fine-tune with semantic encoder/codebook frozen. Hypothesis: a stronger generator at unchanged semantic rate lowers the residual burden in Stage-B and better realizes the GP-ResLC premise.
+
+
+
+## 2026-06-21 17:10 JST - Top-conference pivot: GLC-latent residual scratch/full-design branch
+
+Decision update:
+
+- The project direction is now top-conference/full-paper oriented rather than VCIP-short-track first.
+- The pretrained real-codec rho branch remains the controlled GLC anchor and source-of-truth for protocol-clean comparisons, but it is unlikely to produce a sufficiently large conceptual/performance jump by small q/rho sweeps alone.
+- The scratch branch is method-faithful but limited by the weak Stage-A generator. The high-upside next branch should keep the original axis while using the strong pretrained GLC/VQGAN generator as a synthesis prior.
+
+Implemented branch:
+
+- Added `gp_reslc/scratch/glc_latent_residual.py`.
+- Added `scripts/train_glc_latent_residual.py`.
+- The model sends the existing 8x8 Stage-A semantic VQ code `s` and learns `mu_theta(s)` in the frozen GLC/VQGAN latent space. A low-dimensional entropy-modeled residual then corrects only the unpredictable component of the GLC latent.
+- This is closer to the full GP-ResLC design than post-hoc global GLC prior shifts: the generator-predictable component is explicitly represented as `mu_theta(s)`, and the transmitted residual is modeled separately.
+
+Smoke/pilot:
+
+- Smoke command: `scripts/train_glc_latent_residual.py`, 2 iterations, `residual_dim=16`, `hidden_dim=128`, no W&B. CUDA forward/backward and checkpoint writing passed.
+- Predictor-only pilot: `experiments/glc_latent_residual_predictor_pilot_80`, 80 iterations, no W&B. Validation logic was fixed so predictor-only warmup does not evaluate with random residuals.
+- Pilot signal: Kodak validation DISTS dropped from about `0.77` at init to about `0.51` by 40 iterations with only the fixed semantic stream (`0.00977` bpp). This suggests the frozen GLC generator can be driven from the cheap semantic code, unlike the weaker scratch decoder.
+
+Long run started:
+
+```bash
+.venv/bin/python -u scripts/train_glc_latent_residual.py \
+  --glc_weights pretrained/GLC_image.pth.tar \
+  --stage_a_ckpt experiments/scratch_stage_a_down5_attn_refine_from_d2_8000_6k/stage_a_best.pt \
+  --data /dpl/openimages/train \
+  --val /dpl/kodak \
+  --out experiments/glc_latent_residual_predictor_warmup_6k \
+  --iters 6000 --bs 2 --num_workers 4 \
+  --log_every 50 --eval_every 500 --save_every 2000 \
+  --residual_dim 24 --hidden_dim 256 --predictor_only_iters 6000 \
+  --lr 0.0002 --lambda_R 0 \
+  --lambda_l1 0.2 --lambda_lpips 0.8 --lambda_dists 1.2 \
+  --lambda_pred 2 --lambda_latent 2 \
+  --wandb_project gp-reslc-research \
+  --wandb_name glc_latent_residual_predictor_warmup_6k \
+  --wandb_mode online
+```
+
+W&B:
+
+- Project: `gp-reslc-research`
+- Run: `glc_latent_residual_predictor_warmup_6k`
+- Run id: `woye1ymw`
+
+Early online status:
+
+- Iteration 500 validation: total bpp `0.00977`, residual bpp `0`, LPIPS `0.7868`, DISTS `0.4716`, pred/latent loss `0.1826`.
+- The predictor is still below the best scratch Stage-A DISTS, but it is learning quickly and uses a much stronger frozen generator. Continue warmup, then start a residual phase from the best checkpoint.
+
+Next action after warmup:
+
+1. Resume from `glc_latent_residual_best.pt` with `predictor_only_iters=0` and nonzero `lambda_R` to train the residual branch.
+2. Use `lambda_R` sweep around `0.5, 1.0, 2.0`; promote only if residual bpp adds perceptual gain efficiently.
+3. Add deterministic center-crop evaluator for this branch and compare against current scratch Stage-B and local GLC crops before any full-resolution real-codec work.
+4. If the residual branch is promising, implement real arithmetic coding for the residual symbols and adaptive entropy coding for the semantic VQ indices.
+
+
+## 2026-06-21 17:45 JST - GLC-latent residual: predictor/residual phase audit
+
+Purpose: evaluate whether the new GLC-latent residual branch is actually sending unpredictable residual information, rather than only learning a better decoder-side deterministic correction.
+
+Completed runs:
+
+| run | init | quant step | rate weight | fixed Kodak center result | interpretation |
+|---|---|---:|---:|---|---|
+| `glc_latent_residual_predictor_warmup_6k` | Stage-A semantic + frozen GLC/VQGAN | n/a | 0 | no-res final: bpp `0.00977`, LPIPS `0.65444`, DISTS `0.42000`; best: LPIPS `0.67302`, DISTS `0.41993` | semantic-only predictor reaches the old scratch DISTS range at lower bpp, but LPIPS remains weak. |
+| `glc_latent_residual_residual_lR1_lp2_d2_from_warm_3k` | predictor warmup final | 0.5 | 1.0 | no-res final: LPIPS/DISTS `0.58901/0.39862`; residual-on final: total bpp `0.009766`, LPIPS/DISTS `0.58593/0.39924` | large deterministic refinement gain, but hard-rounded residual symbols are effectively all zero. |
+| `glc_latent_residual_residual_q025_lR07_lp2_d15_from_lR1_1500` | q0.5 residual final | 0.25 | 0.7 | no-res final: LPIPS/DISTS `0.57749/0.39775`; residual-on final: total bpp `0.009766`, LPIPS/DISTS `0.56636/0.39775` | q0.25 improves LPIPS while preserving DISTS, but transmitted residual bpp remains effectively zero. |
+
+Key finding:
+
+- The frozen GLC generator can be driven surprisingly far from the cheap 8x8 semantic code: Kodak-center DISTS improves from the Stage-A scratch basis `0.43546` to about `0.39775` at the same semantic bpp `0.00977`.
+- However, the residual stream is not yet doing the intended job. With additive-noise quantization during training, residual symbols stay below the hard-rounding threshold, so evaluation rounds almost all residual coefficients to zero.
+- The residual decoder still improves results because it receives `mu` and upsampled semantic features; with zero residual symbols it becomes a bit-free deterministic latent refinement network. This is useful as a generator-side predictor, but it does not yet prove the main GP-ResLC thesis of sending only unpredictable residuals.
+
+Action taken:
+
+- Added `quant_mode=ste` to `GLCLatentResidualBottleneck` and `scripts/train_glc_latent_residual.py` so training can use hard-rounded symbols with a straight-through gradient.
+- Added `rounded_abs_mean` and `rounded_nonzero_frac` logs to training, validation, and deterministic evaluation. This makes residual payload collapse visible during training instead of discovering it only after fixed evaluation.
+
+Next experiment:
+
+- Resume from the q0.25 run with `--quant_mode ste`, modest residual rate pressure, and no W&B upload. Promote only if `rounded_nonzero_frac > 0` and perceptual gains survive fixed hard-round evaluation.
+
+
+### STE residual diagnostic result
+
+Run: `experiments/glc_latent_residual_residual_ste_q025_lR02_lp25_d15_from_q025_1k`
+
+Settings: resumed from q0.25 final, `quant_mode=ste`, `quant_step=0.25`, `lambda_R=0.2`, LPIPS-heavy residual phase, no W&B upload.
+
+Fixed Kodak center-crop results:
+
+| checkpoint | mode | bpp | LPIPS | DISTS | rounded nonzero frac | read |
+|---|---|---:|---:|---:|---:|---|
+| `0011000` | no residual | 0.009766 | 0.57976 | 0.40251 | 0 | predictor degraded vs q0.25 parent |
+| `0011000` | residual on | 0.009766 | 0.56710 | 0.40352 | 0 | LPIPS improves, DISTS worsens; no true payload |
+| `final` | no residual | 0.009766 | 0.59107 | 0.40279 | 0 | predictor/refiner degrades further |
+| `final` | residual on | 0.010189 | 0.57695 | 0.40246 | 0.000244 | first tiny nonzero payload; LPIPS improves, DISTS nearly tied |
+
+Conclusion: STE is necessary but insufficient. The residual decoder can still produce a nonzero correction from `mu` and `z_up` even when `q_residual=0`, so the model escapes into bit-free deterministic refinement. The next implementation must force `delta_r=0` wherever the rounded residual payload is zero, while preserving a straight-through gradient so the residual encoder can learn to activate paid residual locations.
+
+
+### Payload-gated and top-k residual diagnostics
+
+Implementation update:
+
+- Added `delta_gate_mode=payload_ste`: residual correction `delta_r` is zero wherever the rounded residual payload is zero. This blocks the previous bit-free deterministic-refinement escape path.
+- Added `force_topk_frac`: encoder-side sparse residual warmup that forces only the highest-magnitude residual coefficients to nonzero rounded symbols. The full residual grid is still entropy-modeled; no separate free mask is assumed.
+
+Runs:
+
+| run | setting | fixed Kodak center result | decision |
+|---|---|---|---|
+| `glc_latent_residual_payloadste_q025_lR005_lp25_d15_from_q025_800` | payload gate, no forced top-k | residual-on and no-res are identical: bpp `0.009766`, LPIPS/DISTS `0.57767/0.40620`, `delta_active_frac=0` | gate is correct, but residual does not self-activate. |
+| `glc_latent_residual_payloadste_topk001_q025_lR01_lp25_d15_from_q025_800`, checkpoint `0011200` | payload gate + top-k `0.001` | no-res: bpp `0.009766`, LPIPS/DISTS `0.56709/0.40019`; residual-on: bpp `0.011458`, LPIPS/DISTS `0.56678/0.39951`, `rounded_nonzero_frac=0.00098`, `delta_active_frac=0.02165` | first true paid-residual point with both LPIPS and DISTS improving, but gain is very small. |
+| same, final | payload gate + top-k `0.001` | no-res: bpp `0.009766`, LPIPS/DISTS `0.57175/0.39984`; residual-on: bpp `0.011458`, LPIPS/DISTS `0.57130/0.39916`, `rounded_nonzero_frac=0.00098`, `delta_active_frac=0.02035` | same direction as 0011200; keep as a mechanism-positive branch, not a performance lead. |
+
+Interpretation:
+
+- The payload gate proves the previous residual gains were partly an architectural escape path: when zero-payload correction is forbidden, the model initially collapses to no-res output.
+- Sparse top-k residual warmup gives the first clean signal that a tiny paid residual can improve both LPIPS and DISTS under the intended rule.
+- The effect is too small for a paper claim. The next high-upside path is not more tiny top-k tuning alone; it should train a stronger predictor/residual pair with a scheduled sparse budget, e.g. start with top-k `0.002-0.005`, then anneal the budget/rate and add a perceptual improvement objective on active residual sites.
+
+
+### DIV2K check and residual-budget upper-bound diagnostics
+
+DIV2K center-crop check (`/dpl/div2k`, 100 images):
+
+| checkpoint | mode | bpp | LPIPS | DISTS | note |
+|---|---|---:|---:|---:|---|
+| q0.25 parent final | no residual | 0.009766 | 0.56085 | 0.39429 | deterministic predictor only |
+| q0.25 parent final | residual on | 0.009766 | 0.54868 | 0.39310 | improves, but this is payload-gate-free deterministic correction, not a valid paid-residual claim |
+| top-k 0.001 final | no residual | 0.009766 | 0.54983 | 0.39302 | payload-gated predictor state |
+| top-k 0.001 final | residual on | 0.011458 | 0.54976 | 0.39295 | paid residual effect generalizes, but is extremely small |
+
+Residual-budget diagnostics on fixed Kodak center crops:
+
+| run | top-k frac | bpp | LPIPS no-res -> res | DISTS no-res -> res | decision |
+|---|---:|---:|---:|---:|---|
+| `payloadste_topk001_q025_lR01_lp25_d15_from_q025_800` final | 0.001 | 0.00977 -> 0.01146 | 0.57175 -> 0.57130 | 0.39984 -> 0.39916 | best mechanism-positive paid-residual branch so far |
+| `payloadste_topk005_q025_lR005_lp25_d15_from_q025_600` final | 0.005 | 0.00977 -> 0.01822 | 0.56502 -> 0.56415 | 0.39371 -> 0.39383 | more bits do not improve DISTS; not rate-efficient |
+| `payloadste_topk005_activel1_q025_lR005_lp25_d15_from_q025_600` final | 0.005 | 0.00977 -> 0.01822 | 0.57829 -> 0.57831 | 0.40526 -> 0.40535 | active L1 lowers local pixel error but hurts perceptual metrics; reject |
+
+Interpretation:
+
+- `top-k=0.001` is the only branch that is both method-faithful and improves LPIPS/DISTS on Kodak and DIV2K, but the gain is much too small for a paper result.
+- Increasing residual budget without better selection/objective wastes bits and can hurt DISTS.
+- Active local L1 is the wrong proxy for perceptual residual usefulness, matching earlier scratch-stage findings that L1 selected losses do not align with DISTS/FID-style claims.
+
+Next research decision:
+
+1. Keep `top-k=0.001` as the clean mechanism proof.
+2. Stop simple budget scaling and L1 active losses.
+3. Move to either a perceptual active-site objective (spatial LPIPS/VGG/DISTS-proxy) or a residual-latent training phase that first teaches the residual decoder to reconstruct true latent residual under a sparse budget, then fine-tunes image perceptual quality.
+
+
+### Active-latent sparse residual result and next pivot
+
+Run: `glc_latent_residual_payloadste_topk001_activelat_q025_lR01_lp25_d15_from_q025_1000`
+
+Settings: payload-gated top-k `0.001`, active latent no-regression loss (`lambda_active_latent_improve=10`, margin `0.001`).
+
+Fixed Kodak center:
+
+| checkpoint | mode | bpp | LPIPS | DISTS | decision |
+|---|---|---:|---:|---:|---|
+| `0010500` | no residual | 0.009766 | 0.57743 | 0.39724 | base |
+| `0010500` | residual on | 0.011458 | 0.57685 | 0.39704 | improves both; best active-latent point |
+| final | no residual | 0.009766 | 0.58267 | 0.39727 | base drifted |
+| final | residual on | 0.011458 | 0.58269 | 0.39733 | reject; over-training hurts residual effect |
+
+Fixed DIV2K center for `0010500`:
+
+| mode | bpp | LPIPS | DISTS |
+|---|---:|---:|---:|
+| no residual | 0.009766 | 0.56066 | 0.39391 |
+| residual on | 0.011458 | 0.56016 | 0.39379 |
+
+Readout:
+
+- Active-latent loss gives a cleaner early sparse residual point than plain top-k, and the sign generalizes to DIV2K.
+- The gain is still too small, and longer training degrades the residual effect.
+- The bigger limitation is likely upstream: the 8x8 Stage-A code was trained for the scratch decoder, not to predict GLC/VQGAN latent space. Keeping Stage-A frozen constrains the full-design branch.
+
+Next pivot:
+
+- Fine-tune the Stage-A encoder/codebook jointly with the GLC-latent predictor while keeping the semantic rate fixed. This directly learns a semantic code whose purpose is to let the frozen generator reconstruct predictable content, then residual coding can be revisited on top of a stronger semantic predictor.
+
+
+### Stage-A joint fine-tune diagnostic
+
+Run: `glc_latent_stagea_joint_pred_from_q025_2k`
+
+Settings: resume q0.25 parent weights only, update Stage-A encoder/codebook plus GLC-latent predictor, predictor-only/no residual, fixed semantic bpp `0.00977`.
+
+Fixed center-crop results for `glc_latent_residual_best.pt` (iteration 11500):
+
+| dataset | bpp | LPIPS | DISTS | comparison |
+|---|---:|---:|---:|---|
+| Kodak | 0.009766 | 0.58188 | 0.39993 | worse than q0.25 parent no-res (`0.57749/0.39775`) |
+| DIV2K | 0.009766 | 0.56311 | 0.39611 | worse than q0.25 parent no-res (`0.56085/0.39429`) |
+
+Decision: reject this simple joint Stage-A fine-tune. Random validation looked promising, but deterministic Kodak/DIV2K show that moving the Stage-A encoder/codebook from a pretrained semantic basis hurts generalization. The next safer route is fixed Stage-A plus predictor-only fine-tuning, then revisit trainable semantic codes with a slower schedule, EMA/codebook regularization, or a separate Stage-II latent-code objective.
+
+
+### Fixed Stage-A predictor-only continuation: new semantic lead
+
+Run: `glc_latent_predictor_only_from_q025_d2_lp2_2k`
+
+Settings: resume q0.25 parent weights only, keep Stage-A frozen, no residual, optimize the semantic-code-to-GLC-latent predictor with image perceptual and latent losses.
+
+Best checkpoint: `glc_latent_residual_best.pt` at iteration `12000`.
+
+Fixed center-crop results:
+
+| dataset | checkpoint | bpp | LPIPS | DISTS | comparison to q0.25 parent no-res |
+|---|---|---:|---:|---:|---|
+| Kodak | predictor-only best | 0.009766 | 0.57334 | 0.39338 | improves from `0.57749/0.39775` |
+| DIV2K | predictor-only best | 0.009766 | 0.56086 | 0.39113 | DISTS improves from `0.56085/0.39429`, LPIPS tied |
+
+Decision:
+
+- This is the strongest current full-design/scratch-direction result: no residual stream, no free correction, same fixed semantic bpp, better predictable-component reconstruction.
+- The gain is larger and more stable than the paid sparse residual gains. This supports a research pivot: first maximize what the frozen generator can recover from the semantic code, then add paid residual only after the predictable component saturates.
+- Next: continue this branch with a lower LR and DISTS-heavy but LPIPS-safe objective. Then re-attach payload-gated top-k residual from the improved predictor.
+
+
+### Low-LR predictor continuation result
+
+Run: `glc_latent_predictor_only_from_predbest_dists25_lp15_4k`
+
+The 4k low-LR continuation from the semantic lead did not improve the fixed Kodak result:
+
+| checkpoint | bpp | LPIPS | DISTS | decision |
+|---|---:|---:|---:|---|
+| previous predictor-only best | 0.009766 | 0.57334 | 0.39338 | keep as semantic lead |
+| continuation `0015000` | 0.009766 | 0.57425 | 0.39715 | reject |
+| continuation final | 0.009766 | 0.57373 | 0.39843 | reject |
+
+Decision: do not continue this DISTS-heavy low-LR setting. The useful move is to keep `glc_latent_predictor_only_from_q025_d2_lp2_2k/glc_latent_residual_best.pt` as the semantic predictor lead and re-attach payload-gated sparse residual from that stronger predictable component.
+
+
+## 2026-06-21 19:05 JST - GLC-latent hard-topk zero-center residual
+
+Implemented two important corrections in the GLC-latent residual branch:
+
+- `delta_gate_mode=zero_center`: residual correction is now `Decoder(q_residual, context) - Decoder(0, context)`. This preserves the core GP-ResLC constraint: if no residual payload is sent, the correction is exactly zero, while a sparse paid residual can still propagate through the convolutional decoder to neighboring latent positions.
+- `--hard_topk`: after selecting top-k residual coefficients, all non-top-k rounded symbols are forced to zero. This fixes the previous `force_topk_frac` loophole where non-top-k symbols could become nonzero and silently increase bpp.
+
+Also added:
+
+- `--freeze_predictor`, so residual-only runs can test whether paid residual bits improve a fixed predictable component.
+- `--reset_best_on_resume`, so continued runs can save a local best checkpoint.
+- LPIPS/DISTS no-regression hinges against the no-residual base.
+- residual/correction magnitude regularizers for later balancing.
+
+### Key mechanism result
+
+Run: `experiments/glc_latent_predlead_freezepred_zerocenter_hardtopk001_perchinge_1500`
+
+Settings:
+
+- Resume: `experiments/glc_latent_predlead_topk001_activelat_lR01_1k/glc_latent_residual_final.pt`
+- Predictor frozen, Stage-A frozen.
+- `delta_gate_mode=zero_center`, `force_topk_frac=0.001`, `hard_topk=True`.
+- Residual payload: roughly `0.002738` bpp, total `0.012504` bpp.
+
+Fixed 256x256 center-crop proxy results. These are not official full-resolution real-codec evaluations.
+
+| dataset/checkpoint | mode | bpp | LPIPS | DISTS | note |
+|---|---|---:|---:|---:|---|
+| Kodak | no residual | 0.009766 | 0.572118 | 0.391503 | fixed predictable component |
+| Kodak best (`it=13500`) | residual on | 0.012504 | 0.570858 | 0.391440 | small but clean paid-residual improvement |
+| Kodak final (`it=14500`) | residual on | 0.012504 | 0.589248 | 0.386138 | DISTS improves strongly, LPIPS worsens |
+| DIV2K | no residual | 0.009766 | 0.557175 | 0.390806 | fixed predictable component |
+| DIV2K best (`it=13500`) | residual on | 0.012504 | 0.556456 | 0.390581 | balanced improvement |
+| DIV2K final (`it=14500`) | residual on | 0.012504 | 0.553252 | 0.384901 | strong improvement on both LPIPS and DISTS |
+| CLIC2020 test center, 428 imgs | no residual | 0.009766 | 0.542022 | 0.376615 | professional 250 + mobile 178 |
+| CLIC2020 test center, 428 imgs | residual on final | 0.012504 | 0.530758 | 0.370720 | strong improvement on both LPIPS and DISTS |
+
+CLIC subset details:
+
+| subset | mode | images | bpp | LPIPS | DISTS |
+|---|---|---:|---:|---:|---:|
+| professional test | no residual | 250 | 0.009766 | 0.533872 | 0.372375 |
+| professional test | residual final | 250 | 0.012504 | 0.521344 | 0.367255 |
+| mobile test | no residual | 178 | 0.009766 | 0.553470 | 0.382571 |
+| mobile test | residual final | 178 | 0.012504 | 0.543980 | 0.375587 |
+
+Interpretation:
+
+- This is the cleanest scratch/full-design evidence so far for the original GP-ResLC axis: a fixed semantic/predictable stream is improved by sending only a strictly sparse residual payload.
+- The final checkpoint generalizes well to CLIC and DIV2K, but Kodak LPIPS worsens despite better Kodak DISTS. Keep both `best` and `final` as curve/ablation points.
+- The re-balance continuation from final (`experiments/glc_latent_zerocenter_hardtopk001_lpips_rebalance_from_final_1k`) did not fix Kodak LPIPS and is not promoted. It improves DIV2K but weakens Kodak enough that it should remain a rejected follow-up.
+
+Next research steps:
+
+1. Build a small rate/perception curve for `hard_topk` budgets, especially `0.0005`, `0.001`, `0.002`, and `0.005`, using zero-center residuals.
+2. Add a non-saturating entropy proxy or scale lower-bound adjustment because `gaussian_bits` clamps probabilities and can under-penalize very large active symbols.
+3. Add a lightweight LPIPS-safe objective or early stopping criterion based on a fixed validation set, since random Kodak-val batches are noisy and Kodak LPIPS can diverge from CLIC/DIV2K.
+4. Once proxy behavior stabilizes, implement real entropy coding for the residual symbol stream and evaluate full-resolution CLIC/DIV2K/Kodak.
+
+
+### Hard-topk budget 0.2% follow-up
+
+Run: `experiments/glc_latent_predlead_freezepred_zerocenter_hardtopk002_perchinge_1500`
+
+Settings match the 0.1% run except `force_topk_frac=0.002`, `hard_topk=True`, and `lambda_R=0.1`.
+
+Fixed center-crop proxy results:
+
+| dataset/checkpoint | bpp | LPIPS | DISTS | decision |
+|---|---:|---:|---:|---|
+| DIV2K 0.2% `0014000` | 0.015241 | 0.553443 | 0.386538 | balanced but worse DISTS than 0.1% final |
+| DIV2K 0.2% final | 0.015241 | 0.548306 | 0.389163 | better LPIPS, worse DISTS |
+| CLIC2020 test center no-res | 0.009766 | 0.542022 | 0.376615 | reference |
+| CLIC2020 test center 0.1% final | 0.012504 | 0.530758 | 0.370720 | current DISTS/L1 lead |
+| CLIC2020 test center 0.2% final | 0.015241 | 0.527802 | 0.374115 | LPIPS-oriented point, not DISTS lead |
+
+Interpretation: more sparse residual budget does not monotonically improve DISTS. The 0.2% payload learns stronger corrections and improves LPIPS on CLIC/DIV2K, but it harms DISTS relative to the 0.1% final point. This suggests the next improvement should not simply widen the top-k budget; it should improve residual objective/entropy calibration so stronger corrections stay perceptually aligned.
+
+
+### Hard-topk budget curve update
+
+Saved curve summary CSV: `experiments/glc_latent_hardtopk_curve_summary.csv`.
+
+CLIC2020 test center-crop proxy, professional 250 + mobile 178:
+
+| point | bpp | residual bpp | LPIPS | DISTS | L1 | MSE | interpretation |
+|---|---:|---:|---:|---:|---:|---:|---|
+| no residual | 0.009766 | 0.000000 | 0.542022 | 0.376615 | 0.113911 | 0.026989 | predictable-only reference |
+| hardtopk0005 | 0.011135 | 0.001369 | 0.530583 | 0.373010 | 0.108494 | 0.024987 | very efficient low payload point |
+| hardtopk001 | 0.012504 | 0.002738 | 0.530758 | 0.370720 | 0.105636 | 0.023745 | current DISTS/L1/MSE lead |
+| hardtopk002 | 0.015241 | 0.005475 | 0.527802 | 0.374115 | 0.107330 | 0.024625 | LPIPS-oriented, DISTS worsens |
+
+DIV2K center-crop proxy:
+
+| point | bpp | residual bpp | LPIPS | DISTS | L1 | MSE |
+|---|---:|---:|---:|---:|---:|---:|
+| no residual | 0.009766 | 0.000000 | 0.557175 | 0.390806 | 0.127053 | 0.032145 |
+| hardtopk0005 | 0.011135 | 0.001369 | 0.550043 | 0.386773 | 0.122601 | 0.030408 |
+| hardtopk001 | 0.012504 | 0.002738 | 0.553252 | 0.384901 | 0.119844 | 0.029408 |
+| hardtopk002 | 0.015241 | 0.005475 | 0.548306 | 0.389163 | 0.121340 | 0.029877 |
+
+Budget-curve interpretation:
+
+- The curve is not monotonic across all perceptual metrics, which is useful evidence: more residual bits are not automatically better if the residual objective/entropy proxy allows overly strong local edits.
+- `hardtopk0005` is the best efficiency point: very small residual payload produces large LPIPS/DISTS gains over no-residual on CLIC/DIV2K.
+- `hardtopk001` is the best DISTS/L1/MSE point on CLIC and DIV2K.
+- `hardtopk002` is LPIPS-oriented but not a good main point because DISTS degrades relative to `hardtopk001`.
+- Next method work should improve entropy calibration and residual regularization, not simply increase top-k budget.
+
+
+## 2026-06-21 20:05 JST - Stable bounded residual curve
+
+Motivation: the previous hard-topk curve used the original clamped Gaussian bit proxy. That proxy is useful for fast screening, but it can under-penalize large active residual symbols. I added a stable entropy mode with a quadratic tail fallback and then constrained the transmitted residual symbols with `max_symbol_abs`. This makes the scratch/full-design branch closer to a real entropy-coded sparse residual stream.
+
+Implementation changes:
+
+- `gp_reslc/scratch/glc_latent_residual.py`: added `gaussian_bits_stable`, `entropy_mode`, and `max_symbol_abs`.
+- `scripts/train_glc_latent_residual.py`: added CLI/config plumbing for stable entropy and bounded symbols.
+- `scripts/evaluate_glc_latent_residual.py`: evaluation now restores `entropy_mode` and `max_symbol_abs` from checkpoint config.
+
+Important negative result:
+
+- Unbounded stable entropy with `topk=0.001` is unstable. Although nonzero positions remain fixed, active symbol magnitude grows and residual bpp can jump to multiple bpp. This confirms that position sparsity alone is insufficient; value bounding or a stronger entropy/real-codec constraint is required.
+
+Stable bounded curve, fixed 256x256 center-crop proxy. These are not yet official full-resolution real-codec results.
+
+CLIC2020 test center, 428 images:
+
+| point | bpp | residual bpp | LPIPS | DISTS | L1 | MSE | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| no residual | 0.009766 | 0.000000 | 0.542011 | 0.376628 | 0.113910 | 0.026989 | reference |
+| stable ternary topk0005 final | 0.010612 | 0.000847 | 0.537297 | 0.374999 | 0.111184 | 0.025975 | adopt low-rate point |
+| stable ternary topk002 best | 0.013150 | 0.003384 | 0.529933 | 0.371677 | 0.107104 | 0.024467 | adopt main stable point |
+| stable small-int2 topk001 best | 0.021877 | 0.012111 | 0.533375 | 0.373803 | 0.109661 | 0.025363 | reject: dominated |
+
+DIV2K center:
+
+| point | bpp | residual bpp | LPIPS | DISTS | L1 | MSE | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| no residual | 0.009766 | 0.000000 | 0.557210 | 0.390785 | 0.127048 | 0.032145 | reference |
+| stable ternary topk0005 final | 0.010612 | 0.000847 | 0.553770 | 0.388299 | 0.124123 | 0.030960 | adopt low-rate point |
+| stable ternary topk002 best | 0.013150 | 0.003384 | 0.550992 | 0.385331 | 0.121149 | 0.029947 | adopt main stable point |
+| stable small-int2 topk001 best | 0.021877 | 0.012111 | 0.552500 | 0.387740 | 0.123059 | 0.030568 | reject: dominated by topk002 |
+
+Kodak center:
+
+| point | bpp | residual bpp | LPIPS | DISTS | L1 | MSE | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| no residual | 0.009766 | 0.000000 | 0.572011 | 0.391566 | 0.114565 | 0.024937 | reference |
+| stable ternary topk0005 final | 0.010612 | 0.000847 | 0.569598 | 0.389898 | 0.113148 | 0.024466 | adopt low-rate point |
+| stable ternary topk002 best | 0.013150 | 0.003384 | 0.575541 | 0.390750 | 0.110967 | 0.023804 | mixed: DISTS/L1 improve, LPIPS worsens |
+| stable small-int2 topk001 best | 0.021877 | 0.012111 | 0.570009 | 0.390974 | 0.112631 | 0.024205 | reject: not rate efficient |
+
+Interpretation:
+
+- `stable_ternary_topk0005` is now the cleanest low-rate evidence for the GP-ResLC axis: only 0.00085 residual bpp improves LPIPS/DISTS/L1/MSE on CLIC, DIV2K, and Kodak.
+- `stable_ternary_topk002` is the best stable perceptual point on CLIC/DIV2K, but Kodak LPIPS worsens. Keep it as the main stable curve point, not as the only visual candidate.
+- `stable_smallint2_topk001` improves over no-residual but is dominated by `stable_ternary_topk002`; increasing symbol amplitude is worse than sending a few more ternary positions. This supports a simple design preference: sparse ternary residuals over high-amplitude sparse residuals.
+- Next method direction: real-codec arithmetic coding for bounded residual symbols, fixed-validation checkpoint selection, and possibly topk0015/learned topk budget to bridge low-rate and main stable points.
+
+Saved CSV: `experiments/glc_latent_stable_bounded_curve_summary.csv`.
+
+
+## 2026-06-21 20:25 JST - TorchAC real residual codec bridge
+
+Implemented `scripts/evaluate_glc_latent_residual_realcodec.py` for the GLC-latent scratch branch. This script keeps the current fixed semantic-code bpp accounting, but actually entropy-codes the bounded residual symbol tensor with `torchac` using the same Gaussian CDF helper as the GLC real codec. It then decodes symbols, reconstructs from decoded symbols, and reports exact byte-derived residual bpp plus decode consistency.
+
+Important caveat: this is still a center-crop development codec, not the final full-resolution paper codec. The per-image stream header is intentionally counted separately because it is disproportionately large at 256x256. For full-resolution CLIC/DIV2K, that header overhead should be smaller.
+
+CLIC2020 test center, 428 images:
+
+| point | proxy total bpp | AC-only residual bpp | stream residual bpp | stream total bpp | LPIPS | DISTS | decode symbols |
+|---|---:|---:|---:|---:|---:|---:|---|
+| stable ternary topk0005 final | 0.010612 | 0.000854 | 0.001831 | 0.011597 | 0.537302 | 0.375008 | exact, max abs 0 |
+| stable ternary topk002 best | 0.013150 | 0.003052 | 0.004028 | 0.013794 | 0.529926 | 0.371678 | exact, max abs 0 |
+
+DIV2K center:
+
+| point | proxy total bpp | AC-only residual bpp | stream residual bpp | stream total bpp | LPIPS | DISTS | decode symbols |
+|---|---:|---:|---:|---:|---:|---:|---|
+| stable ternary topk0005 final | 0.010612 | 0.000854 | 0.001831 | 0.011597 | 0.553742 | 0.388320 | exact, max abs 0 |
+| stable ternary topk002 best | 0.013150 | 0.003052 | 0.004028 | 0.013794 | 0.551003 | 0.385368 | exact, max abs 0 |
+
+Kodak center, topk0005 final:
+
+| proxy total bpp | AC-only residual bpp | stream residual bpp | stream total bpp | LPIPS | DISTS | decode symbols |
+|---:|---:|---:|---:|---:|---:|---|
+| 0.010612 | 0.000854 | 0.001831 | 0.011597 | 0.569766 | 0.389893 | exact, max abs 0 |
+
+Consistency note:
+
+- `decode_symbol_max_abs` is 0 for all checked datasets and points.
+- With `bs=1`, `forward_decode_max_abs` is also 0. With `bs=2`, small pixel differences around 0.002-0.003 appear due to batch-dependent floating point execution through the generator, but the decoded residual symbols are exact and metrics remain aligned with the proxy evaluator.
+
+Interpretation:
+
+- The stable proxy is well calibrated for the arithmetic-coded residual payload: topk0005 AC residual bpp is `0.000854` vs proxy `0.000847`; topk002 AC residual bpp is `0.003052` vs proxy `0.003384`.
+- Header overhead is the main remaining mismatch in 256x256 center-crop proxy evaluation. This reinforces the need to move the scratch branch to full-resolution CLIC/DIV2K before paper claims.
+- This is the first scratch/full-design result that is not merely estimated likelihood: the residual symbols themselves are serialized and decoded exactly. The semantic stream is still fixed-width counted, so the next real-codec step is to serialize semantic VQ indices and combine both streams into one payload.
+
+
+### Semantic stream byte packing check
+
+The real residual evaluator now also serializes Stage-A semantic VQ indices with fixed-width packing using `ceil(log2(codebook_size))` bits per index. For the current Stage-A checkpoint, `codebook_size=1024`, so the bit width is 10. The 8x8 semantic grid on 256x256 crops serializes to exactly 80 bytes, matching `semantic_real_bpp = 0.009765625`.
+
+Sanity check on Kodak limit-4 with `bs=1`:
+
+| field | value |
+|---|---:|
+| semantic_bpp formula | 0.009765625 |
+| semantic_real_bpp bytes | 0.009765625 |
+| semantic_bit_width | 10 |
+| residual_ac_bpp | 0.000854492 |
+| residual_stream_bpp | 0.001831055 |
+| total_real_bpp, semantic + stream residual | 0.011596680 |
+| decode_symbol_max_abs | 0 |
+| forward_decode_max_abs | 0 |
+
+This makes the scratch center-crop real-codec bridge byte-consistent for both transmitted streams. Remaining limitations: full-resolution tiling/padding, compact combined payload header, and official FID/KID patch extraction are still pending.
+
+
+## 2026-06-21 21:15 JST - Full-resolution scratch real-codec and residual delta scaling
+
+Implemented `scripts/evaluate_glc_latent_residual_fullres_realcodec.py`, a full-resolution development codec for the GLC-latent scratch branch. It follows the GLC padding/bpp protocol more closely than the previous center-crop evaluator: original-resolution images are replicate-padded to multiples of 64, transmitted bits are divided by original pixels, semantic VQ indices are fixed-width packed and decoded back through the Stage-A codebook, residual symbols are arithmetic-coded with `torchac`, and decoding uses only the decoded semantic/residual streams.
+
+Key implementation checks:
+
+- CLIC2020 test all uses canonical `data/clic2020_test_combined` with 428 symlinked images, i.e. professional 250 + mobile 178.
+- Semantic decode max error is around `1e-8`; residual symbol decode max error is `0`.
+- Current Stage-A semantic stream is 10 bits/index; bpp is about `0.01006` on high-resolution CLIC/DIV2K because padding/byte rounding is counted over original pixels.
+- Residual AC stream is only about `0.00078` bpp for `topk0005`.
+
+Full-resolution results for the original `stable ternary topk0005` checkpoint at `delta_scale=1.0` show the core mechanism but also a safety problem:
+
+| dataset | bpp | residual AC bpp | LPIPS base -> residual | DISTS base -> residual | interpretation |
+|---|---:|---:|---:|---:|---|
+| CLIC2020 428 | 0.011000 | 0.000781 | 0.540915 -> 0.620295 | 0.341476 -> 0.323087 | strong DISTS gain, LPIPS/L1 unsafe |
+| DIV2K 100 | 0.011025 | 0.000784 | 0.565526 -> 0.674794 | 0.353956 -> 0.345589 | DISTS gain, large LPIPS/L1 degradation |
+| Kodak 24 | 0.011617 | 0.000753 | 0.576080 -> 0.577656 | 0.376250 -> 0.362915 | strong Kodak DISTS gain, slight LPIPS loss |
+
+A short 512-crop safety fine-tune from this checkpoint (`experiments/glc_latent_fullres_safe512_topk0005_l1lp_from_final_1500`, W&B `2anv6fcl`) showed the tradeoff clearly: the final checkpoint improves Kodak LPIPS/L1/MSE but loses DISTS (`0.376250 -> 0.378034`), while the best checkpoint improves DISTS (`0.357377`) but damages LPIPS (`0.632410`). Simple no-regression fine-tuning is therefore too blunt.
+
+The better simple fix is decoder-side residual delta scaling. This is a fixed model setting, not side information. Applying `latent_hat = mu + gamma * residual_delta` with the same transmitted semantic/residual bitstream gives:
+
+| dataset / gamma | bpp | residual AC bpp | LPIPS base -> residual | DISTS base -> residual | LPIPS wins | DISTS wins |
+|---|---:|---:|---:|---:|---:|---:|
+| CLIC2020 gamma=0.5 | 0.011000 | 0.000781 | 0.540915 -> 0.541775 | 0.341476 -> 0.326563 | 296/428 | 397/428 |
+| DIV2K gamma=0.5 | 0.011025 | 0.000784 | 0.565526 -> 0.580409 | 0.353956 -> 0.338459 | 59/100 | 88/100 |
+| Kodak gamma=0.5 | 0.011617 | 0.000753 | 0.576080 -> 0.573606 | 0.376250 -> 0.375262 | 16/24 | 17/24 |
+| Kodak gamma=0.75 | 0.011617 | 0.000753 | 0.576080 -> 0.573079 | 0.376250 -> 0.370487 | 14/24 | 15/24 |
+
+Decision:
+
+- Promote `topk0005 + gamma=0.5` as the current full-resolution scratch/full-design candidate. It preserves the thesis: a ~0.00078 bpp residual stream improves DISTS at essentially the same LPIPS on CLIC, while using actual serialized semantic and residual streams.
+- Keep `gamma=0.75` as a Kodak/DISTS-oriented auxiliary point, but use `gamma=0.5` as the safer global setting across CLIC/DIV2K/Kodak.
+- Next method step should make `gamma` learnable or context-adaptive without side information, e.g. decoder-side confidence from semantic/predictor features, rather than relying on a manually fixed scalar.
+
+Saved summary CSV: `experiments/fullres_realcodec_gamma_summary.csv`.
+
+
+### Gamma=0.5 training adaptation follow-up
+
+After the fixed decoder-side scale result, I added `delta_scale` to `GLCLatentResidualBottleneck.forward()` and `scripts/train_glc_latent_residual.py`, then trained a short 512-crop adaptation run with the same transmitted ternary top-k residual but `delta_scale=0.5` during training.
+
+Run:
+
+- `experiments/glc_latent_gamma050_adapt512_topk0005_balanced_1000`
+- W&B: `g7ockfh4`
+- Init: original `stable_ternary_topk0005` final checkpoint
+- Key settings: 512 crops, frozen Stage-A and predictor, topk0005, stable entropy, ternary residual, `delta_scale=0.5`, moderate LPIPS/DISTS no-regression.
+
+Kodak full-resolution real-codec results at `delta_scale=0.5`:
+
+| checkpoint | bpp | LPIPS base -> residual | DISTS base -> residual | L1 base -> residual | decision |
+|---|---:|---:|---:|---:|---|
+| fixed original gamma=0.5 | 0.011617 | 0.576080 -> 0.573606 | 0.376250 -> 0.375262 | 0.093480 -> 0.092335 | current safe global candidate |
+| adapt best | 0.011617 | 0.576080 -> 0.568699 | 0.376250 -> 0.377626 | 0.093480 -> 0.090852 | reject: DISTS lost |
+| adapt final | 0.011617 | 0.576080 -> 0.567286 | 0.376250 -> 0.377817 | 0.093480 -> 0.091002 | reject: DISTS lost |
+
+Decision: do not promote the trained gamma-adaptation checkpoints. The simple fixed-scale original checkpoint is better balanced. The adaptation run confirms that standard no-regression training tends to suppress the DISTS-useful residual too much. Next design should use a decoder-side confidence/gamma predictor or region-specific safety mechanism, not just global no-regression fine-tuning.
+
+
+## 2026-06-21 21:55 JST - Full-resolution gamma sweep and adaptive decoder gate
+
+- Completed real-codec full-resolution gamma=0.6 sweep for the scratch topk0005 ternary residual checkpoint.
+- Same transmitted bitstream as gamma=0.5/1.0: semantic fixed-width stream plus torchac residual stream. `delta_scale` only changes decoder-side residual application strength and costs no side bits.
+- CLIC2020 all 428: bpp=0.011000, residual_ac_bpp=0.000781, LPIPS 0.540915 -> 0.549742, DISTS 0.341476 -> 0.320686, L1 0.087467 -> 0.090442. Win counts: LPIPS 263/428, DISTS 394/428, L1 243/428.
+- DIV2K 100: bpp=0.011025, LPIPS 0.565526 -> 0.594456, DISTS 0.353956 -> 0.335538. Win counts: LPIPS 48/100, DISTS 84/100.
+- Kodak 24: bpp=0.011617, LPIPS 0.576080 -> 0.573031, DISTS 0.376250 -> 0.374235, L1 0.093480 -> 0.092191. Win counts: LPIPS 16/24, DISTS 18/24, L1 21/24.
+- Interpretation: gamma=0.6 is stronger than gamma=0.5 for DISTS on CLIC/DIV2K/Kodak, but it degrades LPIPS/L1 on CLIC/DIV2K. Fixed gamma is a useful diagnostic, not sufficient as final top-conference method.
+- Implemented decoder-side adaptive residual gate (`delta_scale_net`) in `gp_reslc/scratch/glc_latent_residual.py`, plus train/eval CLI support. The gate is recomputed from transmitted residual symbols, semantic features, and predicted latent mean, so it adds no side bits.
+- Started gate-only fine-tune from the topk0005 checkpoint: `experiments/glc_latent_adaptive_gate_topk0005_from_final_512_balanced_14500to17500`, W&B run `pup0zpf3`. Failed setup runs: `ghs7ls69` (zero-iter due resume counter), `fh29dt65` (missing return key bug).
+
+
+## 2026-06-21 22:08 JST - Adaptive gate-only balanced result
+
+- Completed gate-only fine-tune from scratch topk0005 checkpoint: `experiments/glc_latent_adaptive_gate_topk0005_from_final_512_balanced_14500to17500`, W&B `pup0zpf3`.
+- Gate is decoder-side only and recomputed from transmitted residual symbols + semantic features + predicted latent mean. It adds no side bits.
+- Kodak full-resolution real-codec, final checkpoint: bpp=0.011617, residual_ac_bpp=0.000753, LPIPS 0.576080 -> 0.574754, DISTS 0.376250 -> 0.367728, L1 0.093480 -> 0.092705, adaptive scale mean=0.560.
+- Kodak full-resolution real-codec, best checkpoint: bpp=0.011617, LPIPS 0.576080 -> 0.576465, DISTS 0.376250 -> 0.365664, L1 0.093480 -> 0.093375, adaptive scale mean=0.449.
+- Interpretation: adaptive gate is safer than fixed gamma=1.0 for LPIPS/L1, and improves DISTS over gamma=0.5/0.6 on Kodak, but does not beat the original gamma=1.0 DISTS point. As a top-conference method, a scalar/gate-only residual usage controller is probably too incremental.
+- Next decision: use this as evidence that decoder-side residual confidence is useful, then move to a stronger design: either DISTS-oriented gate with less LPIPS regularization, or progressive residual stages that separate DISTS-useful structural correction from LPIPS-damaging texture/detail correction.
+
+## 2026-06-21 22:44 JST - GLC-latent progressive stage-specific top-k residual
+
+Motivation: the previous decoder-side fixed/adaptive residual scale improved DISTS but remained a post-hoc strength control. It did not fully realize the GP-ResLC thesis that only generator-unpredictable residual information should be transmitted. The new experiment makes the residual stream progressive and allocates sparse symbols separately to stage1/stage2 channels, so the coarse and fine residual decoders cannot silently compete for the same global top-k budget.
+
+Implementation:
+
+- `gp_reslc/scratch/glc_latent_residual.py`: added `progressive_stage_topk`, `stage1_topk_frac`, and `stage2_topk_frac`. In progressive mode, the top-k mask is now selected independently for stage1 and stage2 residual channel groups.
+- `scripts/train_glc_latent_residual.py`: added CLI/W&B logging for stage-specific top-k and stage-specific nonzero fractions.
+- `scripts/evaluate_glc_latent_residual_fullres_realcodec.py`: added progressive checkpoint decode support. Real-codec evaluation now reconstructs progressive residuals through `residual_decoder_stage1` and `residual_decoder_stage2` instead of incorrectly falling back to the single residual decoder.
+- Smoke checks: `py_compile` passed; tensor forward passed for both progressive residual and `use_residual=False` base path.
+
+Active run:
+
+- W&B: `1xwv0f6q`
+- Name: `progressive_stagealloc_topk0008_512_14500to16500`
+- Output: `experiments/glc_latent_progressive_stagealloc_topk0008_from_final_512_14500to16500/`
+- Init: `experiments/glc_latent_predlead_freezepred_zerocenter_hardtopk0005_stable_ternary_1500/glc_latent_residual_final.pt`
+- Dataset: `/dpl/openimages/train`, validation `/dpl/kodak`, crop `512`, batch `1`.
+- Key settings: frozen predictor, `quant_mode=ste`, `delta_gate_mode=zero_center`, `hard_topk`, stable entropy, `stage1_channels=12`, `stage1_topk_frac=0.0008`, `stage2_topk_frac=0.0008`, `lambda_lpips=1.5`, `lambda_dists=3.0`, base LPIPS/DISTS no-regression retained.
+
+Early read:
+
+- At iteration 14500, stage decoders are newly initialized, so final reconstruction equals the generator/predictor base, as expected.
+- By iteration 14550-14650, final LPIPS begins to improve relative to stage1/base on some batches, indicating stage2 is receiving useful gradients under separated top-k selection.
+- The key decision point is not crop validation alone. After training, evaluate with full-resolution real codec on Kodak, DIV2K, and CLIC test/all using the updated progressive decode path, then compare against the official GLC curve and the previous fixed-gamma/adaptive-gamma residual points.
+
+## 2026-06-21 23:13 JST - Progressive decoder init and top-k score audit
+
+This block tested whether the GLC-latent residual stream can be made more faithful to the GP-ResLC principle by either splitting the residual into two progressive stages or changing which sparse residual symbols are transmitted.
+
+Implementation updates:
+
+- Added stage-specific top-k allocation for progressive residual mode.
+- Added `--init_progressive_decoders_from_single {stage1,both}` so old single residual decoder weights can initialize the progressive decoders instead of discarding the useful learned residual synthesis path.
+- Fixed train/validation memory use: stage1 reconstruction is now generated only when stage1 losses/metrics are requested. This avoids 512-crop OOM during runs that do not use stage1 supervision.
+- Added `--topk_score_mode {abs,latent_error,latent_error_sq}`. `latent_error` scores source-side symbols by `|symbol| * mean_c|target_latent - mu|`; `latent_error_sq` uses the squared spatial error. This tests whether choosing spatially less predictable positions improves the transmitted residual at the same top-k budget.
+
+W&B / runs:
+
+- `1xwv0f6q`: zero-initialized stage1/stage2 progressive decoder. Rejected; DISTS worsened and stage2 carried almost no delta.
+- `o5bno8es`: stage1 initialized from old single decoder, stage2 zero. Better crop behavior but full-res Kodak DISTS worsened.
+- `huipcyt9`: both stage decoders initialized from old single decoder, balanced fine-tune. LPIPS improved, DISTS worsened.
+- `frh8u1tx`: both-init DISTS-heavy fine-tune. DISTS returned close to no-train but did not beat it.
+
+Kodak full-resolution real-codec results:
+
+| variant | payload bpp | residual AC bpp | LPIPS | DISTS | read |
+|---|---:|---:|---:|---:|---|
+| Stage-A base only | 0.009766 | 0 | 0.576080 | 0.376250 | generator/predictor base |
+| previous single abs top-k, gamma=1 reference | ~0.011617 | ~0.00075 | ~0.5777 | ~0.3629 | still DISTS lead among these local tests |
+| progressive both-init no-train | 0.011617 | 0.000753 | 0.578412 | 0.363322 | stage split itself is not destructive |
+| progressive stage1-init best | 0.011658 | 0.000793 | 0.568868 | 0.377770 | LPIPS improves, DISTS fails |
+| progressive both-init fine-tune best | 0.011617 | 0.000753 | 0.574547 | 0.370081 | LPIPS improves, DISTS regresses |
+| progressive both-init fine-tune final | 0.011617 | 0.000753 | 0.568128 | 0.377328 | strongest LPIPS, poor DISTS |
+| progressive both-init DISTS-heavy best | 0.011617 | 0.000753 | 0.578450 | 0.363348 | basically no better than no-train |
+| single top-k score = latent_error | 0.011617 | 0.000753 | 0.574098 | 0.375504 | simple unpredictability score hurts DISTS |
+| single top-k score = latent_error_sq | 0.011617 | 0.000753 | 0.574603 | 0.375561 | same failure mode |
+
+Interpretation:
+
+1. Progressive splitting is mechanically valid only when both stage decoders inherit the old residual decoder. Zero-init stage2 does not learn useful corrections in short fine-tunes.
+2. Fine-tuning the progressive decoders tends to trade DISTS for LPIPS. This may be useful for a separate LPIPS point, but it is not a paper-facing DISTS/FID/KID improvement.
+3. Hand-designed latent-error top-k is not a good proxy for perceptual payoff. It selects positions where the generator latent prediction is wrong, but those are not necessarily the positions that improve DISTS.
+4. The next serious version should use a learned encoder-side selector trained against measured perceptual payoff, e.g. compare candidate residual masks by DISTS/LPIPS improvement, distill the payoff into a selector, then entropy-code the selected sparse residual symbols. That is closer to “send only unpredictable residuals” than raw latent-error weighting.
+
+Decision:
+
+Do not promote the progressive/top-k-score variants as the current lead. Keep the previous single residual real-codec point as the practical lead, and treat these experiments as evidence that the next improvement must be a learned residual-value selector rather than a manual top-k heuristic.
+
+## 2026-06-21 23:35 JST - Encoder-side latent-gradient residual selection
+
+A more direct test of the GP-ResLC principle was implemented after manual top-k heuristics failed. Instead of selecting sparse residual symbols only by magnitude, the encoder estimates each candidate residual symbol's first-order latent reconstruction payoff:
+
+`score_i = | grad_{q_i} SmoothL1(mu + D_r(q), y) * candidate_q_i |`
+
+where `mu` is the generator-predictable latent from the semantic stream, `D_r` is the learned residual decoder, and `y` is the frozen GLC/VQGAN target latent. The decoder receives the same sparse residual grid as before; no side map is transmitted. The cost is encoder-side backprop during analysis/encoding.
+
+Implementation:
+
+- Added `topk_score_mode=latent_grad` in `gp_reslc/scratch/glc_latent_residual.py`.
+- Added CLI/evaluator support through `--topk_score_mode latent_grad`.
+- The current implementation is for the single residual decoder, not progressive residual mode.
+- `latent_error` and `latent_error_sq` hand-designed scores were also tested and rejected.
+
+Kodak full-resolution real-codec:
+
+| variant | payload bpp | LPIPS | DISTS | DISTS wins | LPIPS wins | read |
+|---|---:|---:|---:|---:|---:|---|
+| base semantic predictor | 0.009766 | 0.576080 | 0.376250 | - | - | no residual |
+| prior abs top-k reference | ~0.011617 | ~0.5777 | ~0.3629 | - | - | previous DISTS lead |
+| latent_grad, delta=1.0 | 0.011617 | 0.595405 | 0.354949 | 17/24 | 8/24 | strong DISTS, LPIPS worse |
+| latent_grad, delta=0.8 | 0.011617 | 0.579667 | 0.362212 | 18/24 | 14/24 | balanced, slight DISTS lead |
+| latent_grad, delta=0.6 | 0.011617 | 0.574957 | 0.371653 | 18/24 | 17/24 | LPIPS/L1 safer, weaker DISTS |
+| latent_error | 0.011617 | 0.574098 | 0.375504 | - | - | rejects simple latent-error score |
+| latent_error_sq | 0.011617 | 0.574603 | 0.375561 | - | - | also rejected |
+
+DIV2K full-resolution real-codec, `latent_grad`, `delta=0.6`:
+
+| payload bpp | base LPIPS | LPIPS | base DISTS | DISTS | DISTS wins | LPIPS wins |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.011024 | 0.565526 | 0.603688 | 0.353956 | 0.334945 | 83/100 | 45/100 |
+
+CLIC2020 test all 428 full-resolution real-codec, `latent_grad`, `delta=0.6`:
+
+| payload bpp | base LPIPS | LPIPS | base DISTS | DISTS | DISTS wins | LPIPS wins |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.011000 | 0.540915 | 0.559899 | 0.341476 | 0.319396 | 373/428 | 234/428 |
+
+Interpretation:
+
+- This is the strongest mechanism result so far for the original thesis. The residual stream is selected by decoder payoff rather than raw magnitude, and it improves DISTS on Kodak, DIV2K, and CLIC at the same byte-backed payload bpp.
+- It is not yet an official-curve result. Absolute DISTS/LPIPS values are from the scratch/Stage-A semantic branch and are far worse than official GLC q0-q3. The contribution is mechanism-level: at fixed ultra-low payload, better residual selection improves DISTS substantially.
+- LPIPS and L1 often worsen, especially on DIV2K. The method is currently DISTS-oriented. The next version needs a multi-objective payoff score or adaptive residual strength to trade DISTS/LPIPS per image.
+- Encoder analysis time increases because each image requires one latent-gradient backprop. Decoder time and bitstream format are unchanged.
+
+Next steps:
+
+1. Add `latent_grad_mix` score: combine latent payoff with LPIPS/L1 safety proxy or a learned per-image `delta_scale` to reduce LPIPS damage.
+2. Train a selector/distillation network to approximate latent-gradient top-k without test-time backprop, making the method practical.
+3. Evaluate FID/KID patches for CLIC/DIV2K using reconstructions from `latent_grad delta=0.6`; DISTS improvements suggest FID/KID might improve, but this must be measured.
+4. Keep the official-curve comparison separate. This branch currently validates the GP-ResLC design principle but does not yet beat GLC's official perceptual curve.
+
+
+
+## 2026-06-21 23:59 JST - Latent-gradient residual FID/KID protocol check
+
+Added `--disable_residual` to `scripts/evaluate_glc_latent_residual_fullres_realcodec.py` so the semantic/base generator reconstruction can be saved through the same full-resolution loader, padding, and VQGAN decode path as the residual reconstructions. This lets us measure whether encoder-side `latent_grad` residual selection improves distribution metrics over the Stage-A/base predictor, not only DISTS.
+
+Saved-reconstruction runs:
+
+| dataset | variant | payload bpp | LPIPS | DISTS | FID | KID | patches | note |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| CLIC2020 test all 428 | base semantic only | 0.010058 | 0.540915 | 0.341476 | 118.364 | 0.06663 | 28,650 | no residual stream |
+| CLIC2020 test all 428 | latent_grad, delta=0.6 | 0.011000 | 0.559899 | 0.319396 | 105.336 | 0.04996 | 28,650 | residual AC bpp 0.000781 |
+| DIV2K validation | base semantic only | 0.010087 | 0.565526 | 0.353956 | 181.631 | 0.12152 | 6,573 | no residual stream |
+| DIV2K validation | latent_grad, delta=0.6 | 0.011024 | 0.603688 | 0.334945 | 156.661 | 0.08339 | 6,573 | residual AC bpp 0.000784 |
+
+Per-image deltas, residual minus base:
+
+| dataset | DISTS mean/median | DISTS wins | LPIPS mean/median | LPIPS wins | L1 mean/median | L1 wins |
+|---|---:|---:|---:|---:|---:|---:|
+| CLIC2020 test all | -0.02208 / -0.01450 | 373/428 | +0.01898 / -0.00049 | 234/428 | +0.00382 / -0.00024 | 237/428 |
+| DIV2K validation | -0.01901 / -0.01441 | 83/100 | +0.03816 / +0.00181 | 45/100 | +0.00910 / +0.00285 | 37/100 |
+
+Interpretation:
+
+- The official-style patch protocol is correct for both datasets: CLIC gives 28,650 shifted 256-patches and DIV2K gives 6,573 shifted 256-patches.
+- `latent_grad` is not merely improving DISTS; it also improves FID/KID versus the semantic/base generator on both CLIC and DIV2K.
+- Absolute FID/KID/DISTS remain far worse than official GLC because this is still the weak scratch/Stage-A semantic branch. Do not compare these absolute values to the pretrained GLC official curve as a claim of SOTA.
+- The important research signal is mechanistic: at a fixed sparse residual budget and real serialized payload, selecting residual symbols by decoder-side latent payoff sends more distribution-useful information than sending no residual or selecting by raw latent error.
+- The limitation is now sharp: the current payoff is DISTS/FID/KID oriented and can damage LPIPS/L1, especially on DIV2K. The next serious model should learn a multi-objective residual-value selector: latent/DISTS payoff with LPIPS/L1 no-regression or a decoder-safe residual strength predictor.
+
+Artifacts:
+
+- `experiments/realcodec_single_topk_latent_grad_notrain_clic2020_all_delta06_save/`
+- `experiments/realcodec_single_topk_latent_grad_notrain_clic2020_all_base_save/`
+- `experiments/realcodec_single_topk_latent_grad_notrain_div2k_delta06_save/`
+- `experiments/realcodec_single_topk_latent_grad_notrain_div2k_base_save/`
+
+
+## 2026-06-22 00:57 JST - Sign-aware and adaptive residual-strength pilots
+
+Follow-ups after the CLIC/DIV2K FID/KID check tested whether the LPIPS/L1 damage of `latent_grad` could be reduced without losing the DISTS/FID mechanism.
+
+### Sign-aware latent-gradient selector
+
+Implemented `topk_score_mode=latent_grad_improve`, using only first-order latent-loss-improving candidates:
+
+`score_i = relu(- grad_i * candidate_i)`
+
+This produced the same Kodak full-resolution result as the previous absolute `latent_grad` selector: payload bpp `0.011617`, LPIPS `0.595405`, DISTS `0.354949`. Interpretation: the learned residual encoder already proposes mostly latent-loss-improving symbol signs, so the LPIPS damage is not caused primarily by selecting first-order harmful latent directions.
+
+### Fixed residual-delta shaping
+
+Tested no-side-bit decoder shaping of the latent residual delta.
+
+| variant | dataset | LPIPS | DISTS | read |
+|---|---|---:|---:|---|
+| latent_grad delta=0.6 | Kodak | 0.574957 | 0.371653 | safest previous fixed scale |
+| split k=3, low=0.8, high=0.3 | Kodak | 0.577646 | 0.364341 | good Kodak trade-off |
+| split k=3, low=0.8, high=0.3 | DIV2K | 0.644967 | 0.337498 | worse than delta=0.6 on both LPIPS/DISTS; reject |
+| lowpass k=3 | Kodak | 0.586429 | 0.357182 | strong Kodak DISTS, LPIPS worse |
+| lowpass k=3 | DIV2K | interrupted after 25/100 | clearly bad early: LPIPS `0.5411 -> 0.8433`, DISTS `0.3503 -> 0.3813` on image 0825 | reject |
+
+Conclusion: fixed low/high-frequency shaping is dataset-sensitive. It can improve Kodak but does not generalize to DIV2K. Do not promote as a method; use it only as evidence that residual frequency content matters and should be controlled adaptively.
+
+### Adaptive delta-scale head
+
+Ran a decoder-side adaptive residual-strength pilot that freezes all modules except `delta_scale_net`:
+
+- W&B: `iw6gcvot`
+- Run: `experiments/glc_latent_delta_gateonly_latentgrad_lpips_safe_14500to15300/`
+- Training: OpenImages train, Kodak crop validation, 800 steps from `it=14500`.
+- Loss: LPIPS/DISTS/L1 with base no-regression penalties and small mean-scale penalty.
+
+Full-resolution Kodak real-codec results:
+
+| checkpoint | adaptive scale mean | LPIPS | DISTS | decision |
+|---|---:|---:|---:|---|
+| final | 0.458 | 0.602286 | 0.360207 | reject; LPIPS too poor |
+| best / 15200 | 0.620 | 0.625681 | 0.363172 | reject; worse LPIPS |
+
+Interpretation: crop validation was misleading for the adaptive gamma head. The head learned unstable full-resolution behavior and did not solve the LPIPS/L1 regression. For future adaptive residual strength, evaluate Kodak full-res early and train with full-res or larger crops; otherwise the learned gamma overfits crop statistics.
+
+Current practical conclusion remains:
+
+- `latent_grad delta=0.6` is the best cross-dataset mechanism point because it improves CLIC/DIV2K FID/KID and DISTS with moderate, known LPIPS cost.
+- The next serious direction is not fixed filtering or a tiny gamma head; it is a learned multi-objective residual-value selector trained from full-res/cross-dataset teacher signals, or a stronger Stage-A/generator so the residual does not need to perturb perceptual features so aggressively.
+
+
+## 2026-06-22 02:10 JST - Mixed perceptual encoder selector, real-codec full-resolution check
+
+Implemented an encoder-side mixed perceptual residual selector in `scripts/evaluate_glc_latent_residual_fullres_realcodec.py`. The goal was to keep the useful part of `latent_grad` while reducing LPIPS/L1 damage. The selector recomputes the sparse ternary residual mask by first-order improvement of:
+
+`0.5 * L1 + 0.5 * LPIPS + 1.0 * DISTS + 0.25 * latent-L1`
+
+Important implementation detail: direct full-resolution VQGAN backward OOMs on DIV2K. Added `--selector_latent_max_side 32`, so selector scoring is done through a downsampled latent/generator proxy while the actual bitstream, decode, saved reconstructions, and metric evaluation remain full-resolution.
+
+Rejected direction:
+
+- Adaptive delta-scale checkpoint `experiments/glc_latent_adaptive_gate_topk0005_from_final_512_balanced_14500to17500/glc_latent_residual_best.pt` looked promising on Kodak but failed on DIV2K early. It worsened both LPIPS and DISTS on several of the first 20 images, so it is not a generalizable method candidate.
+
+Smoke tests:
+
+- Kodak limit-2, `encoder_selector_loss=l1_latent`: DISTS improved but LPIPS worsened.
+- Kodak limit-2, `encoder_selector_loss=mix`: both LPIPS and DISTS improved, so the full run used mixed payoff.
+
+Full-resolution real-codec results:
+
+| dataset | setting | payload bpp | residual AC bpp | LPIPS | DISTS | note |
+|---|---|---:|---:|---:|---:|---|
+| Kodak | mix, gamma=1.0 | 0.011617 | 0.000753 | 0.607516 | 0.355495 | strong DISTS, LPIPS too poor |
+| Kodak | mix, gamma=0.6 | 0.011617 | 0.000753 | 0.575253 | 0.371978 | safest Kodak point |
+| DIV2K | mix, gamma=0.6, latent32 | 0.011024 | 0.000784 | 0.588100 | 0.335700 | good DISTS, LPIPS cost moderate |
+| DIV2K | mix, gamma=0.5, latent32 | 0.011024 | 0.000784 | 0.577254 | 0.340472 | safer default, DISTS wins 84/100 |
+| CLIC2020 all | mix, gamma=0.5, latent32 | 0.011000 | 0.000781 | 0.543736 | 0.327340 | DISTS wins 391/428, LPIPS wins 277/428 |
+
+Saved-reconstruction patch metrics:
+
+| dataset | recon path | FID | KID | LPIPS | DISTS |
+|---|---|---:|---:|---:|---:|
+| CLIC2020 all | `experiments/eval_selector_mix_gamma05_lat32_clic2020_all_save/recon` | 108.4273 | 0.0562 | 0.5427 | 0.3268 |
+| DIV2K | `experiments/eval_selector_mix_gamma05_lat32_div2k_save/recon` | 163.7456 | 0.0956 | 0.5766 | 0.3402 |
+
+Read:
+
+- The mixed selector is less aggressive than latent-gradient: it gives up some FID/DISTS improvement but keeps LPIPS much closer to the base generator.
+- This is a cleaner top-conference story than manual `latent_error`, progressive splitting, or adaptive gamma. It directly operationalizes "send only residual symbols with perceptual innovation value" at fixed real payload.
+- It is still not a final official-GLC improvement. The branch's Stage-A/generator quality is far below official GLC, so the next major step should be selector distillation or a stronger staged training path rather than more small gamma sweeps.
+
+
+## 2026-06-22 03:55 JST - Learned selector distillation beats base under real codec
+
+Implemented and trained the first practical learned residual-value selector.
+
+Code changes:
+
+- `gp_reslc/scratch/glc_latent_residual.py`: added `_ResidualSelectorNet`, `topk_score_mode=learned_selector`, and selector diagnostics in the model output.
+- `scripts/train_glc_latent_residual.py`: added selector-only training, mixed perceptual teacher generation, BCE distillation loss, and W&B logs for selector precision/recall/score statistics.
+
+Training:
+
+- W&B run: `w1briam2` (`selector_mixdistill_topk0005_256_14500to15100`).
+- Output: `experiments/glc_latent_selector_mixdistill_topk0005_256_14500to15100/`.
+- Resume: `experiments/glc_latent_predlead_freezepred_zerocenter_hardtopk0005_stable_ternary_1500/glc_latent_residual_final.pt`.
+- Frozen: Stage-A, GLC/VQGAN, predictor, residual encoder/decoder, entropy scale model.
+- Trainable: selector head only.
+- Teacher: mixed first-order perceptual payoff, `0.5 L1 + 0.5 LPIPS + 1.0 DISTS + 0.25 latent-L1`.
+- Length: 600 OpenImages crop steps, batch 1, crop 256, `topk=0.0005`, `delta_scale=0.5`.
+
+Real-codec evaluation, no encode-time oracle:
+
+| dataset | bpp | LPIPS base -> learned | DISTS base -> learned | FID/KID learned | note |
+|---|---:|---:|---:|---:|---|
+| Kodak | 0.011617 | 0.576080 -> 0.573336 | 0.376250 -> 0.375072 | not measured | improves LPIPS/L1 and slightly improves DISTS |
+| DIV2K | 0.011023 | 0.565526 -> 0.569826 | 0.353956 -> 0.345658 | 172.6705 / 0.1087 | FID/KID improve from base 181.631 / 0.12152 |
+| CLIC2020 all | 0.010999 | 0.540915 -> 0.538061 | 0.341476 -> 0.335407 | 114.3934 / 0.0631 | FID/KID improve from base 118.364 / 0.06663 |
+
+Read:
+
+- This is the first non-oracle selector that improves CLIC LPIPS, DISTS, FID, KID, and L1 together under real byte-backed payload accounting.
+- DIV2K still has a small LPIPS/L1 cost, but DISTS and distribution metrics improve clearly.
+- The learned selector does not match the oracle mixed/latent-gradient teacher yet; this is expected after only 600 steps and a small selector head.
+- The scientific story is now stronger: GP-ResLC can be framed as perceptual innovation coding, with an oracle teacher upper bound and a learned codec-compatible selector.
+- This still does not solve the official-GLC gap. The scratch semantic generator remains too weak, so the next high-value path is to transplant this learned selector idea into the stronger pretrained/GLC branch or train the full scratch stages much longer.
+
+Next action:
+
+Run a longer selector distillation with higher LPIPS no-regression pressure and possibly a larger selector head. Then evaluate CLIC/DIV2K/Kodak again and compare the learned selector against mixed-oracle and latent-gradient teacher curves.
+
+
+## 2026-06-22 04:05 JST - LPIPS-heavy selector distillation rejected on Kodak
+
+Follow-up run after the first successful learned selector:
+
+- W&B: `b15117hn` (`selector_mixdistill_lpips1_topk0005_256_15100to17100`).
+- Output: `experiments/glc_latent_selector_mixdistill_lpips1_topk0005_256_15100to17100/`.
+- Init: first learned selector final checkpoint.
+- Change: teacher weights moved toward LPIPS/L1 safety: `0.75 L1 + 1.0 LPIPS + 1.0 DISTS + 0.25 latent-L1`.
+
+Kodak full-resolution real-codec:
+
+| checkpoint | LPIPS | DISTS | L1 | decision |
+|---|---:|---:|---:|---|
+| first selector final | 0.573336 | 0.375072 | 0.092120 | current lead |
+| LPIPS-heavy best | 0.572479 | 0.376071 | 0.092109 | LPIPS slightly better, DISTS gain nearly gone |
+| LPIPS-heavy final | 0.573747 | 0.375379 | 0.092373 | worse than first selector on LPIPS/DISTS balance |
+
+Decision: do not promote the LPIPS-heavy follow-up. It confirms teacher weighting can move the LPIPS/DISTS trade-off, but the first 600-step mixed selector remains the best practical learned-selector checkpoint so far.
+
+
+## 2026-06-22 Learned selector residual-strength sweep
+
+After the first learned selector succeeded, I swept the decoder-side global residual strength without changing the transmitted bitstream. This tests whether the learned selector can support separate operating modes: a safe LPIPS-preserving point and a DISTS/FID-oriented point.
+
+Checkpoint: `experiments/glc_latent_selector_mixdistill_topk0005_256_14500to15100/glc_latent_residual_final.pt`.
+
+Kodak real-codec sweep:
+
+| delta_scale | LPIPS | DISTS | L1 | read |
+|---:|---:|---:|---:|---|
+| 0.5 | 0.573336 | 0.375072 | 0.092120 | safe learned-selector default |
+| 0.6 | 0.573484 | 0.374590 | 0.091855 | slightly stronger, still safe |
+| 0.8 | 0.573651 | 0.372755 | 0.091484 | best Kodak DISTS while keeping LPIPS below base |
+| 1.0 | 0.577225 | 0.369601 | 0.092121 | DISTS strong, LPIPS worse than base |
+
+CLIC2020 all 428 at `delta_scale=0.8`:
+
+| payload bpp | base LPIPS | LPIPS | base DISTS | DISTS | base FID/KID | FID/KID | read |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 0.010999 | 0.540915 | 0.548661 | 0.341476 | 0.320307 | 118.364 / 0.06663 | 106.092 / 0.0520 | DISTS/FID-oriented learned-selector point |
+
+Comparison:
+
+- Learned selector `delta=0.5`: CLIC LPIPS/DISTS/FID/KID = `0.538061 / 0.335407 / 114.393 / 0.0631`. This is the safe default because it improves all CLIC metrics versus base.
+- Learned selector `delta=0.8`: CLIC LPIPS/DISTS/FID/KID = `0.548661 / 0.320307 / 106.092 / 0.0520`. This is close to latent-gradient oracle distribution quality while keeping LPIPS better than latent-gradient.
+- Latent-gradient oracle `delta=0.6`: CLIC LPIPS/DISTS/FID/KID = `0.559899 / 0.319396 / 105.336 / 0.04996`.
+
+Decision:
+
+Use two paper-facing learned-selector operating points: `delta=0.5` as the conservative practical point and `delta=0.8` as the DISTS/FID-oriented point. Do not use `delta=1.0` as default because Kodak LPIPS crosses above the base. DIV2K at `delta=0.8` improves DISTS strongly (`0.334945`) but worsens LPIPS (`0.593723`), so it should be reported as a perceptual-distribution point, not as a safe all-metric point.
+
+
+## 2026-06-22 05:00 JST - Stage-quant mixed local sensitivity teacher
+
+Purpose: transplant the scratch learned-selector finding into the stronger pretrained GLC branch. The new `scripts/train_v1.py` option `--lambda_gate_mixed_sens` builds a training-only teacher from local L1 degradation, LPIPS-spatial degradation, texture, and edge strength. High gate probability means the current coarsening is locally safe. The teacher is recentered to the requested `rho_target`, so it changes spatial allocation without directly changing the average rate budget.
+
+Implementation:
+
+- Added `make_gate_mixed_sensitivity_target()` to `scripts/train_v1.py`.
+- Added CLI options `--lambda_gate_mixed_sens`, `--gate_mixed_l1_weight`, `--gate_mixed_lpips_weight`, `--gate_mixed_texture_weight`, `--gate_mixed_edge_weight`, `--gate_mixed_sens_tau`, and `--gate_mixed_sens_margin`.
+- Smoke test passed at `experiments/stage_quant_mixed_sens_smoke`.
+
+q2 run:
+
+- Run: `v5_stage_quant_q2_mixedsens_rt106_rhomax12_lR24_lp10_dists10_mix40_1200`
+- W&B: `nzo1i9x1`
+- Init: weights-only resume from `experiments/v3_stage_quant_v1q2_quality_hinge_fast_lR35_rhomax20_3k/train_state.pt`
+- Setting: fixed GLC, `q_index=2`, `rho_target=1.06`, `stage_rho_max=1.2`, `lambda_gate_mixed_sens=40`, local teacher weights L1/LPIPS/texture/edge = `0.5/1.0/0.1/0.2`.
+
+Training summary:
+
+- Final W&B crop A/B: `delta_bpp_y=-0.00103`, baseline PSNR `20.038`, ours PSNR `19.877`.
+- Final gate: `rho_mean=1.061`, `rho_max=1.103`.
+
+Kodak q2 exact real codec:
+
+| run | bpp | bpp_y | PSNR | MS-SSIM | LPIPS | DISTS | FID | KID | enc/dec |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| q2 mixed-sens | 0.03367 | 0.02832 | 22.0239 | 0.7798 | 0.1701 | 0.0995 | 32.8059 | 0.0026 | 0.089 / 0.107 |
+| q2 spatial-guard | 0.03366 | 0.02855 | 21.9877 | 0.7792 | 0.1705 | 0.0993 | 24.6837 | 0.0025 |
+| q2 stage-quant quality | 0.03263 | 0.02753 | 21.9264 | 0.7757 | 0.1725 | 0.0993 | n/a | n/a |
+| GLC local q2 | 0.03472 | n/a | 22.0767 | 0.7819 | 0.1671 | 0.0979 | n/a | n/a |
+
+Gate-placement audit on Kodak:
+
+| run | delta bpp_y | rho mean | corr rho/base err | corr rho/texture | corr rho/gradient | corr rho/LPIPS delta | high-rho LPIPS delta | low-rho LPIPS delta |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| q2 quality | -0.00113 | 1.061 | +0.237 | +0.244 | +0.216 | +0.024 | 0.00458 | 0.00151 |
+| q2 spatial-guard | -0.00055 | 1.028 | -0.057 | +0.027 | -0.048 | +0.004 | 0.00129 | 0.00109 |
+| q2 mixed-sens | -0.00104 | 1.056 | -0.305 | -0.372 | -0.284 | -0.016 | 0.00127 | 0.00379 |
+
+Read:
+
+The mixed teacher strongly fixes the placement problem: high-rho locations now have much lower baseline error, texture, and gradient, and high-rho LPIPS delta is lower than low-rho LPIPS delta. This validates the mechanism and is more on-axis than the previous spatial guard because it keeps roughly the same bpp_y saving as q2 quality. However, q2 Kodak DISTS/FID do not improve enough to become a lead. The next step is to move the same teacher to q3, where the rate budget is larger and distribution metrics may benefit more.
+
+## 2026-06-22 q-conditioned mixed sensitivity teacher
+
+Goal: move beyond a global rho gate by letting each GLC rate point use a different generator-predictability teacher. This supports the paper story that GP-ResLC should suppress residual precision where the generator can recover content, while preserving quality-sensitive residuals at higher-rate points.
+
+Implementation:
+- Added q_value() helper in scripts/train_v2.py.
+- Added --rho_target_by_q and per-q mixed-teacher weights: --gate_mixed_l1_weight_by_q, --gate_mixed_lpips_weight_by_q, --gate_mixed_texture_weight_by_q, --gate_mixed_edge_weight_by_q.
+- Existing single-value flags remain backward compatible.
+- Training logs now include rho_target_q and active mixed-teacher weights for W&B traceability.
+
+Validation:
+- py_compile passed for scripts/train_v2.py.
+- Write/saving smoke execution was rejected by the approval layer because escalated write commands are disabled in this environment.
+- In-memory CUDA forward/backward validation from the rho1.16 lead checkpoint passed with no file writes. For q3 with rho_target_by_q=[1.20,1.18,1.14,1.10] and mixed weights L1/LPIPS=[0.50,1.00], target_mean=0.6173, gate_mean=0.7129, rho_mean=1.1703, BCE=0.7210, and perceptual-gate gradient L1 sum=76.88.
+
+Interpretation:
+- The q-conditioned machinery is functional and produces nonzero gradients.
+- This is a research-enabling change, not a completed result. Full checkpoint training/evaluation must be run once the environment allows write-enabled training.
+
+## 2026-06-22 safe-weighted mean prediction
+
+Motivation: global mean prediction can move decoder prior means in quality-sensitive regions and collapse DISTS/LPIPS. To align with the GP-ResLC thesis, predictor supervision should concentrate on regions where the generator/decoder can recover the omitted residual.
+
+Implementation:
+- Added --lambda_mean_pred_safe to scripts/train_v2.py.
+- Added weighted_spatial_smooth_l1(pred, target, weight).
+- The safe weight is the mixed sensitivity target when available, otherwise the gate p-map.
+- The loss trains corrected prior means or latent residual means mainly in safe/predictable regions.
+- Logged train/mean_pred_safe to W&B.
+
+Validation:
+- py_compile passed.
+- In-memory CUDA validation from the rho1.16 lead checkpoint passed with no file writes.
+- q2 example with predictor+gate trainable, predictor_delta_bound=0.003: target_mean=0.6710, safe_mean=0.01364, gate_bce=0.63734, bpp_y=0.03263, prior_grad_l1=0.11335, gate_grad_l1=25.16, delta_abs=0 at initialization, rho_mean=1.1619.
+
+Interpretation:
+- This is a stronger rate-side GP-ResLC signal than the earlier global lambda_mean_pred.
+- It operationalizes "send only unpredictable residual" by applying residual-mean prediction where the teacher marks coarsening/prediction as locally safe.
+- Needs full write-enabled training and real-codec evaluation against official GLC curves.
+
+## 2026-06-22 rate-potential mixed teacher
+
+Motivation: the prior mixed teacher selects locally safe regions but does not know whether coarsening that region actually saves bits. Diagnostics showed the current lead gate can be negatively correlated with the estimated bit map, so it may suppress low-value regions.
+
+Implementation:
+- Added --gate_mixed_rate_weight and --gate_mixed_rate_weight_by_q to scripts/train_v2.py.
+- make_gate_mixed_sensitivity_target now accepts rate_map/rate_weight.
+- The training loop passes a detached spatial bit map computed from net.get_y_gaussian_bits(out["y_q"], out["scales_hat"]).mean(channel).
+- High estimated-bit regions reduce the teacher score, increasing the target gate probability/rho only where rate saving is likely. No inference side map is sent.
+
+In-memory diagnostics:
+- q0, OpenImages crop, rho_target=1.24: current gate vs estimated-bit map corr=-0.286.
+- Mixed teacher without rate term corr=-0.169.
+- Mixed teacher with rate_weight=1.0 corr=+0.583.
+
+In-memory 30-step pilots:
+- q2/q3 quality-repair target: q3 DISTS improved slightly but bpp did not move materially; useful for quality repair, not rate.
+- q0/q1 rate-heavy target without rate map: tiny bpp drop but DISTS/LPIPS worsened.
+- q0/q1 rate-heavy target with rate map: target placement improved, but 30-step tiny pilot still worsened DISTS/LPIPS before meaningful bpp savings.
+
+Interpretation:
+- Rate-potential weighting is conceptually important and fixes a real diagnostic mismatch.
+- It should be run with longer training, lower rate_weight, and explicit DISTS/LPIPS hinge or baseline distillation.
+- Recommended first full run when write-enabled: q0/q1 only, rate_weight_by_q around [0.4,0.3,0,0], rho_target_by_q [1.20,1.18,1.12,1.08], lambda_dists_hinge > 0, lambda_mean_pred_safe small, and real-codec evaluation on Kodak/DIV2K before CLIC.
+
+### Kodak q-wise gate-vs-rate diagnostic
+
+No-write CUDA diagnostic on 8 Kodak center crops using the current rho1.16 lead checkpoint:
+
+| q | corr(current gate p, estimated bit map) | corr(mixed teacher, bit map) | corr(rate-weighted teacher, bit map) |
+|---|---:|---:|---:|
+| q0 | -0.1964 | -0.0412 | +0.3985 |
+| q1 | -0.2277 | -0.0378 | +0.4167 |
+| q2 | -0.2721 | +0.0243 | +0.4475 |
+| q3 | -0.2574 | -0.0608 | +0.3846 |
+
+Interpretation: the current lead gate is good at avoiding local error/texture, but it is not rate-potential aware. This explains why rho sweeps saturate around modest official-curve gains. The next full training should include a mild rate-potential teacher plus DISTS/LPIPS hinges, rather than only increasing rho.
+
+### Scratch selector readout for top-conference direction
+
+Re-read scratch notes and current result summaries. The scratch branch is not competitive with official pretrained GLC in absolute quality, but it contains the strongest mechanism evidence for the GP-ResLC thesis.
+
+Key facts from docs/scratch_results_summary.md:
+
+- Latent-gradient residual selection improves fixed-payload DISTS/FID/KID on CLIC2020 and DIV2K, but hurts LPIPS.
+- Mixed perceptual selector reduces that LPIPS damage while preserving DISTS/FID gains.
+- Learned selector distillation is the first practical selector version: no test-time perceptual backprop, real payload accounting, and improved CLIC LPIPS/DISTS/FID/KID versus the scratch base.
+- Learned selector at delta=0.5 on CLIC2020 all 428: LPIPS/DISTS/FID/KID = 0.538061 / 0.335407 / 114.393 / 0.0631 versus scratch base 0.540915 / 0.341476 / 118.364 / 0.06663.
+- Learned selector at delta=0.8 gives stronger CLIC DISTS/FID = 0.320307 / 106.092, with LPIPS tradeoff.
+
+Interpretation for pretrained GLC branch:
+
+- Scratch should not be used as the main SOTA result yet.
+- Its selector mechanism should be imported into the pretrained/official-GLC branch as a gate/mean-prediction teacher: select high perceptual-value, high-rate-potential residual information, not raw residual magnitude.
+- The q-conditioned mixed teacher, safe-weighted mean prediction, and rate-potential teacher added to scripts/train_v2.py are the first step toward that transfer.
+
+## 2026-06-22 q-wise objective weights and rate-correlation logging
+
+Implemented q-wise loss weights in scripts/train_v2.py so one variable-rate model can train q0/q1 with stronger rate/rho pressure and q2/q3 with stronger perceptual repair. Added W&B logging for active q-specific weights, gate-rate correlation, mixed-teacher-rate correlation, and rate-map mean/std. No-write CUDA validation passed: q1 example produced finite loss, gate/rate corr -0.197, teacher/rate corr +0.170, and nonzero predictor/gate gradients. Short no-write sweeps showed hinge-only training raises bpp by lowering rho, while explicit rho hold gives small bpp reductions with quality tradeoff; this motivates q-wise objective scheduling for the next write-enabled run.
+
+## 2026-06-22 staged gate-first controls
+
+Implemented staged trainability controls in scripts/train_v2.py: --predictor_train_start, --gate_train_start, and --q_embed_train_start. No-write CUDA check confirmed predictor/q_embed gradients are zero before their start iteration and nonzero after activation. The current rho1.16 lead checkpoint has prior_predictor gate.weight/bias exactly zero, so a gate-first stage from that checkpoint is a true rate-allocation stage; q_embed is nonzero and should be controlled explicitly. All-q no-write qwise pilots showed joint training tends to lower rho and repair quality instead of preserving bpp savings, so the recommended next write-enabled run is gate-first for roughly 1000 iterations, then safe-mean predictor fine-tuning.
