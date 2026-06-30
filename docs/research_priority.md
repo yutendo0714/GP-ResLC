@@ -17,6 +17,18 @@ The goal is no longer to protect a novelty-first short-track story. The goal is
 to move the real serialized bpp versus perceptual-quality curve left/down against
 official pretrained GLC.
 
+Current decision after the 2026-06-30 review:
+
+- Keep the current rho/stage-entropy branch as the safety lead.
+- Do not restart from scratch.
+- Do not replace GLC with CoD, StableCodec, RDVQ, or another base codec.
+- Treat external 2025-2026 SOTA methods as implementation references, teachers,
+  or entropy-coding design references, not as base-codec replacements.
+- Move the main research beyond rho/scale/quantization-width tuning.
+- The next highest-value mainline is stage-aware residual-variable coding with a
+  serious residual entropy model, supported by safe-coarsening / residual-RDO
+  teachers.
+
 ## Main Thesis
 
 GP-ResLC should be treated as a residual transmission allocation method on top of
@@ -52,27 +64,31 @@ proof that decoder-computable generator-predictability can reduce transmitted
 residual precision without side bits
 ```
 
+Current frozen lead:
+
+```text
+experiments/stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k/v2_2000.pt
+```
+
+Verified CLIC2020 combined real-codec result versus local GLC:
+
+- DISTS BD-rate: `-8.37%`
+- FID BD-rate: `-5.50%`
+- KID BD-rate: `-4.39%`
+- LPIPS BD-rate: `+0.68%`
+
+Interpretation:
+
+- The branch is not a toy proxy; it moves the real serialized bpp curve on the
+  main perceptual/distribution metrics.
+- LPIPS remains weak and must not be overclaimed.
+- The result is a safety lead and mechanism evidence, not the full GP-ResLC
+  method.
+
 Do not keep spending major time on rho-target-only, rho-max-only, loss-weight-only
 sweeps unless they unblock a stronger mainline experiment.
 
-### 2. Safe-to-drop teacher
-
-Promote this to a shared mainline component rather than an ablation.
-
-Train a predictor to identify where residual precision can be reduced with small
-local perceptual/fidelity damage and meaningful bit saving. The teacher can use
-synthetic perturbations, local DISTS/LPIPS/L1/gradient damage, and local bit
-saving. Later semantic/DINO/edge features may be added as guards, but they should
-not be the first dependency.
-
-Use this teacher for:
-
-- rho/stage-quant allocation
-- residual precision allocation
-- tiny control stream labels
-- benefit-cost residual RDO
-
-### 3. Stage-aware residual-variable coding
+### 2. Stage-aware residual-variable coding
 
 This is the closest implementation of the original GP-ResLC proposal.
 
@@ -93,7 +109,57 @@ Critical constraints:
 - Residual symbols must have a real entropy coder.
 - Serialized bpp must include every transmitted symbol.
 
-### 4. Tiny counted control stream
+This is the next mainline target because it changes the actual coded variable
+from the original `y_stage` toward an unpredictable residual stream. If it works,
+the story is no longer "adaptive quantization width for GLC"; it becomes
+"stage-consistent predictable/unpredictable residual coding on top of pretrained
+GLC."
+
+### 3. Learned residual/control entropy model
+
+Any residual or control stream must be coded seriously. Borrow mechanisms from
+modern LIC/GIC only as implementation references:
+
+- finite-support categorical residual priors
+- top-k / escape coding
+- Gaussian or logistic conditional models
+- context-conditioned scales/means
+- lightweight channel/spatial context
+- grouped or checkerboard-style context where it preserves GLC decode order
+
+Do not replace the GLC base codec.
+
+This component should be developed together with stage-aware residual-variable
+coding. A residual stream without a strong entropy model will likely lose its
+rate advantage.
+
+### 4. Safe-to-drop teacher / residual RDO
+
+Promote this to a shared mainline component rather than an ablation.
+
+Train a predictor to identify where residual precision can be reduced with small
+local perceptual/fidelity damage and meaningful bit saving. The teacher can use
+synthetic perturbations, local DISTS/LPIPS/L1/gradient damage, and local bit
+saving. Later semantic/DINO/edge features may be added as guards, but they should
+not be the first dependency.
+
+Use this teacher for:
+
+- rho/stage-quant allocation
+- residual precision allocation
+- residual-variable coding supervision
+- tiny control stream labels
+- benefit-cost residual RDO
+
+Important framing:
+
+- Safe-coarsening is not just another rho target.
+- It should teach generator-predictable / safe-to-drop regions and local
+  benefit-per-bit.
+- High rho or low residual precision should be rewarded only where the local
+  perceptual/fidelity damage is small.
+
+### 5. Tiny counted control stream
 
 Zero-side rho may saturate because `z_hat` does not necessarily contain all
 safe-to-drop information. A tiny control stream is allowed if every bit is counted.
@@ -115,18 +181,49 @@ Candidate controls:
 This is still on-axis because it sends only the unpredictable control needed to
 decide what residual information can be dropped.
 
-### 5. Learned residual/control entropy model
+Current status:
 
-Any residual or control stream must be coded seriously. Borrow mechanisms from
-modern LIC/GIC only as implementation references:
+- A counted control path exists and is codec-correct.
+- The latest control-only branch did not beat the current lead, so control should
+  not be pushed by budget sweeps alone.
+- Revisit control after a stronger teacher, residual RDO, or learned control
+  entropy model exists.
 
-- finite-support categorical residual priors
-- top-k / escape coding
-- Gaussian or logistic conditional models
-- context-conditioned scales/means
-- lightweight channel/spatial context
+## External Reference Use Policy
 
-Do not replace the GLC base codec.
+Use recent SOTA methods as targeted references, not as replacements for the GLC
+base. The purpose is to strengthen GP-ResLC residual/control/entropy modules.
+
+Highest-priority references:
+
+- CADC-style uncertainty/content-adaptive allocation:
+  use for safe-coarsening teacher and local residual precision decisions.
+- DLF-style semantic/detail decomposition:
+  use for predictable/unpredictable residual split and detail-critical residual
+  selection.
+- RDVQ-style rate-aware token coding and top-k/escape discipline:
+  use for residual/control tokens and actual bitstream design.
+- CompressAI / ELIC / MLIC-style entropy modeling:
+  use for Gaussian/logistic conditionals, hyperprior discipline, and grouped
+  context models for residual/control streams.
+
+Secondary references:
+
+- ResULIC:
+  use for semantic/perceptual residual importance teachers.
+- Control-GIC:
+  use for dynamic granularity or precision-level control tokens.
+- StableCodec / CoD / CoD-Lite / OneDC / AEIC:
+  use as teacher signals, diagnostics, or upper-bound references for
+  generator-recoverable texture/detail, not as the GP-ResLC base.
+
+Working rule:
+
+```text
+Borrow mechanisms only when they help decide what residual/control information
+to transmit or how to entropy-code it. Do not turn GP-ResLC into a different
+codec family.
+```
 
 ## Experiment Execution Policy
 
@@ -170,8 +267,9 @@ still pass:
 
 ## Promotion Criteria
 
-Promote a branch only if it improves over the current rho1.16 safety lead under
-real serialized codec evaluation, or clearly exposes a stronger path.
+Promote a branch only if it improves over the current scale-bound
+rho/stage-entropy safety lead under real serialized codec evaluation, or clearly
+exposes a stronger path.
 
 Minimum evidence:
 
@@ -182,14 +280,68 @@ Minimum evidence:
 - at least Kodak plus one larger set before making strong claims
 - CLIC2020/DIV2K before treating it as the new mainline
 
+Mechanism-specific success criteria:
+
+- Safe-coarsening / residual RDO:
+  high-rho or low-precision regions should move away from high-error,
+  high-gradient, structure-sensitive areas; saved bits should come from regions
+  with low local perceptual/fidelity damage.
+- Stage-aware residual-variable coding:
+  residual stream entropy should be lower than the original coded `y` stream at
+  matched quality; zero-init must reproduce GLC; decode equality must remain
+  exact.
+- Learned residual/control entropy model:
+  actual serialized bpp must decrease after coding overhead is counted; rate
+  savings must survive Kodak, DIV2K, and CLIC2020 rather than only estimated
+  likelihood.
+- Tiny counted control:
+  total bpp including control must improve BD-rate; control ablation should hurt;
+  the control stream must remain small, entropy-coded, and counted.
+- Semantic/perceptual guards:
+  they are training-time guidance unless explicitly transmitted; no semantic or
+  edge side information may be used at decode time unless its bits are counted.
+
+## Immediate Deliverables For The Next Mainline
+
+Do not start with more rho/scale sweeps. The next useful implementation artifacts
+are:
+
+1. A stage-aware residual-variable codec path:
+   per-stage `gp_mu_stage`, finite-support residual symbols, exact decode
+   consistency, and real serialized residual bpp.
+2. A residual entropy model:
+   Gaussian/logistic or categorical residual priors, tail/escape handling if
+   needed, and per-stream bpp breakdown.
+3. A local safe-coarsening / residual-RDO teacher:
+   local coarsening perturbations, local damage maps, saved-bit maps,
+   `safe_to_coarsen_score`, and `value_per_bit` labels.
+4. A quick but real validation ladder:
+   smoke consistency -> Kodak curve -> DIV2K/CLIC curve if promising.
+5. Diagnostic maps only when needed:
+   rho/residual precision maps, local error/gradient correlation, residual
+   entropy maps, and control maps if a control stream is used.
+
 ## Practical Priority Order
 
-1. Freeze current rho1.16 and rho1.12 checkpoints as anchors.
-2. Implement safe-to-drop teacher as a reusable supervision module.
-3. Use it to train a stronger stage-aware rho/stage-quant candidate.
-4. Implement stage-aware residual-mu coding inside the four-part prior.
-5. Add learned residual entropy coding.
-6. If zero-side saturates, add a tiny counted control stream.
-7. Add semantic/DINO/edge guards only after the core mechanism shows rate gain.
+1. Freeze the current scale-bound rho/stage-entropy lead as the anchor.
+2. Evaluate the pending q-conditioned no-hinge checkpoint only as a quick
+   candidate check; do not let it reopen rho/loss tuning as the main path.
+3. Implement stage-aware residual-variable coding inside the GLC four-part prior.
+4. Implement or integrate a serious learned residual entropy model for that
+   residual stream.
+5. Build safe-coarsening / residual-RDO teacher signals to supervise allocation
+   and prevent the method from becoming blind quantization-width tuning.
+6. If zero-side allocation saturates, reintroduce a tiny counted control stream
+   with learned entropy coding.
+7. Add semantic/DINO/edge guards only after the core residual mechanism shows
+   real-codec rate gain.
 8. Run ablations after a branch has real-codec promise.
 
+## One-Sentence Research North Star
+
+```text
+GP-ResLC should spend real counted bits only on the residual/control information
+that pretrained GLC cannot reconstruct from z_hat, q, context, and its
+generative decoder, while preserving GLC's codec order and exact decode
+consistency.
+```
