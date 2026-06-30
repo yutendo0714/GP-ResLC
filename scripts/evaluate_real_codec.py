@@ -35,13 +35,17 @@ from torchvision.transforms import ToTensor
 from gp_reslc.perceptual_gate import PerceptualGate
 from gp_reslc.prior_predictor import (
     PriorPredictor,
+    StageLatentControlEncoder,
     StageResidualEntropyPredictor,
     StageResidualPredictor,
+    StageResidualRefiner,
     StageQuantGate,
+    StageScaleCalibrator,
     StageTinyControlEncoder,
     train_forward,
 )
 from gp_reslc.real_codec import (
+    ENTROPY_FAMILIES,
     compress_to_real_bitstream,
     crop_to_original,
     decompress_from_real_bitstream,
@@ -95,7 +99,10 @@ def build_gp_reslc(weights: str, ckpt_path: str, interpolate: bool, device: str)
     if "stage_residual_predictor" in ck:
         if ck.get("predictor_param_mode") in {
             "stage_residual_entropy_quant_gate",
+            "stage_residual_entropy_quant_gate_scale_calib",
+            "stage_residual_entropy_quant_gate_residual_refiner",
             "stage_residual_entropy_quant_gate_control",
+            "stage_residual_entropy_quant_gate_latent_control",
         }:
             net.stage_residual_predictor = StageResidualEntropyPredictor(
                 net.N, scale_log_bound=ck.get("stage_scale_log_bound", 0.7))
@@ -105,6 +112,17 @@ def build_gp_reslc(weights: str, ckpt_path: str, interpolate: bool, device: str)
     if "stage_quant_gate" in ck:
         net.stage_quant_gate = StageQuantGate(net.N, rho_max=ck.get("stage_rho_max", 1.5))
         net.stage_quant_gate.load_state_dict(ck["stage_quant_gate"])
+    if "stage_scale_calibrator" in ck:
+        net.stage_scale_calibrator = StageScaleCalibrator(
+            net.N, scale_log_bound=ck.get("stage_scale_calib_bound", 0.25))
+        net.stage_scale_calibrator.load_state_dict(ck["stage_scale_calibrator"])
+    if "stage_residual_refiner" in ck:
+        net.stage_residual_refiner = StageResidualRefiner(
+            net.N,
+            scale_log_bound=ck.get("stage_residual_refiner_bound", 0.25),
+            depth=ck.get("stage_residual_refiner_depth", 3),
+        )
+        net.stage_residual_refiner.load_state_dict(ck["stage_residual_refiner"])
     if "tiny_control_encoder" in ck:
         net.tiny_control_encoder = StageTinyControlEncoder(
             net.N,
@@ -118,6 +136,18 @@ def build_gp_reslc(weights: str, ckpt_path: str, interpolate: bool, device: str)
         net.tiny_control_threshold = float(ck.get("control_threshold", 0.5))
         net.tiny_control_hard_mode = str(ck.get("control_hard_mode", "threshold"))
         net.tiny_control_topk_frac = float(ck.get("control_topk_frac", 0.06))
+    if "latent_control_encoder" in ck:
+        net.latent_control_encoder = StageLatentControlEncoder(
+            net.N,
+            groups=ck.get("latent_control_groups", 16),
+            init_prob=ck.get("latent_control_init_prob", 0.0025),
+            topk_frac=ck.get("latent_control_topk_frac", 0.0025),
+            hard_mode=ck.get("latent_control_hard_mode", "topk"),
+            threshold=ck.get("latent_control_threshold", 0.5),
+        )
+        net.latent_control_encoder.load_state_dict(ck["latent_control_encoder"])
+        net.latent_control_prob_nonzero = float(ck.get("latent_control_prob_nonzero", 0.0025))
+        net.latent_control_delta = float(ck.get("latent_control_delta", 0.05))
     q_embed = ck.get("q_embed")
     if ck.get("use_gate", False):
         net.perceptual_gate = PerceptualGate(
@@ -184,8 +214,12 @@ def parse_args() -> argparse.Namespace:
             "stage_quant_gate",
             "stage_residual_quant_gate",
             "stage_residual_entropy_quant_gate",
+            "stage_residual_entropy_quant_gate_scale_calib",
+            "stage_residual_entropy_quant_gate_residual_refiner",
             "stage_residual_quant_gate_control",
             "stage_residual_entropy_quant_gate_control",
+            "stage_residual_entropy_quant_gate_residual_control",
+            "stage_residual_entropy_quant_gate_latent_control",
         ],
         default=None,
     )
@@ -194,6 +228,26 @@ def parse_args() -> argparse.Namespace:
                     help="Scale learned gate strength as rho = 1 + alpha * (rho - 1).")
     ap.add_argument("--gate_alpha_by_q", type=float, nargs="+", default=None,
                     help="Optional q-indexed gate alpha table, e.g. 0.25 0.25 0.75 0.75.")
+    ap.add_argument(
+        "--entropy_family",
+        choices=sorted(ENTROPY_FAMILIES),
+        default="gaussian",
+        help="Continuous entropy family used for arithmetic-coded y/residual symbols.",
+    )
+    ap.add_argument("--entropy_scale_factor", type=float, default=1.0,
+                    help="Global multiplier applied to entropy-model scales before arithmetic coding.")
+    ap.add_argument("--residual_control_topk_frac", type=float, default=0.0,
+                    help="For residual-control mode, fraction of signed low-res controls to send.")
+    ap.add_argument("--residual_control_prob_nonzero", type=float, default=0.01,
+                    help="For residual-control mode, arithmetic-coder prior for nonzero signed controls.")
+    ap.add_argument("--residual_control_delta", type=float, default=0.25,
+                    help="For residual-control mode, signed mean correction magnitude in scaled latent units.")
+    ap.add_argument("--residual_control_groups", type=int, default=1,
+                    help="For residual-control mode, channel groups per stage for signed controls.")
+    ap.add_argument("--residual_control_levels", type=int, default=1,
+                    help="Max absolute signed control symbol. 1 gives ternary {-1,0,+1}; higher values enable counted multi-level controls.")
+    ap.add_argument("--latent_control_delta_override", type=float, default=None,
+                    help="Override checkpoint latent-control correction magnitude for diagnostic sweeps.")
     ap.add_argument("--max_images", type=int, default=0)
     ap.add_argument("--save_streams", action="store_true", help="Write .gprc payload files next to reconstructions.")
     ap.add_argument("--skip_recon", action="store_true", help="Do not write decoded PNG reconstructions.")
@@ -213,6 +267,8 @@ def main() -> None:
 
     if args.ckpt:
         net = build_gp_reslc(args.glc_weights, args.ckpt, args.interpolate, device)
+        if args.latent_control_delta_override is not None:
+            net.latent_control_delta = float(args.latent_control_delta_override)
         method = "gp_reslc_real"
     else:
         net = build_glc(args.glc_weights, device)
@@ -220,6 +276,14 @@ def main() -> None:
     if args.predictor_param_mode is None:
         args.predictor_param_mode = getattr(net, "predictor_param_mode", "mean")
         print(f"[evaluate_real_codec] predictor_param_mode={args.predictor_param_mode}", flush=True)
+    if args.check_estimated_consistency and args.predictor_param_mode in {
+        "stage_residual_entropy_quant_gate_residual_control",
+        "stage_residual_entropy_quant_gate_latent_control",
+    }:
+        raise ValueError(
+            "--check_estimated_consistency is not available for counted control-stream modes; "
+            "this mode uses a counted source-side control stream not represented in train_forward."
+        )
 
     paths = image_paths(args.input)
     if args.max_images and args.max_images > 0:
@@ -234,6 +298,13 @@ def main() -> None:
         "input": args.input,
         "gate_alpha": args.gate_alpha,
         "gate_alpha_by_q": args.gate_alpha_by_q,
+        "entropy_family": args.entropy_family,
+        "entropy_scale_factor": args.entropy_scale_factor,
+        "residual_control_topk_frac": args.residual_control_topk_frac,
+        "residual_control_prob_nonzero": args.residual_control_prob_nonzero,
+        "residual_control_delta": args.residual_control_delta,
+        "residual_control_groups": args.residual_control_groups,
+        "residual_control_levels": args.residual_control_levels,
         "q": {},
     }
 
@@ -258,9 +329,23 @@ def main() -> None:
                 "q": q,
                 "real_codec": True,
                 "gate_alpha": gate_alpha,
+                "entropy_family": args.entropy_family,
+                "entropy_scale_factor": args.entropy_scale_factor,
+                "residual_control_topk_frac": args.residual_control_topk_frac,
+                "residual_control_prob_nonzero": args.residual_control_prob_nonzero,
+                "residual_control_delta": args.residual_control_delta,
+                "residual_control_groups": args.residual_control_groups,
+                "residual_control_levels": args.residual_control_levels,
                 "images": {},
             }
         manifest["gate_alpha"] = gate_alpha
+        manifest["entropy_family"] = args.entropy_family
+        manifest["entropy_scale_factor"] = args.entropy_scale_factor
+        manifest["residual_control_topk_frac"] = args.residual_control_topk_frac
+        manifest["residual_control_prob_nonzero"] = args.residual_control_prob_nonzero
+        manifest["residual_control_delta"] = args.residual_control_delta
+        manifest["residual_control_groups"] = args.residual_control_groups
+        manifest["residual_control_levels"] = args.residual_control_levels
         totals = {
             "bpp": 0.0,
             "bpp_y": 0.0,
@@ -300,6 +385,13 @@ def main() -> None:
                 orig_hw=(h, w),
                 predictor_param_mode=args.predictor_param_mode,
                 predictor_delta_bound=args.predictor_delta_bound,
+                entropy_family=args.entropy_family,
+                entropy_scale_factor=args.entropy_scale_factor,
+                residual_control_topk_frac=args.residual_control_topk_frac,
+                residual_control_prob_nonzero=args.residual_control_prob_nonzero,
+                residual_control_delta=args.residual_control_delta,
+                residual_control_groups=args.residual_control_groups,
+                residual_control_levels=args.residual_control_levels,
             )
             sync(device)
             t1 = time.perf_counter()
@@ -309,6 +401,12 @@ def main() -> None:
                 payload,
                 predictor_param_mode=args.predictor_param_mode,
                 predictor_delta_bound=args.predictor_delta_bound,
+                entropy_family=args.entropy_family,
+                entropy_scale_factor=args.entropy_scale_factor,
+                residual_control_prob_nonzero=args.residual_control_prob_nonzero,
+                residual_control_delta=args.residual_control_delta,
+                residual_control_groups=args.residual_control_groups,
+                residual_control_levels=args.residual_control_levels,
             )
             sync(device)
             t2 = time.perf_counter()
@@ -355,8 +453,11 @@ def main() -> None:
                 "payload_bytes": len(payload),
                 "y_bytes": stats["y_bytes"],
                 "control_bytes": stats.get("control_bytes", 0.0),
+                "residual_control_nonzero": stats.get("residual_control_nonzero", 0.0),
+                "residual_control_symbol_count": stats.get("residual_control_symbol_count", 0.0),
                 "z_bytes": stats["z_bytes"],
                 "header_bytes": stats["header_bytes"],
+                "entropy_family": args.entropy_family,
                 "encode_time_s": enc_t,
                 "decode_time_s": dec_t,
                 "height": h,

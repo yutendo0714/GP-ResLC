@@ -67,15 +67,22 @@ residual precision without side bits
 Current frozen lead:
 
 ```text
-experiments/stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k/v2_2000.pt
+experiments/stage_safe_rdo_gate_from_sb03_2000/v2_final.pt
 ```
 
 Verified CLIC2020 combined real-codec result versus local GLC:
 
-- DISTS BD-rate: `-8.37%`
-- FID BD-rate: `-5.50%`
-- KID BD-rate: `-4.39%`
-- LPIPS BD-rate: `+0.68%`
+- DISTS BD-rate: `-9.76%`
+- FID BD-rate: `-6.42%`
+- KID BD-rate: `-4.65%`
+- LPIPS BD-rate: `+0.05%`
+
+Verified DIV2K validation real-codec result versus local GLC:
+
+- DISTS BD-rate: `-10.37%`
+- FID BD-rate: `-5.64%`
+- KID BD-rate: `-4.98%`
+- LPIPS BD-rate: `-0.49%`
 
 Interpretation:
 
@@ -186,8 +193,14 @@ Current status:
 - A counted control path exists and is codec-correct.
 - The latest control-only branch did not beat the current lead, so control should
   not be pushed by budget sweeps alone.
+- Fixed-prior source-side residual-control probes on Kodak8 also failed to beat
+  the Safe-RDO lead after control bits were counted:
+  `g16_f0025_d005` gives DISTS/FID `-2.45%/-4.30%` versus GLC, and
+  `g16_f005_d010` gives `-1.58%/-2.80%`, both weaker than SafeRDO
+  `-6.00%/-7.38%`.
 - Revisit control after a stronger teacher, residual RDO, or learned control
-  entropy model exists.
+  entropy model exists.  If revisited, the control prior should be
+  decoder-computable and stage-wise, not an encoder-only probability map.
 
 ## External Reference Use Policy
 
@@ -267,7 +280,7 @@ still pass:
 
 ## Promotion Criteria
 
-Promote a branch only if it improves over the current scale-bound
+Promote a branch only if it improves over the current Safe-RDO
 rho/stage-entropy safety lead under real serialized codec evaluation, or clearly
 exposes a stronger path.
 
@@ -323,9 +336,10 @@ are:
 
 ## Practical Priority Order
 
-1. Freeze the current scale-bound rho/stage-entropy lead as the anchor.
-2. Evaluate the pending q-conditioned no-hinge checkpoint only as a quick
-   candidate check; do not let it reopen rho/loss tuning as the main path.
+1. Freeze the current Safe-RDO rho/stage-entropy lead as the anchor.
+2. Treat q-aware rho-target and safe-weighted stage-mean continuations as
+   rejected diagnostics unless they beat the Safe-RDO lead on a larger
+   real-codec set.
 3. Implement stage-aware residual-variable coding inside the GLC four-part prior.
 4. Implement or integrate a serious learned residual entropy model for that
    residual stream.
