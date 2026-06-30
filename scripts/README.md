@@ -3,6 +3,10 @@
 The scripts are kept at one level so old experiment commands remain reproducible.
 Use this index instead of guessing from filenames.
 
+Current research policy: use official pretrained GLC as the fixed base, stop
+scratch as an active path, and prioritize full residual/control/entropy
+mechanisms over rho-only sweeps. See `docs/research_priority.md`.
+
 ## Paper-Facing Real Codec
 
 - `evaluate_real_codec.py`: primary real-codec evaluator for GLC and GP-ResLC
@@ -55,4 +59,3 @@ Use this index instead of guessing from filenames.
 - `eval_metrics.py`, `make_comparison.py`, `make_curves.py`, `run_ablation.py`:
   useful older orchestration utilities. Prefer the real-codec pipeline for new
   paper-facing comparisons.
-

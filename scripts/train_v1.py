@@ -60,7 +60,9 @@ class CropFolder(Dataset):
     EXTS = ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp")
 
     def __init__(self, root, size=256):
-        self.paths = sorted(sum([glob.glob(os.path.join(root, e)) for e in self.EXTS], []))
+        self.paths = sorted(sum([
+            glob.glob(os.path.join(root, "**", e), recursive=True) for e in self.EXTS
+        ], []))
         assert self.paths, f"画像が見つかりません: {root}"
         self.size = size
         self.t = transforms.Compose([
@@ -107,10 +109,10 @@ def build_net(weights, device, unfreeze_fusion=False, use_stage_residual=False, 
     if use_stage_residual:
         for p in net.stage_residual_predictor.parameters():
             p.requires_grad_(True)
-    elif use_stage_quant_gate:
+    if use_stage_quant_gate:
         for p in net.stage_quant_gate.parameters():
             p.requires_grad_(True)
-    else:
+    if not use_stage_residual and not use_stage_quant_gate:
         for p in net.prior_predictor.parameters():
             p.requires_grad_(True)
     if unfreeze_fusion:  # 利得が出ないときのピボット用
@@ -401,7 +403,19 @@ def main():
                     help="Save net.state_dict() in train_state.pt. Forced on when any GLC module is unfrozen.")
     ap.add_argument("--freeze_aux_module", action="store_true",
                     help="Freeze prior_predictor/stage_residual/stage_quant while training unfrozen GLC modules.")
-    ap.add_argument("--predictor_param_mode", choices=["mean", "scale_mean", "all", "latent_residual", "stage_latent_residual", "stage_quant_gate"], default="scale_mean")
+    ap.add_argument(
+        "--predictor_param_mode",
+        choices=[
+            "mean",
+            "scale_mean",
+            "all",
+            "latent_residual",
+            "stage_latent_residual",
+            "stage_quant_gate",
+            "stage_residual_quant_gate",
+        ],
+        default="scale_mean",
+    )
     ap.add_argument("--predictor_delta_bound", type=float, default=0.0,
                     help="Bound predictor delta by bound*tanh(delta/bound); 0 disables")
     ap.add_argument("--stage_rho_max", type=float, default=1.5,
@@ -463,15 +477,24 @@ def main():
     elif not args.no_wandb:
         print("[warn] wandb 未インストール。`pip install wandb` 推奨。ログ無しで継続。")
 
-    use_stage_residual = args.predictor_param_mode == "stage_latent_residual"
-    use_stage_quant_gate = args.predictor_param_mode == "stage_quant_gate"
+    use_stage_residual = args.predictor_param_mode in {
+        "stage_latent_residual",
+        "stage_residual_quant_gate",
+    }
+    use_stage_quant_gate = args.predictor_param_mode in {
+        "stage_quant_gate",
+        "stage_residual_quant_gate",
+    }
     net = build_net(args.glc_weights, device, args.unfreeze_fusion,
                     use_stage_residual, use_stage_quant_gate, args.stage_rho_max,
                     args.unfreeze_entropy, args.unfreeze_hyper_dec)
     net.predictor_param_mode = args.predictor_param_mode
     net.predictor_delta_bound = args.predictor_delta_bound
     if args.freeze_aux_module:
-        if use_stage_residual:
+        if use_stage_residual and use_stage_quant_gate:
+            _set_trainable(net.stage_residual_predictor, False)
+            _set_trainable(net.stage_quant_gate, False)
+        elif use_stage_residual:
             _set_trainable(net.stage_residual_predictor, False)
         elif use_stage_quant_gate:
             _set_trainable(net.stage_quant_gate, False)
@@ -531,7 +554,7 @@ def main():
             net.load_state_dict(ck["model_state_dict"], strict=False)
         if use_stage_residual:
             net.stage_residual_predictor.load_state_dict(ck["stage_residual_predictor"])
-        elif use_stage_quant_gate:
+        if use_stage_quant_gate:
             net.stage_quant_gate.load_state_dict(ck["stage_quant_gate"])
         else:
             net.prior_predictor.load_state_dict(ck["prior_predictor"])
@@ -695,7 +718,7 @@ def main():
                 if args.predictor_param_mode == "latent_residual":
                     target_residual_pred = target_y - base_mean.detach()
                     l_mean_pred = F.smooth_l1_loss(out["latent_pred_scaled"], target_residual_pred)
-                elif args.predictor_param_mode == "stage_latent_residual":
+                elif args.predictor_param_mode in {"stage_latent_residual", "stage_residual_quant_gate"}:
                     l_mean_pred = out["stage_mean_pred_loss"]
                 elif args.predictor_param_mode == "stage_quant_gate":
                     l_mean_pred = zero
@@ -705,7 +728,12 @@ def main():
             else:
                 l_mean_pred = zero
 
-            if args.lambda_scale_reg > 0 and args.predictor_param_mode not in ("latent_residual", "stage_latent_residual", "stage_quant_gate"):
+            if args.lambda_scale_reg > 0 and args.predictor_param_mode not in (
+                "latent_residual",
+                "stage_latent_residual",
+                "stage_quant_gate",
+                "stage_residual_quant_gate",
+            ):
                 base_scale = out["params_base"][:, net.N:2 * net.N]
                 after_scale = out["params_after"][:, net.N:2 * net.N]
                 l_scale_reg = F.relu(after_scale - base_scale).mean()
@@ -856,12 +884,12 @@ def main():
                     torch.save(net.stage_residual_predictor.state_dict(),
                                os.path.join(args.out, f"stage_residual_predictor_{it}.pt"))
                     state["stage_residual_predictor"] = net.stage_residual_predictor.state_dict()
-                elif use_stage_quant_gate:
+                if use_stage_quant_gate:
                     torch.save(net.stage_quant_gate.state_dict(),
                                os.path.join(args.out, f"stage_quant_gate_{it}.pt"))
                     state["stage_quant_gate"] = net.stage_quant_gate.state_dict()
                     state["stage_rho_max"] = args.stage_rho_max
-                else:
+                if not use_stage_residual and not use_stage_quant_gate:
                     torch.save(net.prior_predictor.state_dict(),
                                os.path.join(args.out, f"prior_predictor_{it}.pt"))
                     state["prior_predictor"] = net.prior_predictor.state_dict()
@@ -886,12 +914,12 @@ def main():
         final_path = os.path.join(args.out, "stage_residual_predictor_final.pt")
         torch.save(net.stage_residual_predictor.state_dict(), final_path)
         state["stage_residual_predictor"] = net.stage_residual_predictor.state_dict()
-    elif use_stage_quant_gate:
+    if use_stage_quant_gate:
         final_path = os.path.join(args.out, "stage_quant_gate_final.pt")
         torch.save(net.stage_quant_gate.state_dict(), final_path)
         state["stage_quant_gate"] = net.stage_quant_gate.state_dict()
         state["stage_rho_max"] = args.stage_rho_max
-    else:
+    if not use_stage_residual and not use_stage_quant_gate:
         final_path = os.path.join(args.out, "prior_predictor_final.pt")
         torch.save(net.prior_predictor.state_dict(), final_path)
         state["prior_predictor"] = net.prior_predictor.state_dict()

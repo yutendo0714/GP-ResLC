@@ -4741,3 +4741,808 @@ Implemented q-wise loss weights in scripts/train_v2.py so one variable-rate mode
 ## 2026-06-22 staged gate-first controls
 
 Implemented staged trainability controls in scripts/train_v2.py: --predictor_train_start, --gate_train_start, and --q_embed_train_start. No-write CUDA check confirmed predictor/q_embed gradients are zero before their start iteration and nonzero after activation. The current rho1.16 lead checkpoint has prior_predictor gate.weight/bias exactly zero, so a gate-first stage from that checkpoint is a true rate-allocation stage; q_embed is nonzero and should be controlled explicitly. All-q no-write qwise pilots showed joint training tends to lower rho and repair quality instead of preserving bpp savings, so the recommended next write-enabled run is gate-first for roughly 1000 iterations, then safe-mean predictor fine-tuning.
+
+## 2026-06-30 stage-aware residual + quant-gate mainline
+
+Motivation: the rho-only branch is a useful safety anchor, but it can be read as
+adaptive quantization. The next mainline candidate should implement the original
+GP-ResLC thesis more directly: at each GLC four-part prior stage, use only
+decoder-available context to predict a generator-recoverable residual mean, then
+entropy-code the remaining residual with decoder-computable precision control.
+
+Implemented mode:
+
+```text
+predictor_param_mode = stage_residual_quant_gate
+
+For each four-part stage i:
+  rho_i = rho_theta_i(z_hat, q, decoded previous y parts)
+  delta_i = gp_mu_theta_i(z_hat, q, decoded previous y parts)
+  y_scaled_i = y / (quant_step * rho_i)
+  encode residual around base_mean_i + delta_i
+  decode and reconstruct with quant_step * rho_i
+```
+
+Important constraints:
+
+- zero initialization reproduces the pretrained GLC graph up to numerical noise
+- no side map is transmitted
+- `delta_i` and `rho_i` are both recomputed by the decoder from already decoded
+  information
+- real codec encode/decode has explicit support for the combined mode
+- the old global perceptual gate is disabled with `--no_gate` for this branch
+
+Implementation files:
+
+- `gp_reslc/prior_predictor.py`: added
+  `forward_four_part_prior_with_stage_residual_quant_gate`.
+- `gp_reslc/real_codec.py`: added matching encode/decode paths for the combined
+  stage-aware residual/quant-gate graph.
+- `scripts/train_v2.py`: added combined-mode training, checkpointing, logging.
+- `scripts/evaluate_real_codec.py`: added combined-mode CLI support and
+  recursive dataset image discovery.
+- `scripts/train_v1.py`: kept compatible with combined-mode checkpointing.
+
+Smoke validation:
+
+- W&B run: `stage_residual_quant_gate_smoke`
+  (`kzpby7b5`).
+- Command used OpenImages train, Kodak validation, q2 only, 2 iterations.
+- Forward/backward/checkpoint save passed.
+- Real codec smoke on Kodak image 1, q2:
+  `bpp=0.03746`, `y=0.03235`, `z=0.00342`, `header=0.00169`,
+  `encode=0.613s`, `decode=0.112s`, `max_abs=0.000e+00`.
+
+Next full run:
+
+- all q training on OpenImages
+- DISTS/LPIPS quality guard plus stage residual prediction loss
+- real-codec Kodak quick curve at checkpoints
+- promote only if it beats the current rho safety lead under counted bpp
+
+### Full-run result: stage residual + quant gate, rate-heavy checkpoint
+
+Run:
+
+- training: `experiments/stage_residual_quant_gate_allq_rpteacher_lR14_20k`
+- W&B: `stage_residual_quant_gate_allq_rpteacher_lR14_20k` (`u2lk41st`)
+- promoted checkpoint for evaluation: `v2_2000.pt`
+- mode: `stage_residual_quant_gate`
+- dataset for transfer check: DIV2K validation images `0801`-`0900`
+- codec: `scripts/evaluate_real_codec.py`, same four-part stage graph in encode/decode
+
+Kodak full-resolution real-codec summary versus local GLC:
+
+| run | DISTS BD-rate | LPIPS BD-rate | FID BD-rate | KID BD-rate | matched DISTS bpp |
+|---|---:|---:|---:|---:|---:|
+| rate-heavy `v2_2000` | -5.39% | -0.25% | -1.66% | -3.90% | -3.65% |
+| balanced `v2_1000` | -4.00% | +0.20% | -0.57% | -0.88% | -2.29% |
+
+DIV2K validation real-codec summary versus local GLC:
+
+| metric | BD-rate | matched bpp delta |
+|---|---:|---:|
+| DISTS | -7.43% | -6.66% |
+| LPIPS | +0.05% | +1.24% |
+| FID | -3.78% | -1.31% |
+| KID | -3.98% | -0.68% |
+| PSNR | +0.65% | n/a |
+
+DIV2K pointwise behavior:
+
+- q0: bpp `0.02381 -> 0.02148`, but LPIPS/FID worsen.
+- q1: bpp `0.02764 -> 0.02546`, DISTS slightly improves, LPIPS/FID worsen mildly.
+- q2: bpp `0.03224 -> 0.03054`, DISTS improves slightly, LPIPS/FID worsen mildly.
+- q3: bpp `0.03649 -> 0.03512`, DISTS is effectively tied and FID/KID are effectively tied.
+
+Interpretation:
+
+- This branch is more faithful to the GP-ResLC thesis than the earlier global rho shortcut because the residual mean and precision control are computed inside the GLC four-part prior order from decoder-available information.
+- The result transfers to both Kodak and DIV2K under counted real bitstreams: DISTS/FID/KID BD-rate are negative on both sets, while LPIPS is near neutral on DIV2K and slightly improved on Kodak.
+- The weakness is clear: q0 is over-compressed, and LPIPS is still the easiest perceptual metric to damage. The current decoder-computable `z_hat/q/context` gate cannot fully identify all safe-to-drop locations.
+- The next full implementation should therefore move to the mainline "safe-to-drop / residual-control" design, not more rho-target or loss-weight cosmetics.
+
+Next research step:
+
+1. Add a tiny counted control stream for safe-to-drop or residual precision correction when decoder-only signals are insufficient.
+2. Keep the stream extremely small and include it in the payload bpp.
+3. Couple it with a learned residual/control entropy model, so the new bits are spent only where they buy DISTS/FID/KID or LPIPS safety.
+4. Evaluate immediately with real-codec Kodak and DIV2K curves before expanding to CLIC.
+
+### Tiny counted control stream implementation and first rejection
+
+Implemented a counted protection-control stream on top of
+`stage_residual_quant_gate`.
+
+Design:
+
+- The encoder predicts a 4-channel binary control map at z resolution.
+- The maps are packed into one Bernoulli arithmetic stream and counted in the
+  payload.
+- A control symbol of 1 protects that coarse region by moving the effective
+  stage rho back toward 1:
+
+```text
+rho_eff = 1 + (rho_stage - 1) * (1 - control)
+```
+
+- The decoder receives the control stream before decoding the y streams, so the
+  real arithmetic codec is consistent.
+- Real-codec smoke passed with `max_abs=0.000e+00`.
+
+Important implementation correction:
+
+- Four separate control streams wasted header bytes.
+- The final implementation packs all four stage maps into one control stream.
+- One-image Kodak q2 smoke after packing: `bpp=0.03603`, `control=0.00035`,
+  header `0.00185`, `max_abs=0.000e+00`.
+
+Training/evaluation:
+
+- Run: `stage_residual_quant_gate_control_topk04_freezestage_from_rate2000_5k`
+- W&B: `o089lp1x`
+- Init: `stage_residual_quant_gate_allq_rpteacher_lR14_20k/v2_2000.pt`
+- Stage residual predictor, stage quant gate, and q embedding were frozen.
+- Only the tiny control encoder was trained.
+- Top-k control budget: 4% of z-resolution control symbols.
+- Evaluated checkpoint: `v2_2000.pt`
+
+Kodak8 real-codec result versus local GLC:
+
+| run | DISTS BD-rate | LPIPS BD-rate | FID BD-rate | matched DISTS bpp |
+|---|---:|---:|---:|---:|
+| stage residual + quant gate | -6.01% | -1.20% | +1.02% | -2.74% |
+| + top-k 4% control | -3.94% | +0.09% | -13.75% | -1.69% |
+
+Interpretation:
+
+- The counted control stream can improve distribution quality on Kodak8, as
+  shown by the FID gain.
+- It does not yet beat the stage-only branch on DISTS/LPIPS because the control
+  overhead and protection placement cost more than the quality it recovers.
+- This confirms that the control-stream idea is method-faithful but needs a
+  smaller budget or a learned entropy/control prior before it can become the
+  lead.
+
+Next immediate test:
+
+- Repeat the frozen-stage control training with a 2% top-k budget.
+- Promote only if it keeps the stage-only DISTS/LPIPS curve while retaining some
+  of the FID improvement.
+
+### Tiny counted control stream 2% top-k result
+
+Run:
+
+- training: `experiments/stage_residual_quant_gate_control_topk02_freezestage_from_rate2000_2500`
+- W&B: `stage_residual_quant_gate_control_topk02_freezestage_from_rate2000_2500` (`e1a3p24k`)
+- init: `stage_residual_quant_gate_allq_rpteacher_lR14_20k/v2_2000.pt`
+- frozen modules: stage residual predictor, stage quant gate, q embedding
+- trained module: tiny paid control encoder only
+- control budget: top-k 2% at z-resolution, packed into one counted Bernoulli stream
+- evaluated checkpoint: `v2_final.pt`
+
+Kodak8 real-codec result versus local GLC:
+
+| run | DISTS BD-rate | LPIPS BD-rate | FID BD-rate | KID BD-rate | matched DISTS bpp |
+|---|---:|---:|---:|---:|---:|
+| stage residual + quant gate | -6.01% | -1.20% | +1.02% | +7.44% | -2.74% |
+| + top-k 2% control | -3.33% | -0.08% | -4.56% | +10.21% | -1.27% |
+
+Decision:
+
+- Reject the current top-k control formulation as a lead branch.
+- It is on-axis because all control bits are counted and decoder uses them before
+  y arithmetic decoding, but the current protection labels are not worth their
+  cost under DISTS/LPIPS.
+- Do not continue with control-budget-only sweeps. Revisit control only after a
+  stronger learned residual/control entropy model or teacher can decide where
+  protection actually pays off.
+
+### Stage-aware residual entropy predictor: mean + scale
+
+Implemented a stronger mainline branch:
+
+```text
+GLC four-part stage prior:
+  y_stage = base_mean_stage + gp_mu_stage(context) + residual_stage
+  residual_stage ~ N(0, base_scale_stage * gp_scale_stage(context))
+```
+
+Properties:
+
+- `gp_mu_stage` and `gp_scale_stage` use only decoder-available signals in the
+  same four-part order as GLC.
+- No side map and no control stream are transmitted.
+- The real arithmetic codec uses the same residual scale multiplier as the
+  training graph.
+- Zero initialization gives `gp_mu=0`, `gp_scale=1`; old mean-only stage
+  predictor weights are copied into the mean half when resuming from the
+  current lead checkpoint.
+
+Implementation:
+
+- `StageResidualEntropyPredictor` added to `gp_reslc/prior_predictor.py`.
+- New mode: `stage_residual_entropy_quant_gate`.
+- Updated `scripts/train_v2.py`, `scripts/evaluate_real_codec.py`, and
+  `gp_reslc/real_codec.py`.
+- Smoke training and real-codec encode/decode passed.
+
+First run:
+
+- training: `experiments/stage_residual_entropy_quant_gate_from_rate2000_8k`
+- W&B: `stage_residual_entropy_quant_gate_from_rate2000_8k` (`afiysst9`)
+- init: `stage_residual_quant_gate_allq_rpteacher_lR14_20k/v2_2000.pt`
+- frozen: stage quant gate, q embedding
+- trained: stage residual entropy predictor
+- stopped after checkpoint `v2_2000.pt` for quick real-codec evaluation
+
+Kodak8 real-codec result versus local GLC:
+
+| run | DISTS BD-rate | LPIPS BD-rate | FID BD-rate | KID BD-rate | matched DISTS bpp |
+|---|---:|---:|---:|---:|---:|
+| stage residual + quant gate | -6.01% | -1.20% | +1.02% | +7.44% | -2.74% |
+| + residual entropy scale | -5.83% | -2.66% | -4.96% | +36.82% | -4.16% |
+
+Interpretation:
+
+- The scale-aware residual entropy branch reduces real y-stream bpp further
+  without any side stream.
+- It improves LPIPS and FID BD-rate on Kodak8, and matched-DISTS bpp is stronger
+  than the stage-only branch.
+- It narrowly loses DISTS BD-rate to the stage-only checkpoint because q0/q1 are
+  over-compressed.
+- This is a better mainline direction than tiny control: it directly strengthens
+  residual entropy modeling and keeps the GP-ResLC story simple.
+
+Next immediate test:
+
+- Continue from this checkpoint with lower rate pressure and DISTS/LPIPS hinges,
+  especially on q0/q1, to keep the scale predictor from collapsing quality while
+  preserving the LPIPS/FID gain.
+- Active run: `experiments/stage_residual_entropy_quant_gate_hinge_from_entropy2000_4k`
+  / W&B `stage_residual_entropy_quant_gate_hinge_from_entropy2000_4k`.
+
+Hinge follow-up:
+
+- training: `experiments/stage_residual_entropy_quant_gate_hinge_from_entropy2000_4k`
+- W&B: `stage_residual_entropy_quant_gate_hinge_from_entropy2000_4k` (`qtvizlgg`)
+- evaluated checkpoint: `v2_2000.pt`
+
+Kodak8 real-codec result:
+
+| run | DISTS BD-rate | LPIPS BD-rate | FID BD-rate | KID BD-rate | matched DISTS bpp |
+|---|---:|---:|---:|---:|---:|
+| stage residual + quant gate | -6.01% | -1.20% | +1.02% | +7.44% | -2.74% |
+| + residual entropy scale | -5.83% | -2.66% | -4.96% | +36.82% | -4.16% |
+| + residual entropy scale + hinge | -5.52% | -2.58% | -4.09% | +13.53% | -4.38% |
+
+Decision:
+
+- Reject the hinge continuation as a lead. It improves KID stability but does
+  not recover DISTS enough and slightly weakens LPIPS/FID relative to the
+  non-hinge entropy-scale checkpoint.
+- The core diagnosis is not simply loss weight; the residual scale multiplier is
+  too free. A narrower scale range should keep the entropy-model benefit while
+  avoiding q0/q1 overconfidence.
+
+Next:
+
+- Restart from the stage-only lead with `stage_scale_log_bound=0.3` instead of
+  `0.7`.
+- Keep stage quant gate and q embedding frozen.
+- Promote only if it beats stage-only on DISTS or preserves stage-only DISTS
+  while retaining the LPIPS/FID gains of the entropy-scale branch.
+
+Scale-bound follow-up:
+
+- training: `experiments/stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k`
+- W&B: `stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k` (`01bxxf6q`)
+- init: `stage_residual_quant_gate_allq_rpteacher_lR14_20k/v2_2000.pt`
+- frozen: stage quant gate, q embedding
+- residual scale log bound: `0.3`
+- evaluated checkpoint: `v2_2000.pt`
+
+Kodak8 real-codec result:
+
+| run | DISTS BD-rate | LPIPS BD-rate | FID BD-rate | KID BD-rate | matched DISTS bpp |
+|---|---:|---:|---:|---:|---:|
+| stage residual + quant gate | -6.01% | -1.20% | +1.02% | +7.44% | -2.74% |
+| residual entropy scale, bound 0.7 | -5.83% | -2.66% | -4.96% | +36.82% | -4.16% |
+| residual entropy scale, bound 0.3 | -5.95% | -2.67% | -7.23% | +20.66% | -4.52% |
+
+Decision:
+
+- Promote the scale-bound 0.3 checkpoint to a transfer check.
+- It nearly matches the stage-only DISTS BD-rate while improving LPIPS and FID
+  on Kodak8, and it has stronger matched-DISTS bpp than the stage-only branch.
+- Because Kodak8 is small and FID/KID are unstable there, the next decision must
+  use DIV2K validation real-codec evaluation.
+
+DIV2K transfer check:
+
+- dataset: `data/eval/div2k_valid_0801_0900` (DIV2K validation 100 images)
+- compared runs:
+  - local GLC real codec: `experiments/real_codec/div2k_glc`
+  - stage residual + quant gate: `experiments/real_codec/div2k_stage_residual_quant_gate_rate_2000`
+  - residual entropy scale, bound 0.3: `experiments/real_codec/div2k_stage_residual_entropy_quant_gate_scalebound03_2000`
+- metrics:
+  - `experiments/real_codec/div2k_stage_residual_entropy_quant_gate_scalebound03_2000_metrics.csv`
+  - `experiments/real_codec/div2k_stage_residual_entropy_quant_gate_scalebound03_2000_bd.md`
+  - `experiments/real_codec/div2k_stage_residual_entropy_quant_gate_scalebound03_2000_matched.md`
+
+DIV2K real-codec result versus local GLC:
+
+| run | DISTS BD-rate | LPIPS BD-rate | FID BD-rate | KID BD-rate | matched DISTS bpp |
+|---|---:|---:|---:|---:|---:|
+| stage residual + quant gate | -7.43% | +0.05% | -3.78% | -3.98% | -6.66% |
+| residual entropy scale, bound 0.3 | -9.20% | -0.05% | -5.13% | -1.23% | -8.03% |
+
+Decision:
+
+- Promote `stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k/v2_2000.pt`
+  to the current mainline validation branch.
+- The improvement is not just a q-index point comparison: the matched-DISTS
+  interpolation also moves from `-6.66%` to `-8.03%` bpp versus GLC.
+- LPIPS remains essentially neutral and KID is less strong than the stage-only
+  branch, so the method should not be declared finished.
+- Next full test is CLIC2020 combined test. If CLIC confirms the DIV2K trend,
+  the next implementation should be a q/stage-conditioned scale schedule or
+  safe-to-drop teacher for LPIPS/KID stability, not another loss-weight sweep.
+
+CLIC evaluation safeguard:
+
+- A first CLIC run was accidentally launched without an explicit
+  `--predictor_param_mode`. Because `scripts/evaluate_real_codec.py` defaulted
+  to `mean`, the run reproduced local GLC bpp exactly instead of using
+  `stage_residual_entropy_quant_gate`.
+- The duplicate output was moved to
+  `experiments/real_codec/clic2020_test_stage_residual_entropy_quant_gate_scalebound03_2000_wrong_mode_mean_duplicate`.
+- `scripts/evaluate_real_codec.py` was fixed so that, when a checkpoint stores
+  `predictor_param_mode`, the evaluator adopts that mode automatically and
+  prints it before evaluation.
+- One-image CLIC smoke after the fix confirmed the correct path:
+  baseline q0 first image `0.02637 bpp`, GP-ResLC q0 first image
+  `0.02225 bpp`, no control stream.
+
+CLIC2020 combined real-codec validation:
+
+- dataset: `data/clic2020_test_combined` (428 images)
+- checkpoint:
+  `experiments/stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k/v2_2000.pt`
+- evaluator mode: checkpoint-inferred
+  `stage_residual_entropy_quant_gate`
+- reconstructed output:
+  `experiments/real_codec/clic2020_test_stage_residual_entropy_quant_gate_scalebound03_2000`
+- metrics:
+  - `experiments/real_codec/clic2020_test_stage_residual_entropy_quant_gate_scalebound03_2000_metrics.csv`
+  - `experiments/real_codec/clic2020_test_stage_residual_entropy_quant_gate_scalebound03_2000_bd.md`
+  - `experiments/real_codec/clic2020_test_stage_residual_entropy_quant_gate_scalebound03_2000_matched.md`
+
+Real transmitted bpp:
+
+| q | GLC bpp | GP-ResLC bpp | y bpp | z bpp | control bpp | encode s/img | decode s/img |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0.02134 | 0.01801 | 0.01424 | 0.00352 | 0.00000 | 0.645 | 0.924 |
+| 1 | 0.02503 | 0.02187 | 0.01810 | 0.00352 | 0.00000 | 0.725 | 1.008 |
+| 2 | 0.02958 | 0.02704 | 0.02327 | 0.00352 | 0.00000 | 0.827 | 1.111 |
+| 3 | 0.03369 | 0.03159 | 0.02782 | 0.00352 | 0.00000 | 0.933 | 1.217 |
+
+CLIC2020 quality/BD result versus local GLC:
+
+| metric | BD-rate | matched-quality bpp delta |
+|---|---:|---:|
+| DISTS | -8.37% | -7.28% |
+| LPIPS | +0.68% | +1.88% |
+| FID | -5.50% | -2.42% |
+| KID | -4.39% | -1.85% |
+| PSNR | +0.28% | n/a |
+
+Decision:
+
+- Promote the scale-bound stage residual entropy branch as the current best
+  full-benchmark mainline.
+- The CLIC result confirms the DIV2K trend on the official-size natural-image
+  test set: DISTS/FID/KID curves move left under real serialized codec bpp.
+- This is not just a quality-index retuning result. Matched-quality DISTS uses
+  all four GLC q targets inside the GP-ResLC range and gives `-7.28%` average
+  bpp reduction.
+- LPIPS is still the weak axis: BD-rate is slightly worse and matched-LPIPS bpp
+  is positive. The next branch should optimize q/stage-conditioned residual
+  entropy and precision control to preserve LPIPS while retaining the DISTS/FID
+  gain.
+
+Next:
+
+- Start a q-conditioned full branch from this checkpoint.
+- Unfreeze the stage quant gate and q embedding, keep the residual entropy
+  scale bound at `0.3`, and use conservative learning rate.
+- This is a mainline capacity increase, not a scalar sweep: the model should
+  learn rate-specific residual predictability/precision behavior across q.
+
+Q-conditioned full branch started:
+
+- run:
+  `experiments/stage_residual_entropy_quant_gate_qcond_full_from_sb03_20k`
+- W&B:
+  `stage_residual_entropy_quant_gate_qcond_full_from_sb03_20k`
+  (`t2od6wbs`)
+- init:
+  `experiments/stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k/v2_2000.pt`
+- mode:
+  `stage_residual_entropy_quant_gate`
+- training data:
+  `/dpl/open-images-v6/train`
+- validation:
+  `data/eval/kodak8`
+- iterations:
+  `20000`
+- batch size:
+  `4`
+- learning rate:
+  `3e-6`
+- q choices:
+  `0 1 2 3`
+- trainable:
+  stage residual entropy predictor, stage quant gate, q embedding
+- frozen:
+  pretrained GLC backbone
+- loss:
+  `12 R + 0.03 MSE + 3.0 LPIPS + 1.8 DISTS + 1.0 LPIPS-hinge + 0.1 mean-pred + 0.01 stage-delta-abs`
+- residual scale log bound:
+  `0.3`
+
+Initial log:
+
+- trainable params: `10.31 M`
+- initial q1 batch: bpp `0.0239`, bpp_y `0.0204`, LPIPS `0.2476`,
+  DISTS `0.1304`, LPIPS hinge `0.0191`
+- A/B at iteration 0 shows lower y-stream bpp for all q, but quality is still
+  slightly behind the frozen GLC baseline, so the run must be judged by
+  checkpoint real-codec validation, not training bpp alone.
+
+Early stop decision:
+
+- stopped manually after iteration `2200`
+- checkpoints kept:
+  - `v2_0.pt`
+  - `v2_1000.pt`
+  - `v2_2000.pt`
+- reason:
+  the global LPIPS hinge protected quality by pushing the learned stage rho
+  almost back to `1.0`, erasing the y-stream saving that made the scale-bound
+  branch strong.
+- A/B at iteration `2000`:
+  - q0 y delta: `-0.0007 bpp`
+  - q1 y delta: `-0.0004 bpp`
+  - q2 y delta: `-0.0005 bpp`
+  - q3 y delta: `-0.0004 bpp`
+- conclusion:
+  reject this as a lead. It is too conservative and is likely to collapse the
+  CLIC/DIV2K BD-rate gains.
+
+Next branch:
+
+- use the existing mixed safe-to-drop teacher instead of a global LPIPS hinge.
+- The teacher estimates where current coarsening is locally safe from
+  GLC-relative L1/LPIPS/texture/rate signals, then trains the decoder-computable
+  stage gate map.
+- This is closer to the GP-ResLC thesis: learn where the generator can recover
+  details and keep residual precision for the unpredictable regions.
+
+Mixed safe-to-drop teacher branch started:
+
+- run:
+  `experiments/stage_residual_entropy_quant_gate_mixedteacher_qcond_from_sb03_20k`
+- W&B:
+  `stage_residual_entropy_quant_gate_mixedteacher_qcond_from_sb03_20k`
+  (`hazdh760`)
+- init:
+  `experiments/stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k/v2_2000.pt`
+- mode:
+  `stage_residual_entropy_quant_gate`
+- trainable:
+  stage residual entropy predictor, stage quant gate, q embedding
+- central change:
+  replace global LPIPS hinge with mixed safe-to-drop teacher:
+  `0.5 BCE(p_stage, safe_target)`, where `safe_target` is built from
+  GLC-relative local L1/LPIPS-spatial damage, texture/edge protection, and
+  estimated rate map.
+- rate/teacher setup:
+  `lambda_R=14`, `rho_target=1.14`, `rho_target_until=12000`,
+  `rho_max=1.5`, `stage_rho_max=1.5`, `stage_scale_log_bound=0.3`
+- auxiliary residual constraints:
+  `lambda_mean_pred_safe=0.10`, `lambda_predictor_unsafe_delta=0.02`,
+  `lambda_stage_delta_abs=0.01`
+- initial A/B:
+  - q0 y delta: `-0.0037 bpp`
+  - q1 y delta: `-0.0035 bpp`
+  - q2 y delta: `-0.0032 bpp`
+  - q3 y delta: `-0.0024 bpp`
+- initial teacher stats:
+  `mixed_target mean/std = 0.602/0.303`, `rho mean/min/max = 1.152/1.051/1.224`
+
+Mid-run research summary, 2026-06-30 11:11 JST:
+
+- Main verified result in this block:
+  `stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k/v2_2000.pt`
+  is the current strongest full-benchmark checkpoint.
+- CLIC2020 combined real-codec evaluation confirmed:
+  DISTS BD-rate `-8.37%`, FID BD-rate `-5.50%`, KID BD-rate `-4.39%`,
+  matched-DISTS bpp `-7.28%` versus local GLC.
+- DIV2K validation had already shown the same trend:
+  DISTS BD-rate `-9.20%`, FID BD-rate `-5.13%`, matched-DISTS bpp `-8.03%`.
+- The fix to `scripts/evaluate_real_codec.py` is important:
+  evaluator now adopts `predictor_param_mode` from the checkpoint, preventing
+  silent fallback to `mean` mode and accidental GLC-duplicate evaluations.
+
+Branches tried in this block:
+
+1. `stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k`
+   - purpose:
+     strengthen stage-aware residual entropy modeling with a conservative scale
+     multiplier bound.
+   - result:
+     promoted as current mainline because it improves real-codec curves on
+     Kodak8, DIV2K, and CLIC2020.
+
+2. `stage_residual_entropy_quant_gate_qcond_full_from_sb03_20k`
+   - purpose:
+     unfreeze q embedding and stage quant/residual modules, add LPIPS hinge,
+     and learn q-conditioned full behavior.
+   - early result:
+     rejected after `2200` iterations because the LPIPS hinge drove `rho`
+     back toward `1.0` and erased most y-stream saving.
+   - lesson:
+     global quality protection is too blunt; it protects quality by undoing the
+     compression mechanism.
+
+3. `stage_residual_entropy_quant_gate_mixedteacher_qcond_from_sb03_20k`
+   - purpose:
+     train a safe-to-drop stage gate using local GLC-relative L1/LPIPS-spatial
+     damage, texture/edge protection, and estimated rate map.
+   - current status:
+     running. At `5000` iterations, A/B y-stream deltas remain strong:
+     q0 `-0.0025`, q1 `-0.0028`, q2 `-0.0031`, q3 `-0.0030` bpp_y.
+   - interpretation:
+     unlike the LPIPS-hinge branch, this keeps the compression mechanism alive
+     while attempting to learn where coarsening is safe.
+
+External-method references used in this block:
+
+- No new external GitHub repository was cloned or directly imported in this
+  block.
+- The design decisions are still grounded in existing methods:
+  - GLC's four-part autoregressive prior and real codec evaluation path.
+  - HiFiC/GLC natural-image FID/KID patch protocol.
+  - Hyperprior/autoregressive entropy modeling practice from learned image
+    compression.
+  - Learned bit-allocation / safe-to-drop ideas from generative/perceptual
+    compression, implemented here inside the pretrained GLC residual stream
+    rather than by changing the backbone codec.
+
+Next decision point:
+
+- Evaluate `stage_residual_entropy_quant_gate_mixedteacher_qcond_from_sb03_20k`
+  at checkpoint `v2_5000.pt` first on Kodak8 real codec.
+- Promote to DIV2K/CLIC only if it keeps or improves the current mainline
+  DISTS/FID gains without worsening LPIPS beyond the scale-bound checkpoint.
+- If it fails quality, preserve the current mainline and design a less blunt
+  teacher: either lower desired safe-map mean by q, or add a tiny counted
+  protection stream for only the unpredictable residual/control.
+
+Mixed teacher branch evaluation:
+
+- stopped after `v2_6000.pt`
+- checkpoint:
+  `experiments/stage_residual_entropy_quant_gate_mixedteacher_qcond_from_sb03_20k/v2_6000.pt`
+- real-codec output:
+  `experiments/real_codec/kodak8_stage_residual_entropy_quant_gate_mixedteacher_qcond_6000`
+- metrics:
+  - `experiments/real_codec/kodak8_stage_residual_entropy_quant_gate_mixedteacher_qcond_6000_metrics.csv`
+  - `experiments/real_codec/kodak8_stage_residual_entropy_quant_gate_mixedteacher_qcond_6000_bd.md`
+  - `experiments/real_codec/kodak8_stage_residual_entropy_quant_gate_mixedteacher_qcond_6000_matched.md`
+
+Kodak8 real-codec result versus local GLC:
+
+| run | DISTS BD-rate | LPIPS BD-rate | FID BD-rate | KID BD-rate | matched DISTS bpp |
+|---|---:|---:|---:|---:|---:|
+| residual entropy scale, bound 0.3 | -5.95% | -2.67% | -7.23% | +20.66% | -4.52% |
+| mixed safe-to-drop teacher, qcond, 6000 | -3.97% | -2.34% | -6.20% | -3.07% | -3.21% |
+
+Decision:
+
+- Do not promote this mixed-teacher checkpoint.
+- It still beats GLC, but it is weaker than the current scale-bound mainline on
+  DISTS, LPIPS, FID, and matched-DISTS bpp.
+- The result is informative: the local safe-to-drop teacher preserved the
+  y-stream saving in training logs, but did not translate into a better
+  perceptual real-codec curve.
+- This suggests that a decoder-only safe map is not enough to protect all
+  unpredictable residual regions. The next mainline attempt should use a tiny
+  counted protection/control stream, where only genuinely decoder-unpredictable
+  residual/control information is transmitted and charged to real bpp.
+
+Implementation update: entropy-scale residual gate with tiny counted control:
+
+- Added predictor mode:
+  `stage_residual_entropy_quant_gate_control`
+- Purpose:
+  combine the current strongest entropy-scale residual branch with a tiny paid
+  protection stream.
+- Mechanism:
+  - keep stage-aware residual mean prediction
+  - keep residual entropy scale multiplier
+  - keep decoder-computable stage precision gate
+  - transmit sparse binary control symbols only where the decoder-only gate
+    should be locally pulled back toward `rho=1`
+  - count the control stream in real serialized bpp
+- Smoke checks:
+  - `py_compile` passed for `gp_reslc/prior_predictor.py`,
+    `gp_reslc/real_codec.py`, `scripts/train_v2.py`,
+    `scripts/evaluate_real_codec.py`
+  - 1-iteration train smoke passed:
+    `experiments/smoke_stage_residual_entropy_quant_gate_control/v2_0.pt`
+  - real-codec smoke passed on 2 Kodak8 images:
+    `experiments/real_codec/smoke_stage_residual_entropy_quant_gate_control`
+  - observed q0 smoke:
+    `bpp=0.02346`, `y=0.01794`, `control=0.00024`, `z=0.00342`
+
+Next branch:
+
+- Start from the current scale-bound mainline.
+- First train only the tiny control encoder with the mainline frozen, so the
+  experiment tests the new paid protection stream rather than drifting the
+  whole codec.
+- If this improves LPIPS/DISTS/FID per real bpp, follow with a joint fine-tune.
+
+Tiny counted control branch started:
+
+- run:
+  `experiments/stage_residual_entropy_quant_gate_control_topk04_controlonly_from_sb03_8k`
+- W&B:
+  `stage_residual_entropy_quant_gate_control_topk04_controlonly_from_sb03_8k`
+  (`ry6ibeqy`)
+- init:
+  `experiments/stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k/v2_2000.pt`
+- mode:
+  `stage_residual_entropy_quant_gate_control`
+- trainable:
+  tiny control encoder only, `1.45 M` params
+- frozen:
+  q embedding, stage residual entropy predictor, stage quant gate, pretrained
+  GLC backbone
+- control codec:
+  fixed-prior Bernoulli arithmetic stream, counted in real bpp
+- control setting:
+  `topk_frac=0.04`, `control_prob_one=0.04`, `control_target_mean=0.04`
+- initial log:
+  - q3 batch `bpp_y=0.0320`, `bpp_control=0.00027`
+  - control symbol/prob/max: `0.0469/0.0500/0.0500`
+  - A/B y-stream deltas:
+    q0 `-0.0030`, q1 `-0.0029`, q2 `-0.0022`, q3 `-0.0016`
+
+Decision criterion:
+
+- The branch is only useful if the paid control improves perceptual quality
+  enough to offset its real bpp cost.
+- First checkpoint target: `v2_2000.pt` or `v2_4000.pt` on Kodak8 real codec.
+
+Tiny counted control branch evaluation:
+
+- stopped after `v2_2000.pt`
+- checkpoint:
+  `experiments/stage_residual_entropy_quant_gate_control_topk04_controlonly_from_sb03_8k/v2_2000.pt`
+- output:
+  `experiments/real_codec/kodak8_stage_residual_entropy_quant_gate_control_topk04_controlonly_2000`
+- metrics:
+  - `experiments/real_codec/kodak8_stage_residual_entropy_quant_gate_control_topk04_controlonly_2000_metrics.csv`
+  - `experiments/real_codec/kodak8_stage_residual_entropy_quant_gate_control_topk04_controlonly_2000_bd.md`
+  - `experiments/real_codec/kodak8_stage_residual_entropy_quant_gate_control_topk04_controlonly_2000_matched.md`
+
+Kodak8 real-codec result versus local GLC:
+
+| run | DISTS BD-rate | LPIPS BD-rate | FID BD-rate | KID BD-rate | matched DISTS bpp |
+|---|---:|---:|---:|---:|---:|
+| residual entropy scale, bound 0.3 | -5.95% | -2.67% | -7.23% | +20.66% | -4.52% |
+| tiny control topk 0.04, control-only | -2.98% | -0.70% | +1.94% | -1.26% | -1.96% |
+
+Decision:
+
+- Reject the control-only checkpoint.
+- The paid stream is correctly counted (`~0.00024 bpp`) and technically works,
+  but it does not improve the rate-perception curve enough to justify the
+  extra bpp.
+- The q0/q1 perceptual quality remains weak and FID worsens. The control
+  encoder appears to learn a sparse location map, but the current teacher/topk
+  target is not aligned well enough with actual perceptual benefit.
+- Keep the code path because it is a valid full implementation of the original
+  "send only unpredictable control" idea, but do not use it as the current lead.
+
+Current lead after this branch:
+
+- `stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k/v2_2000.pt`
+  remains the best checkpoint.
+
+Next direction:
+
+- Return to the no-side-information mainline and improve the residual entropy
+  branch itself.
+- A promising route is a q-conditioned fine-tune without global LPIPS hinge or
+  mixed teacher: keep the scale-bound entropy predictor, allow q embedding and
+  stage gate to adapt, but use a lower learning rate and real-codec checkpoint
+  validation to prevent quality collapse.
+
+### 2026-06-30 wrap-up: q-conditioned no-hinge branch
+
+Started a final no-side-information branch to test whether q-conditioned stage
+entropy/gate adaptation can improve the current lead without the two failure
+modes observed above:
+
+- no LPIPS hinge, because the hinge branch collapsed rho toward 1 and erased
+  the bpp saving
+- no mixed teacher, because the teacher branch improved over GLC but did not
+  beat the current lead on Kodak8
+- no counted control stream, because the paid control branch did not offset its
+  added bpp
+
+Run:
+
+- experiment:
+  `experiments/stage_residual_entropy_quant_gate_qcond_nohinge_from_sb03_6k`
+- W&B:
+  `stage_residual_entropy_quant_gate_qcond_nohinge_from_sb03_6k`
+  (`dj9m57f2`)
+- initialization:
+  `experiments/stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k/v2_2000.pt`
+- mode:
+  `stage_residual_entropy_quant_gate`
+- trainable:
+  q embedding, stage quant gate, stage residual entropy predictor
+- frozen:
+  pretrained GLC backbone
+- checkpoint available:
+  `v2_1000.pt`
+
+At iteration 1000, the quick A/B y-stream deltas were still negative:
+
+| q | y-stream delta |
+|---|---:|
+| q0 | -0.0029 |
+| q1 | -0.0026 |
+| q2 | -0.0020 |
+| q3 | -0.0014 |
+
+The branch was stopped at the user's requested wrap-up point after `v2_1000.pt`
+was safely written. It has not yet been promoted because real-codec evaluation
+has not been run.
+
+Current lead remains:
+
+- checkpoint:
+  `experiments/stage_residual_entropy_quant_gate_scalebound03_from_rate2000_5k/v2_2000.pt`
+- CLIC2020 combined real-codec evidence:
+  - DISTS BD-rate: `-8.37%`
+  - FID BD-rate: `-5.50%`
+  - KID BD-rate: `-4.39%`
+  - LPIPS BD-rate: `+0.68%`
+- interpretation:
+  the branch gives a real serialized bpp reduction on the main perceptual
+  metrics, but LPIPS remains weak and should not be overclaimed.
+
+Next action when resuming:
+
+1. Real-codec evaluate
+   `experiments/stage_residual_entropy_quant_gate_qcond_nohinge_from_sb03_6k/v2_1000.pt`
+   on Kodak8 first.
+2. Promote it only if it beats the current lead in DISTS/FID/KID without a
+   meaningful LPIPS regression.
+3. If it fails, keep the scale-bound checkpoint as the mainline and move to a
+   stronger but still simple residual allocation design rather than tuning
+   scalar loss weights.
+
+System state at wrap-up:
+
+- GPU visible: RTX 4070 Ti SUPER
+- GPU utilization after stop: idle
+- no long-running training/evaluation process left active

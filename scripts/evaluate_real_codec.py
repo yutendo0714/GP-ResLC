@@ -33,7 +33,14 @@ from PIL import Image
 from torchvision.transforms import ToTensor
 
 from gp_reslc.perceptual_gate import PerceptualGate
-from gp_reslc.prior_predictor import PriorPredictor, StageResidualPredictor, StageQuantGate, train_forward
+from gp_reslc.prior_predictor import (
+    PriorPredictor,
+    StageResidualEntropyPredictor,
+    StageResidualPredictor,
+    StageQuantGate,
+    StageTinyControlEncoder,
+    train_forward,
+)
 from gp_reslc.real_codec import (
     compress_to_real_bitstream,
     crop_to_original,
@@ -86,11 +93,31 @@ def build_gp_reslc(weights: str, ckpt_path: str, interpolate: bool, device: str)
     else:
         net.prior_predictor = None
     if "stage_residual_predictor" in ck:
-        net.stage_residual_predictor = StageResidualPredictor(net.N)
+        if ck.get("predictor_param_mode") in {
+            "stage_residual_entropy_quant_gate",
+            "stage_residual_entropy_quant_gate_control",
+        }:
+            net.stage_residual_predictor = StageResidualEntropyPredictor(
+                net.N, scale_log_bound=ck.get("stage_scale_log_bound", 0.7))
+        else:
+            net.stage_residual_predictor = StageResidualPredictor(net.N)
         net.stage_residual_predictor.load_state_dict(ck["stage_residual_predictor"])
     if "stage_quant_gate" in ck:
         net.stage_quant_gate = StageQuantGate(net.N, rho_max=ck.get("stage_rho_max", 1.5))
         net.stage_quant_gate.load_state_dict(ck["stage_quant_gate"])
+    if "tiny_control_encoder" in ck:
+        net.tiny_control_encoder = StageTinyControlEncoder(
+            net.N,
+            init_prob=ck.get("control_init_prob", 0.05),
+            threshold=ck.get("control_threshold", 0.5),
+            hard_mode=ck.get("control_hard_mode", "threshold"),
+            topk_frac=ck.get("control_topk_frac", 0.06),
+        )
+        net.tiny_control_encoder.load_state_dict(ck["tiny_control_encoder"])
+        net.tiny_control_prob_one = float(ck.get("control_prob_one", 0.08))
+        net.tiny_control_threshold = float(ck.get("control_threshold", 0.5))
+        net.tiny_control_hard_mode = str(ck.get("control_hard_mode", "threshold"))
+        net.tiny_control_topk_frac = float(ck.get("control_topk_frac", 0.06))
     q_embed = ck.get("q_embed")
     if ck.get("use_gate", False):
         net.perceptual_gate = PerceptualGate(
@@ -120,6 +147,7 @@ def build_gp_reslc(weights: str, ckpt_path: str, interpolate: bool, device: str)
         q_embed = expand_qembed(q_embed)
     if q_embed is not None:
         net.q_embed = q_embed.to(device)
+    net.predictor_param_mode = ck.get("predictor_param_mode", "mean")
     return net.to(device).eval()
 
 
@@ -129,7 +157,9 @@ def sync(device: str) -> None:
 
 
 def image_paths(root: str) -> list[str]:
-    paths = sorted(sum([glob.glob(os.path.join(root, ext)) for ext in EXTS], []))
+    paths = sorted(sum([
+        glob.glob(os.path.join(root, "**", ext), recursive=True) for ext in EXTS
+    ], []))
     if not paths:
         raise RuntimeError(f"no images found in {root}")
     return paths
@@ -143,7 +173,22 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--out", required=True)
     ap.add_argument("--q_indexes", type=int, nargs="+", default=[0, 1, 2, 3])
     ap.add_argument("--interpolate", action="store_true")
-    ap.add_argument("--predictor_param_mode", choices=["mean", "scale_mean", "all", "latent_residual", "stage_latent_residual", "stage_quant_gate"], default="mean")
+    ap.add_argument(
+        "--predictor_param_mode",
+        choices=[
+            "mean",
+            "scale_mean",
+            "all",
+            "latent_residual",
+            "stage_latent_residual",
+            "stage_quant_gate",
+            "stage_residual_quant_gate",
+            "stage_residual_entropy_quant_gate",
+            "stage_residual_quant_gate_control",
+            "stage_residual_entropy_quant_gate_control",
+        ],
+        default=None,
+    )
     ap.add_argument("--predictor_delta_bound", type=float, default=0.0)
     ap.add_argument("--gate_alpha", type=float, default=1.0,
                     help="Scale learned gate strength as rho = 1 + alpha * (rho - 1).")
@@ -172,6 +217,9 @@ def main() -> None:
     else:
         net = build_glc(args.glc_weights, device)
         method = "glc_real"
+    if args.predictor_param_mode is None:
+        args.predictor_param_mode = getattr(net, "predictor_param_mode", "mean")
+        print(f"[evaluate_real_codec] predictor_param_mode={args.predictor_param_mode}", flush=True)
 
     paths = image_paths(args.input)
     if args.max_images and args.max_images > 0:
@@ -216,6 +264,7 @@ def main() -> None:
         totals = {
             "bpp": 0.0,
             "bpp_y": 0.0,
+            "bpp_control": 0.0,
             "bpp_z": 0.0,
             "bpp_header": 0.0,
             "encode_time_s": 0.0,
@@ -291,6 +340,7 @@ def main() -> None:
             pixels = h * w
             bpp = len(payload) * 8.0 / pixels
             bpp_y = stats["y_bytes"] * 8.0 / pixels
+            bpp_control = stats.get("control_bytes", 0.0) * 8.0 / pixels
             bpp_z = stats["z_bytes"] * 8.0 / pixels
             bpp_header = stats["header_bytes"] * 8.0 / pixels
             enc_t = t1 - t0
@@ -299,10 +349,12 @@ def main() -> None:
             item = {
                 "bpp": bpp,
                 "bpp_y": bpp_y,
+                "bpp_control": bpp_control,
                 "bpp_z": bpp_z,
                 "bpp_header": bpp_header,
                 "payload_bytes": len(payload),
                 "y_bytes": stats["y_bytes"],
+                "control_bytes": stats.get("control_bytes", 0.0),
                 "z_bytes": stats["z_bytes"],
                 "header_bytes": stats["header_bytes"],
                 "encode_time_s": enc_t,
@@ -332,7 +384,7 @@ def main() -> None:
 
             print(
                 f"[{method} q={q} {idx + 1}/{len(paths)} {name}] "
-                f"bpp={bpp:.5f} y={bpp_y:.5f} z={bpp_z:.5f} "
+                f"bpp={bpp:.5f} y={bpp_y:.5f} c={bpp_control:.5f} z={bpp_z:.5f} "
                 f"hdr={bpp_header:.5f} enc={enc_t:.3f}s dec={dec_t:.3f}s"
                 + (f" max_abs={consistency_max_abs:.3e}" if consistency_max_abs is not None else "")
             )

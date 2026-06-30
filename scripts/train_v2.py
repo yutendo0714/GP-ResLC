@@ -45,7 +45,9 @@ from src.utils.lpips.lpips import LPIPS as RawLPIPS
 from gp_reslc.prior_predictor import (
     PriorPredictor,
     StageQuantGate,
+    StageResidualEntropyPredictor,
     StageResidualPredictor,
+    StageTinyControlEncoder,
     train_forward,
 )
 from gp_reslc.perceptual_gate import PerceptualGate
@@ -71,7 +73,9 @@ class CropFolder(Dataset):
     EXTS = ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp")
 
     def __init__(self, root, size=256):
-        self.paths = sorted(sum([glob.glob(os.path.join(root, e)) for e in self.EXTS], []))
+        self.paths = sorted(sum([
+            glob.glob(os.path.join(root, "**", e), recursive=True) for e in self.EXTS
+        ], []))
         assert self.paths, f"画像が見つかりません: {root}"
         self.size = size
         self.t = transforms.Compose([
@@ -94,14 +98,29 @@ class CropFolder(Dataset):
 
 def build_net(weights, device, use_gate, rho_max, rho_min=0.5, train_predictor=True,
               rho_mode="hard", softplus_shift=2.0, softplus_tau=1.0, rho_init=1.0,
-              use_stage_residual=False, use_stage_quant_gate=False, stage_rho_max=1.5):
+              use_stage_residual=False, use_stage_quant_gate=False, stage_rho_max=1.5,
+              use_stage_entropy=False, stage_scale_log_bound=0.7,
+              use_tiny_control=False, control_init_prob=0.05, control_prob_one=0.08,
+              control_threshold=0.5, control_hard_mode="threshold", control_topk_frac=0.06):
     net = GLC_Image(inplace=False)
     net.load_state_dict(get_state_dict(weights), strict=True)
     net.prior_predictor = PriorPredictor(net.N)
     if use_stage_residual:
-        net.stage_residual_predictor = StageResidualPredictor(net.N)
+        if use_stage_entropy:
+            net.stage_residual_predictor = StageResidualEntropyPredictor(
+                net.N, scale_log_bound=stage_scale_log_bound)
+        else:
+            net.stage_residual_predictor = StageResidualPredictor(net.N)
     if use_stage_quant_gate:
         net.stage_quant_gate = StageQuantGate(net.N, rho_max=stage_rho_max)
+    if use_tiny_control:
+        net.tiny_control_encoder = StageTinyControlEncoder(
+            net.N, num_q=NUM_Q, init_prob=control_init_prob, threshold=control_threshold,
+            hard_mode=control_hard_mode, topk_frac=control_topk_frac)
+        net.tiny_control_prob_one = float(control_prob_one)
+        net.tiny_control_threshold = float(control_threshold)
+        net.tiny_control_hard_mode = str(control_hard_mode)
+        net.tiny_control_topk_frac = float(control_topk_frac)
     net.q_embed = nn.Parameter(torch.zeros(NUM_Q, net.N, 1, 1))      # q 条件（zero-init=V1 等価）
     net.perceptual_gate = PerceptualGate(
         net.N, rho_max=rho_max, rho_min=rho_min, rho_mode=rho_mode,
@@ -113,10 +132,13 @@ def build_net(weights, device, use_gate, rho_max, rho_min=0.5, train_predictor=T
     if use_stage_residual:
         for p in net.stage_residual_predictor.parameters():
             p.requires_grad_(train_predictor)
-    elif use_stage_quant_gate:
+    if use_stage_quant_gate:
         for p in net.stage_quant_gate.parameters():
             p.requires_grad_(train_predictor)
-    else:
+    if use_tiny_control:
+        for p in net.tiny_control_encoder.parameters():
+            p.requires_grad_(train_predictor)
+    if not use_stage_residual and not use_stage_quant_gate:
         for p in net.prior_predictor.parameters():
             p.requires_grad_(train_predictor)
     net.q_embed.requires_grad_(True)
@@ -139,7 +161,7 @@ def quick_eval(net, x, qs=(0, 1, 2, 3)):
             o = train_forward(net, x, q, use_predictor=use, gate=g, q_shift=sh,
                               predictor_param_mode=getattr(net, "predictor_param_mode", "scale_mean"),
                             predictor_delta_bound=getattr(net, "predictor_delta_bound", 0.0))
-            bpp_y = o["bit_y"].item() / (B * H * W)
+            bpp_y = (o["bit_y"] + o.get("bit_control", o["bit_y"].new_tensor(0.0))).item() / (B * H * W)
             mse = torch.mean((x - o["x_hat"].clamp(-1, 1)) ** 2).item()
             res[tag] = (bpp_y, 10 * math.log10(4.0 / max(mse, 1e-10)), o["x_hat"].clamp(-1, 1))
         out[q] = res
@@ -207,6 +229,35 @@ def set_module_trainable(module, enabled: bool):
         return
     for p in module.parameters():
         p.requires_grad_(enabled)
+
+
+def load_stage_predictor_compatible(module: nn.Module, state_dict: dict):
+    """Load old mean-only stage predictors into mean+scale predictors.
+
+    For StageResidualEntropyPredictor the final conv has 2N output channels:
+    the first N are mean deltas and the second N are log-scale deltas. Old
+    checkpoints only have N channels, so copy them into the mean half and keep
+    the scale half at zero initialization.
+    """
+    try:
+        module.load_state_dict(state_dict)
+        return
+    except RuntimeError:
+        pass
+
+    current = module.state_dict()
+    patched = {k: v.clone() for k, v in current.items()}
+    for key, value in state_dict.items():
+        if key not in patched:
+            continue
+        target = patched[key]
+        if target.shape == value.shape:
+            patched[key] = value
+            continue
+        if target.ndim >= 1 and target.shape[0] == value.shape[0] * 2 and target.shape[1:] == value.shape[1:]:
+            target[:value.shape[0]].copy_(value)
+            patched[key] = target
+    module.load_state_dict(patched, strict=True)
 
 
 def make_gate_sendability_target(x, x_hat, spatial_size, desired_mean, tau=1.0, texture_weight=0.25, edge_weight=0.0):
@@ -341,6 +392,19 @@ def make_gate_mixed_sensitivity_target(x, base_x_hat, ours_x_hat, spatial_size, 
         return safe.clamp(0.05, 0.95)
 
 
+def make_control_protect_target(safe_target: torch.Tensor, control_spatial_size, desired_mean: float) -> torch.Tensor:
+    """Convert a high=safe coarsening map into a sparse high=protect control map."""
+    with torch.no_grad():
+        unsafe = 1.0 - safe_target.detach()
+        if unsafe.shape[1] != 1:
+            unsafe = unsafe.mean(dim=1, keepdim=True)
+        protect = F.interpolate(unsafe, size=control_spatial_size, mode="area")
+        dims = (2, 3)
+        desired = protect.new_tensor(float(desired_mean)).clamp(0.005, 0.35)
+        protect = protect - protect.mean(dims, keepdim=True) + desired
+        return protect.clamp(0.005, 0.95)
+
+
 class LPIPSSpatialLoss(torch.nn.Module):
     """LPIPS wrapper that keeps the spatial map for local gate teachers."""
 
@@ -423,6 +487,12 @@ def main():
     ap.add_argument("--freeze_q_embed", action="store_true", help="q条件embeddingを凍結し、gate/predictorだけを学習する")
     ap.add_argument("--freeze_gate", action="store_true",
                     help="Freeze perceptual gate parameters after loading; useful for predictor-only fine-tunes from a gate checkpoint.")
+    ap.add_argument("--freeze_stage_residual_module", action="store_true",
+                    help="Freeze StageResidualPredictor while training other modules.")
+    ap.add_argument("--freeze_stage_quant_module", action="store_true",
+                    help="Freeze StageQuantGate while training other modules.")
+    ap.add_argument("--freeze_tiny_control_module", action="store_true",
+                    help="Freeze StageTinyControlEncoder while training other modules.")
     ap.add_argument("--predictor_train_start", type=int, default=0,
                     help="Iteration at which predictor/stage-residual parameters become trainable. Use >0 for gate-first staged training.")
     ap.add_argument("--gate_train_start", type=int, default=0,
@@ -490,13 +560,44 @@ def main():
                     help="Optional per-q mixed teacher rate-potential weights. Provide 1 or 4 values.")
     ap.add_argument(
         "--predictor_param_mode",
-        choices=["mean", "scale_mean", "all", "latent_residual", "stage_latent_residual", "stage_quant_gate"],
+        choices=[
+            "mean",
+            "scale_mean",
+            "all",
+            "latent_residual",
+            "stage_latent_residual",
+            "stage_quant_gate",
+            "stage_residual_quant_gate",
+            "stage_residual_entropy_quant_gate",
+            "stage_residual_quant_gate_control",
+            "stage_residual_entropy_quant_gate_control",
+        ],
         default="scale_mean",
     )
     ap.add_argument("--predictor_delta_bound", type=float, default=0.0,
                     help="Bound predictor delta by bound*tanh(delta/bound); 0 disables")
     ap.add_argument("--stage_rho_max", type=float, default=1.5,
                     help="Maximum rho for predictor_param_mode=stage_quant_gate")
+    ap.add_argument("--stage_scale_log_bound", type=float, default=0.7,
+                    help="Bound for decoder-computable residual scale multiplier in stage_residual_entropy_quant_gate")
+    ap.add_argument("--control_init_prob", type=float, default=0.05,
+                    help="Initial probability for the tiny paid protection-control symbols")
+    ap.add_argument("--control_prob_one", type=float, default=0.08,
+                    help="Fixed Bernoulli prior P(control=1) used for control entropy cost and real codec")
+    ap.add_argument("--control_threshold", type=float, default=0.5,
+                    help="Hard threshold for turning control probabilities into transmitted binary symbols")
+    ap.add_argument("--control_hard_mode", choices=["threshold", "topk"], default="threshold",
+                    help="How control probabilities are converted into transmitted binary symbols")
+    ap.add_argument("--control_topk_frac", type=float, default=0.06,
+                    help="Fraction of z-resolution control symbols sent as 1 when --control_hard_mode topk")
+    ap.add_argument("--lambda_control_protect", type=float, default=0.0,
+                    help="BCE teacher for the tiny paid protection-control stream")
+    ap.add_argument("--lambda_control_protect_by_q", type=float, nargs="+", default=None,
+                    help="Optional per-q control protection weights. Provide 1 or 4 values.")
+    ap.add_argument("--control_target_mean", type=float, default=0.06,
+                    help="Target mean for sparse protection-control symbols")
+    ap.add_argument("--control_target_mean_by_q", type=float, nargs="+", default=None,
+                    help="Optional per-q control target means. Provide 1 or 4 values.")
     ap.add_argument("--log_every", type=int, default=100)
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--num_workers", type=int, default=8)
@@ -525,8 +626,28 @@ def main():
                    id=args.wandb_id, resume="allow" if args.resume else None)
         wandb.summary["q_choices"] = q_choices
 
-    use_stage_residual = args.predictor_param_mode == "stage_latent_residual"
-    use_stage_quant_gate = args.predictor_param_mode == "stage_quant_gate"
+    use_stage_residual = args.predictor_param_mode in {
+        "stage_latent_residual",
+        "stage_residual_quant_gate",
+        "stage_residual_entropy_quant_gate",
+        "stage_residual_quant_gate_control",
+        "stage_residual_entropy_quant_gate_control",
+    }
+    use_stage_quant_gate = args.predictor_param_mode in {
+        "stage_quant_gate",
+        "stage_residual_quant_gate",
+        "stage_residual_entropy_quant_gate",
+        "stage_residual_quant_gate_control",
+        "stage_residual_entropy_quant_gate_control",
+    }
+    use_stage_entropy = args.predictor_param_mode in {
+        "stage_residual_entropy_quant_gate",
+        "stage_residual_entropy_quant_gate_control",
+    }
+    use_tiny_control = args.predictor_param_mode in {
+        "stage_residual_quant_gate_control",
+        "stage_residual_entropy_quant_gate_control",
+    }
     net = build_net(
         args.glc_weights, device, use_gate, args.rho_max, args.gate_rho_min,
         train_predictor=not args.freeze_predictor, rho_mode=args.gate_rho_mode,
@@ -534,12 +655,28 @@ def main():
         rho_init=args.gate_rho_init,
         use_stage_residual=use_stage_residual, use_stage_quant_gate=use_stage_quant_gate,
         stage_rho_max=args.stage_rho_max,
+        use_stage_entropy=use_stage_entropy,
+        stage_scale_log_bound=args.stage_scale_log_bound,
+        use_tiny_control=use_tiny_control,
+        control_init_prob=args.control_init_prob,
+        control_prob_one=args.control_prob_one,
+        control_threshold=args.control_threshold,
+        control_hard_mode=args.control_hard_mode,
+        control_topk_frac=args.control_topk_frac,
     )
     net.predictor_param_mode = args.predictor_param_mode
     net.predictor_delta_bound = args.predictor_delta_bound
     if args.freeze_q_embed:
         net.q_embed.requires_grad_(False)
-    if use_stage_residual:
+    if use_stage_residual and use_stage_quant_gate and use_tiny_control:
+        predictor_module = nn.ModuleList([
+            net.stage_residual_predictor,
+            net.stage_quant_gate,
+            net.tiny_control_encoder,
+        ])
+    elif use_stage_residual and use_stage_quant_gate:
+        predictor_module = nn.ModuleList([net.stage_residual_predictor, net.stage_quant_gate])
+    elif use_stage_residual:
         predictor_module = net.stage_residual_predictor
     elif use_stage_quant_gate:
         predictor_module = net.stage_quant_gate
@@ -548,6 +685,12 @@ def main():
     if args.freeze_gate and net.perceptual_gate is not None:
         for p in net.perceptual_gate.parameters():
             p.requires_grad_(False)
+    if args.freeze_stage_residual_module and use_stage_residual:
+        set_module_trainable(net.stage_residual_predictor, False)
+    if args.freeze_stage_quant_module and use_stage_quant_gate:
+        set_module_trainable(net.stage_quant_gate, False)
+    if args.freeze_tiny_control_module and use_tiny_control:
+        set_module_trainable(net.tiny_control_encoder, False)
     net.train()
     if args.train_lpips_net == "alex":
         if not _LPIPS_LIB:
@@ -567,7 +710,10 @@ def main():
         for p in dists_loss.parameters():
             p.requires_grad_(False)
     lpips_spatial_loss = None
-    if args.lambda_gate_measured_sens > 0 or args.lambda_gate_mixed_sens > 0 or any_positive(args.lambda_gate_mixed_sens_by_q):
+    if (args.lambda_gate_measured_sens > 0 or args.lambda_gate_mixed_sens > 0
+            or any_positive(args.lambda_gate_mixed_sens_by_q)
+            or args.lambda_control_protect > 0
+            or any_positive(args.lambda_control_protect_by_q)):
         lpips_spatial_loss = LPIPSSpatialLoss(RawLPIPS(net="alex", spatial=True, verbose=False)).to(device).eval()
         for p in lpips_spatial_loss.parameters():
             p.requires_grad_(False)
@@ -589,9 +735,18 @@ def main():
         if "prior_predictor" in ck:
             net.prior_predictor.load_state_dict(ck["prior_predictor"])
         if use_stage_residual and "stage_residual_predictor" in ck:
-            net.stage_residual_predictor.load_state_dict(ck["stage_residual_predictor"])
+            load_stage_predictor_compatible(net.stage_residual_predictor, ck["stage_residual_predictor"])
         if use_stage_quant_gate and "stage_quant_gate" in ck:
             net.stage_quant_gate.load_state_dict(ck["stage_quant_gate"])
+        if use_tiny_control and "tiny_control_encoder" in ck:
+            net.tiny_control_encoder.load_state_dict(ck["tiny_control_encoder"])
+            net.tiny_control_prob_one = float(ck.get("control_prob_one", args.control_prob_one))
+            net.tiny_control_encoder.threshold = float(ck.get("control_threshold", args.control_threshold))
+            net.tiny_control_encoder.hard_mode = str(ck.get("control_hard_mode", args.control_hard_mode))
+            net.tiny_control_encoder.topk_frac = float(ck.get("control_topk_frac", args.control_topk_frac))
+            net.tiny_control_threshold = float(ck.get("control_threshold", args.control_threshold))
+            net.tiny_control_hard_mode = str(ck.get("control_hard_mode", args.control_hard_mode))
+            net.tiny_control_topk_frac = float(ck.get("control_topk_frac", args.control_topk_frac))
         with torch.no_grad():
             net.q_embed.copy_(ck["q_embed"].to(device))
         if use_gate and ck.get("perceptual_gate") is not None:
@@ -614,6 +769,12 @@ def main():
             q_embed_active = (not args.freeze_q_embed) and it >= args.q_embed_train_start
             set_module_trainable(predictor_module, predictor_active)
             set_module_trainable(net.perceptual_gate if use_gate else None, gate_active)
+            if args.freeze_stage_residual_module and use_stage_residual:
+                set_module_trainable(net.stage_residual_predictor, False)
+            if args.freeze_stage_quant_module and use_stage_quant_gate:
+                set_module_trainable(net.stage_quant_gate, False)
+            if args.freeze_tiny_control_module and use_tiny_control:
+                set_module_trainable(net.tiny_control_encoder, False)
             net.q_embed.requires_grad_(q_embed_active)
             lambda_R_q = q_value(args.lambda_R, args.lambda_R_by_q, q, "--lambda_R_by_q")
             lambda_d_q = q_value(args.lambda_d, args.lambda_d_by_q, q, "--lambda_d_by_q")
@@ -624,7 +785,9 @@ def main():
             lambda_mean_pred_safe_q = q_value(args.lambda_mean_pred_safe, args.lambda_mean_pred_safe_by_q, q, "--lambda_mean_pred_safe_by_q")
             lambda_rho_target_q = q_value(args.lambda_rho_target, args.lambda_rho_target_by_q, q, "--lambda_rho_target_by_q")
             lambda_gate_mixed_sens_q = q_value(args.lambda_gate_mixed_sens, args.lambda_gate_mixed_sens_by_q, q, "--lambda_gate_mixed_sens_by_q")
+            lambda_control_protect_q = q_value(args.lambda_control_protect, args.lambda_control_protect_by_q, q, "--lambda_control_protect_by_q")
             rho_target_q = q_value(args.rho_target, args.rho_target_by_q, q, "--rho_target_by_q")
+            control_target_mean_q = q_value(args.control_target_mean, args.control_target_mean_by_q, q, "--control_target_mean_by_q")
             gate_mixed_l1_q = q_value(args.gate_mixed_l1_weight, args.gate_mixed_l1_weight_by_q, q, "--gate_mixed_l1_weight_by_q")
             gate_mixed_lpips_q = q_value(args.gate_mixed_lpips_weight, args.gate_mixed_lpips_weight_by_q, q, "--gate_mixed_lpips_weight_by_q")
             gate_mixed_texture_q = q_value(args.gate_mixed_texture_weight, args.gate_mixed_texture_weight_by_q, q, "--gate_mixed_texture_weight_by_q")
@@ -637,8 +800,10 @@ def main():
                                 predictor_delta_bound=args.predictor_delta_bound)
             B, _, H, W = x.shape
             bpp_y = out["bit_y"] / (B * H * W)
+            bpp_control = out.get("bit_control", bpp_y.new_tensor(0.0)) / (B * H * W)
+            bpp_rate = bpp_y + bpp_control
             bpp_z = torch.as_tensor(out["bit_z"], device=x.device, dtype=bpp_y.dtype) / (H * W)
-            bpp_total = bpp_y + bpp_z
+            bpp_total = bpp_rate + bpp_z
             d_mse = cal_mse_Loss(x, out["x_hat"]).mean()
             d_lp = lpips_loss(out["x_hat"], x).mean()
             base_distill_active = any(v > 0 for v in (
@@ -713,7 +878,13 @@ def main():
                 gate_raw_max = gate_raw.max().item()
             else:
                 gate_raw_mean = gate_raw_min = gate_raw_max = 0.0
-            if args.lambda_align > 0:
+            if out.get("control_symbols") is not None:
+                control_mean = out["control_symbols"].detach().mean().item()
+                control_prob_mean = out["control_prob"].detach().mean().item()
+                control_prob_max = out["control_prob"].detach().max().item()
+            else:
+                control_mean = control_prob_mean = control_prob_max = 0.0
+            if args.lambda_align > 0 and out.get("mu_pred") is not None:
                 idx_gt = calculate_vqgan_results(x, net.vqgan)["idx_gt"]
                 l_align = cal_ce_Loss(net.code_pred_loss(out["mu_pred"]), idx_gt).mean()
             else:
@@ -722,7 +893,13 @@ def main():
                 with torch.no_grad():
                     base_q_enc, _, _, base_mean = net.separate_prior(out["params_base"])
                     target_y = out["y"].detach() * base_q_enc.detach()
-                if args.predictor_param_mode == "stage_latent_residual":
+                if args.predictor_param_mode in {
+                    "stage_latent_residual",
+                    "stage_residual_quant_gate",
+                    "stage_residual_entropy_quant_gate",
+                    "stage_residual_quant_gate_control",
+                    "stage_residual_entropy_quant_gate_control",
+                }:
                     l_mean_pred = stage_mean_pred_loss if stage_mean_pred_loss is not None else bpp_y.new_tensor(0.0)
                     latent_pred_abs = stage_delta_abs
                     target_residual_abs = stage_target_abs
@@ -794,6 +971,7 @@ def main():
             mixed_rate_corr = 0.0
             mixed_rate_mean = 0.0
             mixed_rate_std = 0.0
+            safe_for_control = None
             mixed_active = args.gate_mixed_sens_until <= 0 or it < args.gate_mixed_sens_until
             if lambda_gate_mixed_sens_q > 0 and mixed_active and out.get("gate_p_tex") is not None:
                 if lpips_spatial_loss is None:
@@ -820,6 +998,7 @@ def main():
                     mixed_target = mixed_target.expand_as(out["gate_p_tex"])
                 l_gate_mixed_sens = F.binary_cross_entropy(
                     out["gate_p_tex"].clamp(1e-4, 1 - 1e-4), mixed_target)
+                safe_for_control = mixed_target.detach()
                 mixed_rate_corr = spatial_corr(mixed_target, rate_map).item()
                 gate_mixed_sens_mean = mixed_target.mean().item()
                 gate_mixed_sens_std = mixed_target.std().item()
@@ -827,6 +1006,41 @@ def main():
                 l_gate_mixed_sens = bpp_y.new_tensor(0.0)
                 gate_mixed_sens_mean = 0.0
                 gate_mixed_sens_std = 0.0
+
+            if lambda_control_protect_q > 0 and out.get("control_prob") is not None:
+                if lpips_spatial_loss is None:
+                    raise RuntimeError("LPIPS spatial loss was not initialized")
+                if x_hat_base is None:
+                    with torch.no_grad():
+                        base_out = train_forward(net, x, q, use_predictor=False, gate=None, q_shift=None,
+                                                 predictor_param_mode=args.predictor_param_mode,
+                                                 predictor_delta_bound=args.predictor_delta_bound)
+                        x_hat_base = base_out["x_hat"].detach().clamp(-1, 1)
+                if safe_for_control is None:
+                    if out.get("gate_p_tex") is not None:
+                        gate_spatial_size = out["gate_p_tex"].shape[-2:]
+                    else:
+                        gate_spatial_size = out["y"].shape[-2:]
+                    rate_map = net.get_y_gaussian_bits(
+                        out["y_q"].detach(), out["scales_hat"].detach()).mean(dim=1, keepdim=True)
+                    safe_for_control = make_gate_mixed_sensitivity_target(
+                        x, x_hat_base, out["x_hat"], gate_spatial_size, 0.5, lpips_spatial_loss,
+                        l1_weight=gate_mixed_l1_q, lpips_weight=gate_mixed_lpips_q,
+                        texture_weight=gate_mixed_texture_q, edge_weight=gate_mixed_edge_q,
+                        rate_map=rate_map, rate_weight=gate_mixed_rate_q,
+                        margin=args.gate_mixed_sens_margin, tau=args.gate_mixed_sens_tau)
+                control_target = make_control_protect_target(
+                    safe_for_control, out["control_prob"].shape[-2:], control_target_mean_q)
+                if control_target.shape != out["control_prob"].shape:
+                    control_target = control_target.expand_as(out["control_prob"])
+                l_control_protect = F.binary_cross_entropy(
+                    out["control_prob"].clamp(1e-4, 1 - 1e-4), control_target)
+                control_target_mean = control_target.mean().item()
+                control_target_std = control_target.std().item()
+            else:
+                l_control_protect = bpp_y.new_tensor(0.0)
+                control_target_mean = 0.0
+                control_target_std = 0.0
             if lambda_mean_pred_safe_q > 0:
                 if lambda_gate_mixed_sens_q > 0 and mixed_active and out.get("gate_p_tex") is not None:
                     safe_weight = mixed_target.detach()
@@ -837,7 +1051,13 @@ def main():
                 with torch.no_grad():
                     base_q_enc, _, _, base_mean = net.separate_prior(out["params_base"])
                     target_y = out["y"].detach() * base_q_enc.detach()
-                if args.predictor_param_mode == "stage_latent_residual":
+                if args.predictor_param_mode in {
+                    "stage_latent_residual",
+                    "stage_residual_quant_gate",
+                    "stage_residual_entropy_quant_gate",
+                    "stage_residual_quant_gate_control",
+                    "stage_residual_entropy_quant_gate_control",
+                }:
                     l_mean_pred_safe = stage_mean_pred_loss if stage_mean_pred_loss is not None else bpp_y.new_tensor(0.0)
                 elif args.predictor_param_mode == "latent_residual" and out.get("latent_pred_scaled") is not None:
                     target_residual_pred = target_y - base_mean.detach()
@@ -857,7 +1077,7 @@ def main():
                     l_predictor_unsafe_delta = out["delta_params"].abs().mean()
             else:
                 l_predictor_unsafe_delta = bpp_y.new_tensor(0.0)
-            loss = (lambda_R_q * bpp_y + lambda_d_q * d_mse
+            loss = (lambda_R_q * bpp_rate + lambda_d_q * d_mse
                     + lambda_lpips_q * d_lp + lambda_dists_q * d_dists
                     + args.lambda_base_l1 * l_base_l1 + args.lambda_base_lpips * l_base_lpips
                     + args.lambda_dists_distill * l_base_dists
@@ -869,7 +1089,8 @@ def main():
                     + args.lambda_rho_floor * l_rho_floor
                     + lambda_rho_target_q * l_rho_target + args.lambda_gate_send * l_gate_send
                     + args.lambda_gate_measured_sens * l_gate_measured_sens
-                    + lambda_gate_mixed_sens_q * l_gate_mixed_sens)
+                    + lambda_gate_mixed_sens_q * l_gate_mixed_sens
+                    + lambda_control_protect_q * l_control_protect)
 
             opt.zero_grad()
             loss.backward()
@@ -878,7 +1099,7 @@ def main():
 
             if it % args.log_every == 0:
                 print(f"[it {it}] q={q} loss={loss.item():.4f} bpp={bpp_total.item():.4f} "
-                      f"bpp_y={bpp_y.item():.4f} psnr={psnr:.2f} "
+                      f"bpp_y={bpp_y.item():.4f} bpp_c={bpp_control.item():.5f} psnr={psnr:.2f} "
                       f"mse={d_mse.item():.4f} lpips={d_lp.item():.4f} dists={d_dists.item():.4f} ce={l_align.item():.4f} "
                       f"loss_w=R{lambda_R_q:.2f}/D{lambda_d_q:.2f}/LP{lambda_lpips_q:.2f}/DS{lambda_dists_q:.2f} "
                       f"train_on=P{int(predictor_active)}/G{int(gate_active)}/Q{int(q_embed_active)} "
@@ -893,10 +1114,14 @@ def main():
                       f"gate_send={l_gate_send.item():.4f} meas_sens={l_gate_measured_sens.item():.4f} "
                       f"mst={gate_measured_sens_mean:.3f}/{gate_measured_sens_std:.3f} "
                       f"mix_sens={l_gate_mixed_sens.item():.4f} mixt={gate_mixed_sens_mean:.3f}/{gate_mixed_sens_std:.3f} "
+                      f"ctrl_loss={l_control_protect.item():.4f} ctrlt={control_target_mean:.3f}/{control_target_std:.3f} "
                       f"rate_corr={gate_rate_corr:.3f}/{mixed_rate_corr:.3f} rate={mixed_rate_mean:.4f}/{mixed_rate_std:.4f} "
+                      f"ctrl={control_mean:.4f}/{control_prob_mean:.4f}/{control_prob_max:.4f} "
                       f"delta_abs={delta_abs:.5f}")
                 if use_wandb:
                     wandb.log({"train/loss": loss.item(), "train/bpp_y": bpp_y.item(),
+                               "train/bpp_control": bpp_control.item(),
+                               "train/bpp_rate": bpp_rate.item(),
                                "train/bpp_z": bpp_z.item(), "train/bpp_total": bpp_total.item(),
                                "train/psnr": psnr, "train/mse": d_mse.item(), "train/lpips": d_lp.item(),
                                "train/dists": d_dists.item(), "train/ce_align": l_align.item(),
@@ -909,6 +1134,7 @@ def main():
                                "train/lambda_mean_pred_safe_q": lambda_mean_pred_safe_q,
                                "train/lambda_rho_target_q": lambda_rho_target_q,
                                "train/lambda_gate_mixed_sens_q": lambda_gate_mixed_sens_q,
+                               "train/lambda_control_protect_q": lambda_control_protect_q,
                                "train/predictor_active": float(predictor_active),
                                "train/gate_active": float(gate_active),
                                "train/q_embed_active": float(q_embed_active),
@@ -932,6 +1158,9 @@ def main():
                                "train/gate_mixed_sens": l_gate_mixed_sens.item(),
                                "train/gate_mixed_sens_mean": gate_mixed_sens_mean,
                                "train/gate_mixed_sens_std": gate_mixed_sens_std,
+                               "train/control_protect": l_control_protect.item(),
+                               "control/target_mean": control_target_mean,
+                               "control/target_std": control_target_std,
                                "train/gate_rate_corr": gate_rate_corr,
                                "train/mixed_target_rate_corr": mixed_rate_corr,
                                "train/mixed_rate_map_mean": mixed_rate_mean,
@@ -941,6 +1170,9 @@ def main():
                                "gate/rho_active_frac": rho_active, "gate/raw_mean": gate_raw_mean,
                                "gate/raw_min": gate_raw_min, "gate/raw_max": gate_raw_max,
                                "gate/send_target_mean": gate_target_mean, "gate/send_target_std": gate_target_std,
+                               "control/symbol_mean": control_mean,
+                               "control/prob_mean": control_prob_mean,
+                               "control/prob_max": control_prob_max,
                                "pred/mu_mean": mu_mean, "pred/mu_std": mu_std,
                                "train/q": q}, step=it)
 
@@ -968,9 +1200,18 @@ def main():
                          "predictor_param_mode": args.predictor_param_mode}
                 if use_stage_residual:
                     state["stage_residual_predictor"] = net.stage_residual_predictor.state_dict()
+                    if use_stage_entropy:
+                        state["stage_scale_log_bound"] = args.stage_scale_log_bound
                 if use_stage_quant_gate:
                     state["stage_quant_gate"] = net.stage_quant_gate.state_dict()
                     state["stage_rho_max"] = args.stage_rho_max
+                if use_tiny_control:
+                    state["tiny_control_encoder"] = net.tiny_control_encoder.state_dict()
+                    state["control_init_prob"] = args.control_init_prob
+                    state["control_prob_one"] = args.control_prob_one
+                    state["control_threshold"] = args.control_threshold
+                    state["control_hard_mode"] = args.control_hard_mode
+                    state["control_topk_frac"] = args.control_topk_frac
                 torch.save(state, os.path.join(args.out, f"v2_{it}.pt"))
                 state_with_opt = dict(state)
                 state_with_opt["it"] = it
@@ -990,9 +1231,18 @@ def main():
              "predictor_param_mode": args.predictor_param_mode}
     if use_stage_residual:
         state["stage_residual_predictor"] = net.stage_residual_predictor.state_dict()
+        if use_stage_entropy:
+            state["stage_scale_log_bound"] = args.stage_scale_log_bound
     if use_stage_quant_gate:
         state["stage_quant_gate"] = net.stage_quant_gate.state_dict()
         state["stage_rho_max"] = args.stage_rho_max
+    if use_tiny_control:
+        state["tiny_control_encoder"] = net.tiny_control_encoder.state_dict()
+        state["control_init_prob"] = args.control_init_prob
+        state["control_prob_one"] = args.control_prob_one
+        state["control_threshold"] = args.control_threshold
+        state["control_hard_mode"] = args.control_hard_mode
+        state["control_topk_frac"] = args.control_topk_frac
     torch.save(state, os.path.join(args.out, "v2_final.pt"))
     state_with_opt = dict(state)
     state_with_opt["it"] = it

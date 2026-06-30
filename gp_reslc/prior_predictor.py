@@ -118,6 +118,52 @@ class StageResidualPredictor(nn.Module):
         return self.stages[stage_idx - 1](torch.cat((y_hat_so_far, common_params), dim=1))
 
 
+class StageResidualEntropyPredictor(nn.Module):
+    """Decoder-recomputable residual mean and scale correction per GLC stage.
+
+    This is the entropy-model extension of :class:`StageResidualPredictor`.
+    It keeps the same four-part decoding order, but predicts both
+
+        residual_mean_delta, residual_scale_multiplier
+
+    from decoder-available signals. The final convs are zero initialized, so
+    the initial state is exactly delta=0 and scale_multiplier=1.
+    """
+
+    def __init__(self, N: int = 256, scale_log_bound: float = 0.7):
+        super().__init__()
+        assert DepthConvBlock is not None, "GLC リポジトリ直下で import してください。"
+        self.N = int(N)
+        self.scale_log_bound = float(scale_log_bound)
+        self.stage0 = nn.Sequential(
+            DepthConvBlock(N, N),
+            zero_module(nn.Conv2d(N, N * 2, 1)),
+        )
+        self.stages = nn.ModuleList([
+            nn.Sequential(
+                DepthConvBlock(N * 2, N),
+                DepthConvBlock(N, N),
+                zero_module(nn.Conv2d(N, N * 2, 1)),
+            )
+            for _ in range(3)
+        ])
+
+    def _split(self, raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        delta, log_scale_raw = raw.chunk(2, dim=1)
+        bound = max(float(self.scale_log_bound), 1e-6)
+        log_scale = bound * torch.tanh(log_scale_raw / bound)
+        scale_mul = torch.exp(log_scale).clamp(0.25, 4.0)
+        return delta, scale_mul
+
+    def forward_stage(self, stage_idx: int, common_params: torch.Tensor,
+                      y_hat_so_far: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        if stage_idx == 0:
+            return self._split(self.stage0(common_params))
+        if y_hat_so_far is None:
+            raise ValueError("y_hat_so_far is required for stages 1-3")
+        return self._split(self.stages[stage_idx - 1](torch.cat((y_hat_so_far, common_params), dim=1)))
+
+
 class StageQuantGate(nn.Module):
     """Stage-aware decoder-recomputable quantization gate.
 
@@ -166,7 +212,118 @@ class StageQuantGate(nn.Module):
         return self._rho_from_raw(raw)
 
 
-def forward_four_part_prior_with_stage_quant_gate(net, y, common_params, stage_gate):
+class StageTinyControlEncoder(nn.Module):
+    """Encoder-only sparse control symbols for stage precision repair.
+
+    The decoder cannot recompute this map, so the binary symbols must be sent
+    and counted. The map is intentionally predicted at z resolution and then
+    nearest-upsampled to y resolution, keeping the payload in the
+    sub-millibpp-to-few-millibpp regime on natural images.
+
+    A symbol value of 1 means "protect this coarse region": reduce the
+    decoder-computable rho back toward 1.0. This lets the base stage gate stay
+    aggressive while a tiny paid stream fixes unpredictable unsafe regions.
+    """
+
+    def __init__(
+        self,
+        N: int = 256,
+        num_q: int = 4,
+        init_prob: float = 0.05,
+        threshold: float = 0.5,
+        hard_mode: str = "threshold",
+        topk_frac: float = 0.06,
+    ):
+        super().__init__()
+        assert DepthConvBlock is not None, "GLC リポジトリ直下で import してください。"
+        init_prob = min(max(float(init_prob), 1e-4), 1.0 - 1e-4)
+        init_logit = torch.logit(torch.tensor(init_prob)).item()
+        self.threshold = float(threshold)
+        self.hard_mode = str(hard_mode)
+        self.topk_frac = float(topk_frac)
+        self.body = nn.Sequential(
+            DepthConvBlock(N * 2, N),
+            DepthConvBlock(N, N),
+        )
+        self.to_logits = nn.Conv2d(N, 4, 1)
+        nn.init.zeros_(self.to_logits.weight)
+        nn.init.constant_(self.to_logits.bias, init_logit)
+        self.q_bias = nn.Parameter(torch.zeros(num_q, 4, 1, 1))
+
+    def forward(
+        self,
+        y: torch.Tensor,
+        common_params: torch.Tensor,
+        z_hw: tuple[int, int],
+        q_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        feat = self.body(torch.cat((y, common_params), dim=1))
+        logits_y = self.to_logits(feat)
+        logits = F.adaptive_avg_pool2d(logits_y, z_hw)
+        q_idx = max(0, min(int(q_index), self.q_bias.shape[0] - 1))
+        logits = logits + self.q_bias[q_idx:q_idx + 1]
+        prob = torch.sigmoid(logits)
+        if self.hard_mode == "topk":
+            flat = prob.flatten(1)
+            k = int(round(max(0.0, min(self.topk_frac, 1.0)) * flat.shape[1]))
+            if k <= 0:
+                hard = torch.zeros_like(prob)
+            else:
+                k = min(k, flat.shape[1])
+                idx = torch.topk(flat, k=k, dim=1).indices
+                hard_flat = torch.zeros_like(flat)
+                hard_flat.scatter_(1, idx, 1.0)
+                hard = hard_flat.reshape_as(prob)
+        elif self.hard_mode == "threshold":
+            hard = (prob > self.threshold).to(prob.dtype)
+        else:
+            raise ValueError(f"unknown tiny-control hard_mode: {self.hard_mode}")
+        symbols = prob + (hard - prob).detach()
+        return symbols, prob, logits
+
+
+def bernoulli_nll_bits(symbols: torch.Tensor, prob_one: float) -> torch.Tensor:
+    """Differentiable fixed-prior Bernoulli code length for control symbols."""
+    p1 = min(max(float(prob_one), 1e-5), 1.0 - 1e-5)
+    p0 = 1.0 - p1
+    c = symbols.clamp(0.0, 1.0)
+    return -(c * torch.log2(c.new_tensor(p1)) + (1.0 - c) * torch.log2(c.new_tensor(p0))).sum()
+
+
+def _control_stage_to_y(control_maps: torch.Tensor, stage_idx: int, h: int, w: int) -> torch.Tensor:
+    ctrl = control_maps[:, stage_idx:stage_idx + 1]
+    return F.interpolate(ctrl, size=(h, w), mode="nearest")
+
+
+def _apply_stage_q_condition(common_params: torch.Tensor, q_shift: torch.Tensor | None) -> torch.Tensor:
+    if q_shift is None:
+        return common_params
+    return common_params + q_shift.to(device=common_params.device, dtype=common_params.dtype)
+
+
+def _stage_delta_and_scales(
+    stage_predictor,
+    stage_idx: int,
+    common_params: torch.Tensor,
+    y_hat_so_far: torch.Tensor | None,
+    base_scales: torch.Tensor,
+    predictor_delta_bound: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if stage_idx == 0:
+        pred = stage_predictor.forward_stage(0, common_params)
+    else:
+        pred = stage_predictor.forward_stage(stage_idx, common_params, y_hat_so_far)
+    if isinstance(pred, tuple):
+        delta, scale_mul = pred
+        scales = (base_scales * scale_mul).clamp_min(1e-5)
+    else:
+        delta = pred
+        scales = base_scales
+    return _bound_delta(delta, predictor_delta_bound), scales
+
+
+def forward_four_part_prior_with_stage_quant_gate(net, y, common_params, stage_gate,
+                                                  q_shift: torch.Tensor | None = None):
     """GLC four-part prior with stage-aware quant_step modulation."""
     quant_step, scales, means = common_params.chunk(3, 1)
     quant_step = quant_step.clamp_min(0.5)
@@ -174,6 +331,7 @@ def forward_four_part_prior_with_stage_quant_gate(net, y, common_params, stage_g
         common_params_reduced = net.y_spatial_prior_reduction(common_params)
     else:
         common_params_reduced = common_params
+    common_params_reduced = _apply_stage_q_condition(common_params_reduced, q_shift)
 
     dtype = y.dtype
     device = y.device
@@ -223,6 +381,248 @@ def forward_four_part_prior_with_stage_quant_gate(net, y, common_params, stage_g
     return y_res, y_q, y_hat, scales_hat, rho_map, p_map
 
 
+def forward_four_part_prior_with_stage_residual_quant_gate(
+    net,
+    y,
+    common_params,
+    stage_predictor,
+    stage_gate,
+    predictor_delta_bound: float = 0.0,
+    q_shift: torch.Tensor | None = None,
+):
+    """GLC four-part prior with stage-aware residual means and quant gates.
+
+    This mode is the closest pretrained-GLC implementation of the main
+    GP-ResLC thesis so far:
+
+      y_stage = base_mean_stage + gp_mu_stage(context) + residual_stage
+
+    while the residual precision can still be reduced by a decoder-computable
+    stage gate. Both `gp_mu_stage` and `rho_stage` use only information that is
+    available at the corresponding GLC four-part decoding stage.
+    """
+    quant_step, scales, means = common_params.chunk(3, 1)
+    quant_step = quant_step.clamp_min(0.5)
+    if net.y_spatial_prior_reduction is not None:
+        common_params_reduced = net.y_spatial_prior_reduction(common_params)
+    else:
+        common_params_reduced = common_params
+    common_params_reduced = _apply_stage_q_condition(common_params_reduced, q_shift)
+
+    dtype = y.dtype
+    device = y.device
+    B, C, H, W = y.size()
+    mask_0, mask_1, mask_2, mask_3 = net.get_mask_four_parts(B, C, H, W, dtype, device)
+
+    stage_pred_losses = []
+    stage_pred_abs_vals = []
+    stage_target_abs_vals = []
+
+    def add_stage_stats(delta, target, mask):
+        active = mask > 0.5
+        delta_active = delta[active]
+        target_active = target.detach()[active]
+        stage_pred_losses.append(F.smooth_l1_loss(delta_active, target_active))
+        stage_pred_abs_vals.append(delta_active.detach().abs().mean())
+        stage_target_abs_vals.append(target_active.detach().abs().mean())
+
+    rho_0, p_0 = stage_gate.forward_stage(0, common_params_reduced)
+    q_enc_0 = 1.0 / (quant_step * rho_0)
+    y_scaled_0 = y * q_enc_0
+    q_dec_map = quant_step * rho_0 * mask_0
+    delta_0, scales_0 = _stage_delta_and_scales(
+        stage_predictor, 0, common_params_reduced, None, scales, predictor_delta_bound)
+    add_stage_stats(delta_0, y_scaled_0 - means, mask_0)
+    y_res_0, y_q_0, y_hat_0, s_hat_0 = net.process_with_mask(
+        y_scaled_0, scales_0, means + delta_0, mask_0)
+
+    y_hat_so_far = y_hat_0
+    params = torch.cat((y_hat_so_far, common_params_reduced), dim=1)
+    scales, means = net.y_spatial_prior(net.y_spatial_prior_adaptor_1(params)).chunk(2, 1)
+    rho_1, p_1 = stage_gate.forward_stage(1, common_params_reduced, y_hat_so_far)
+    q_enc_1 = 1.0 / (quant_step * rho_1)
+    y_scaled_1 = y * q_enc_1
+    q_dec_map = q_dec_map + quant_step * rho_1 * mask_1
+    delta_1, scales_1 = _stage_delta_and_scales(
+        stage_predictor, 1, common_params_reduced, y_hat_so_far, scales, predictor_delta_bound)
+    add_stage_stats(delta_1, y_scaled_1 - means, mask_1)
+    y_res_1, y_q_1, y_hat_1, s_hat_1 = net.process_with_mask(
+        y_scaled_1, scales_1, means + delta_1, mask_1)
+
+    y_hat_so_far = y_hat_so_far + y_hat_1
+    params = torch.cat((y_hat_so_far, common_params_reduced), dim=1)
+    scales, means = net.y_spatial_prior(net.y_spatial_prior_adaptor_2(params)).chunk(2, 1)
+    rho_2, p_2 = stage_gate.forward_stage(2, common_params_reduced, y_hat_so_far)
+    q_enc_2 = 1.0 / (quant_step * rho_2)
+    y_scaled_2 = y * q_enc_2
+    q_dec_map = q_dec_map + quant_step * rho_2 * mask_2
+    delta_2, scales_2 = _stage_delta_and_scales(
+        stage_predictor, 2, common_params_reduced, y_hat_so_far, scales, predictor_delta_bound)
+    add_stage_stats(delta_2, y_scaled_2 - means, mask_2)
+    y_res_2, y_q_2, y_hat_2, s_hat_2 = net.process_with_mask(
+        y_scaled_2, scales_2, means + delta_2, mask_2)
+
+    y_hat_so_far = y_hat_so_far + y_hat_2
+    params = torch.cat((y_hat_so_far, common_params_reduced), dim=1)
+    scales, means = net.y_spatial_prior(net.y_spatial_prior_adaptor_3(params)).chunk(2, 1)
+    rho_3, p_3 = stage_gate.forward_stage(3, common_params_reduced, y_hat_so_far)
+    q_enc_3 = 1.0 / (quant_step * rho_3)
+    y_scaled_3 = y * q_enc_3
+    q_dec_map = q_dec_map + quant_step * rho_3 * mask_3
+    delta_3, scales_3 = _stage_delta_and_scales(
+        stage_predictor, 3, common_params_reduced, y_hat_so_far, scales, predictor_delta_bound)
+    add_stage_stats(delta_3, y_scaled_3 - means, mask_3)
+    y_res_3, y_q_3, y_hat_3, s_hat_3 = net.process_with_mask(
+        y_scaled_3, scales_3, means + delta_3, mask_3)
+
+    y_res = (y_res_0 + y_res_1) + (y_res_2 + y_res_3)
+    y_q = (y_q_0 + y_q_1) + (y_q_2 + y_q_3)
+    y_hat = y_hat_so_far + y_hat_3
+    scales_hat = (s_hat_0 + s_hat_1) + (s_hat_2 + s_hat_3)
+    rho_map = rho_0 * mask_0 + rho_1 * mask_1 + rho_2 * mask_2 + rho_3 * mask_3
+    p_map = p_0 * mask_0 + p_1 * mask_1 + p_2 * mask_2 + p_3 * mask_3
+    y_hat = y_hat * q_dec_map
+    stage_delta_abs = torch.stack(stage_pred_abs_vals).mean()
+    stage_target_abs = torch.stack(stage_target_abs_vals).mean()
+    stage_mean_pred_loss = torch.stack(stage_pred_losses).mean()
+    return (
+        y_res,
+        y_q,
+        y_hat,
+        scales_hat,
+        rho_map,
+        p_map,
+        stage_delta_abs,
+        stage_target_abs,
+        stage_mean_pred_loss,
+    )
+
+
+def forward_four_part_prior_with_stage_residual_quant_gate_control(
+    net,
+    y,
+    common_params,
+    stage_predictor,
+    stage_gate,
+    control_maps,
+    predictor_delta_bound: float = 0.0,
+    q_shift: torch.Tensor | None = None,
+):
+    """Stage residual/quant gate with a tiny counted protection stream.
+
+    `control_maps` has shape Bx4xHzxWz. It is transmitted in the real codec.
+    At each stage, control=1 moves the effective rho toward 1.0:
+
+        rho_eff = 1 + (rho_base - 1) * (1 - control)
+
+    so the paid stream is used only to protect regions where decoder-only
+    coarsening would damage quality.
+    """
+    quant_step, scales, means = common_params.chunk(3, 1)
+    quant_step = quant_step.clamp_min(0.5)
+    if net.y_spatial_prior_reduction is not None:
+        common_params_reduced = net.y_spatial_prior_reduction(common_params)
+    else:
+        common_params_reduced = common_params
+    common_params_reduced = _apply_stage_q_condition(common_params_reduced, q_shift)
+
+    dtype = y.dtype
+    device = y.device
+    B, C, H, W = y.size()
+    mask_0, mask_1, mask_2, mask_3 = net.get_mask_four_parts(B, C, H, W, dtype, device)
+
+    stage_pred_losses = []
+    stage_pred_abs_vals = []
+    stage_target_abs_vals = []
+
+    def add_stage_stats(delta, target, mask):
+        active = mask > 0.5
+        delta_active = delta[active]
+        target_active = target.detach()[active]
+        stage_pred_losses.append(F.smooth_l1_loss(delta_active, target_active))
+        stage_pred_abs_vals.append(delta_active.detach().abs().mean())
+        stage_target_abs_vals.append(target_active.detach().abs().mean())
+
+    def protect_rho(rho, stage_idx):
+        ctrl = _control_stage_to_y(control_maps, stage_idx, H, W).to(dtype=rho.dtype, device=rho.device)
+        return 1.0 + (rho - 1.0) * (1.0 - ctrl)
+
+    rho_0, p_0 = stage_gate.forward_stage(0, common_params_reduced)
+    rho_0 = protect_rho(rho_0, 0)
+    q_enc_0 = 1.0 / (quant_step * rho_0)
+    y_scaled_0 = y * q_enc_0
+    q_dec_map = quant_step * rho_0 * mask_0
+    delta_0, scales_0 = _stage_delta_and_scales(
+        stage_predictor, 0, common_params_reduced, None, scales, predictor_delta_bound)
+    add_stage_stats(delta_0, y_scaled_0 - means, mask_0)
+    y_res_0, y_q_0, y_hat_0, s_hat_0 = net.process_with_mask(
+        y_scaled_0, scales_0, means + delta_0, mask_0)
+
+    y_hat_so_far = y_hat_0
+    params = torch.cat((y_hat_so_far, common_params_reduced), dim=1)
+    scales, means = net.y_spatial_prior(net.y_spatial_prior_adaptor_1(params)).chunk(2, 1)
+    rho_1, p_1 = stage_gate.forward_stage(1, common_params_reduced, y_hat_so_far)
+    rho_1 = protect_rho(rho_1, 1)
+    q_enc_1 = 1.0 / (quant_step * rho_1)
+    y_scaled_1 = y * q_enc_1
+    q_dec_map = q_dec_map + quant_step * rho_1 * mask_1
+    delta_1, scales_1 = _stage_delta_and_scales(
+        stage_predictor, 1, common_params_reduced, y_hat_so_far, scales, predictor_delta_bound)
+    add_stage_stats(delta_1, y_scaled_1 - means, mask_1)
+    y_res_1, y_q_1, y_hat_1, s_hat_1 = net.process_with_mask(
+        y_scaled_1, scales_1, means + delta_1, mask_1)
+
+    y_hat_so_far = y_hat_so_far + y_hat_1
+    params = torch.cat((y_hat_so_far, common_params_reduced), dim=1)
+    scales, means = net.y_spatial_prior(net.y_spatial_prior_adaptor_2(params)).chunk(2, 1)
+    rho_2, p_2 = stage_gate.forward_stage(2, common_params_reduced, y_hat_so_far)
+    rho_2 = protect_rho(rho_2, 2)
+    q_enc_2 = 1.0 / (quant_step * rho_2)
+    y_scaled_2 = y * q_enc_2
+    q_dec_map = q_dec_map + quant_step * rho_2 * mask_2
+    delta_2, scales_2 = _stage_delta_and_scales(
+        stage_predictor, 2, common_params_reduced, y_hat_so_far, scales, predictor_delta_bound)
+    add_stage_stats(delta_2, y_scaled_2 - means, mask_2)
+    y_res_2, y_q_2, y_hat_2, s_hat_2 = net.process_with_mask(
+        y_scaled_2, scales_2, means + delta_2, mask_2)
+
+    y_hat_so_far = y_hat_so_far + y_hat_2
+    params = torch.cat((y_hat_so_far, common_params_reduced), dim=1)
+    scales, means = net.y_spatial_prior(net.y_spatial_prior_adaptor_3(params)).chunk(2, 1)
+    rho_3, p_3 = stage_gate.forward_stage(3, common_params_reduced, y_hat_so_far)
+    rho_3 = protect_rho(rho_3, 3)
+    q_enc_3 = 1.0 / (quant_step * rho_3)
+    y_scaled_3 = y * q_enc_3
+    q_dec_map = q_dec_map + quant_step * rho_3 * mask_3
+    delta_3, scales_3 = _stage_delta_and_scales(
+        stage_predictor, 3, common_params_reduced, y_hat_so_far, scales, predictor_delta_bound)
+    add_stage_stats(delta_3, y_scaled_3 - means, mask_3)
+    y_res_3, y_q_3, y_hat_3, s_hat_3 = net.process_with_mask(
+        y_scaled_3, scales_3, means + delta_3, mask_3)
+
+    y_res = (y_res_0 + y_res_1) + (y_res_2 + y_res_3)
+    y_q = (y_q_0 + y_q_1) + (y_q_2 + y_q_3)
+    y_hat = y_hat_so_far + y_hat_3
+    scales_hat = (s_hat_0 + s_hat_1) + (s_hat_2 + s_hat_3)
+    rho_map = rho_0 * mask_0 + rho_1 * mask_1 + rho_2 * mask_2 + rho_3 * mask_3
+    p_map = p_0 * mask_0 + p_1 * mask_1 + p_2 * mask_2 + p_3 * mask_3
+    y_hat = y_hat * q_dec_map
+    stage_delta_abs = torch.stack(stage_pred_abs_vals).mean()
+    stage_target_abs = torch.stack(stage_target_abs_vals).mean()
+    stage_mean_pred_loss = torch.stack(stage_pred_losses).mean()
+    return (
+        y_res,
+        y_q,
+        y_hat,
+        scales_hat,
+        rho_map,
+        p_map,
+        stage_delta_abs,
+        stage_target_abs,
+        stage_mean_pred_loss,
+    )
+
+
 def _bound_delta(delta: torch.Tensor, bound: float) -> torch.Tensor:
     if bound and bound > 0:
         return bound * torch.tanh(delta / bound)
@@ -230,13 +630,15 @@ def _bound_delta(delta: torch.Tensor, bound: float) -> torch.Tensor:
 
 
 def forward_four_part_prior_with_stage_residual(net, y, common_params, stage_predictor,
-                                                predictor_delta_bound: float = 0.0):
+                                                predictor_delta_bound: float = 0.0,
+                                                q_shift: torch.Tensor | None = None):
     """GLC four-part prior with stage-aware decoder-recomputable residual means."""
     q_enc, q_dec, scales, means = net.separate_prior(common_params)
     if net.y_spatial_prior_reduction is not None:
         common_params_reduced = net.y_spatial_prior_reduction(common_params)
     else:
         common_params_reduced = common_params
+    common_params_reduced = _apply_stage_q_condition(common_params_reduced, q_shift)
 
     dtype = y.dtype
     device = y.device
@@ -469,7 +871,19 @@ def train_forward(net, x, q_index, use_predictor: bool = True, gate=None, q_shif
     stage_mean_pred_loss = None
     use_stage_residual = use_predictor and predictor_param_mode == "stage_latent_residual"
     use_stage_quant_gate = use_predictor and predictor_param_mode == "stage_quant_gate"
-    if use_predictor and not use_stage_residual and not use_stage_quant_gate:
+    use_stage_residual_quant_gate = (
+        use_predictor and predictor_param_mode == "stage_residual_quant_gate")
+    use_stage_residual_entropy_quant_gate = (
+        use_predictor and predictor_param_mode == "stage_residual_entropy_quant_gate")
+    use_stage_residual_entropy_quant_gate_control = (
+        use_predictor and predictor_param_mode == "stage_residual_entropy_quant_gate_control")
+    use_stage_residual_quant_gate_control = (
+        use_predictor and predictor_param_mode == "stage_residual_quant_gate_control")
+    if (use_predictor and not use_stage_residual and not use_stage_quant_gate
+            and not use_stage_residual_quant_gate
+            and not use_stage_residual_entropy_quant_gate
+            and not use_stage_residual_entropy_quant_gate_control
+            and not use_stage_residual_quant_gate_control):
         delta_params, mu_pred, _ = net.prior_predictor(z_cond)
         if predictor_delta_bound and predictor_delta_bound > 0:
             delta_params = predictor_delta_bound * torch.tanh(delta_params / predictor_delta_bound)
@@ -500,13 +914,37 @@ def train_forward(net, x, q_index, use_predictor: bool = True, gate=None, q_shif
         params = torch.cat((params[:, :net.N] * gate_rho, params[:, net.N:]), dim=1)
     params_after = params
 
-    if use_stage_quant_gate:
+    bit_control = y.new_tensor(0.0)
+    control_symbols = None
+    control_prob = None
+    if use_stage_residual_quant_gate_control or use_stage_residual_entropy_quant_gate_control:
+        if not hasattr(net, "tiny_control_encoder") or net.tiny_control_encoder is None:
+            raise ValueError(f"{predictor_param_mode} requires net.tiny_control_encoder")
+        if net.y_spatial_prior_reduction is not None:
+            common_for_control = net.y_spatial_prior_reduction(params)
+        else:
+            common_for_control = params
+        common_for_control = _apply_stage_q_condition(common_for_control, q_shift)
+        control_symbols, control_prob, _ = net.tiny_control_encoder(
+            y, common_for_control, (z_hat.shape[-2], z_hat.shape[-1]), int(q_index))
+        bit_control = bernoulli_nll_bits(
+            control_symbols, getattr(net, "tiny_control_prob_one", 0.08))
+        (y_res, y_q, y_hat, scales_hat, gate_rho, gate_p_tex, stage_delta_abs,
+         stage_target_abs, stage_mean_pred_loss) = forward_four_part_prior_with_stage_residual_quant_gate_control(
+            net, y, params, net.stage_residual_predictor, net.stage_quant_gate,
+            control_symbols, predictor_delta_bound, q_shift=q_shift)
+    elif use_stage_residual_quant_gate or use_stage_residual_entropy_quant_gate:
+        (y_res, y_q, y_hat, scales_hat, gate_rho, gate_p_tex, stage_delta_abs,
+         stage_target_abs, stage_mean_pred_loss) = forward_four_part_prior_with_stage_residual_quant_gate(
+            net, y, params, net.stage_residual_predictor, net.stage_quant_gate,
+            predictor_delta_bound, q_shift=q_shift)
+    elif use_stage_quant_gate:
         y_res, y_q, y_hat, scales_hat, gate_rho, gate_p_tex = forward_four_part_prior_with_stage_quant_gate(
-            net, y, params, net.stage_quant_gate)
+            net, y, params, net.stage_quant_gate, q_shift=q_shift)
     elif use_stage_residual:
         (y_res, y_q, y_hat, scales_hat, stage_delta_abs,
          stage_target_abs, stage_mean_pred_loss) = forward_four_part_prior_with_stage_residual(
-            net, y, params, net.stage_residual_predictor, predictor_delta_bound)
+            net, y, params, net.stage_residual_predictor, predictor_delta_bound, q_shift=q_shift)
     elif latent_pred_scaled is not None:
         y_res, y_q, y_hat, scales_hat = forward_four_part_prior_with_latent_mean(
             net, y, params, latent_pred_scaled)
@@ -528,6 +966,8 @@ def train_forward(net, x, q_index, use_predictor: bool = True, gate=None, q_shif
             "params_base": params_base, "params_after": params_after,
             "latent_pred_scaled": latent_pred_scaled, "latent_pred": latent_pred,
             "gate_rho": gate_rho, "gate_p_tex": gate_p_tex,
+            "control_symbols": control_symbols, "control_prob": control_prob,
+            "bit_control": bit_control,
             "stage_delta_abs": stage_delta_abs,
             "stage_target_abs": stage_target_abs,
             "stage_mean_pred_loss": stage_mean_pred_loss,
