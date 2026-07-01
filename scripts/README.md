@@ -47,6 +47,8 @@ mechanisms over rho-only sweeps. See `docs/research_priority.md`.
 
 - `analyze_gate_correlations.py`, `analyze_gate_maps.py`,
   `analyze_stage_quant_gate_sensitivity.py`: feature/gate diagnostics.
+- `run_brs_diagnostic_matrix.py`: real-codec command matrix for hard
+  residual omission and same-bpp omitted-residual synthesis diagnostics.
 - `evaluate_recon_grid.py`, `summarize_bd_from_metrics_csv.py`,
   `summarize_matched_metric.py`: metric aggregation.
 - `make_qualitative_grid.py`, `make_rho_overlay_grid.py`,

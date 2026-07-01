@@ -248,6 +248,176 @@ class StageResidualRefiner(nn.Module):
         return self._split(self.stages[stage_idx - 1](torch.cat((y_hat_so_far, common_params), dim=1)))
 
 
+class StageResidualSymbolSynthesizer(nn.Module):
+    """Decoder-side classifier for omitted quantized residual symbols.
+
+    This is a no-side-information synthesis branch.  It predicts a small
+    discrete residual symbol for each GLC four-part stage from the same
+    decoder-available context used by the spatial prior.  The intended use is
+    not to replace arithmetic coding everywhere; it fills only residual symbols
+    that the codec has deliberately omitted.
+    """
+
+    def __init__(self, N: int = 256, radius: int = 3, depth: int = 2):
+        super().__init__()
+        assert DepthConvBlock is not None, "GLC リポジトリ直下で import してください。"
+        self.N = int(N)
+        self.radius = int(radius)
+        self.num_symbols = 2 * self.radius + 1
+        depth = max(1, int(depth))
+
+        def make_body(in_ch: int) -> nn.Sequential:
+            layers = [DepthConvBlock(in_ch, N)]
+            for _ in range(depth - 1):
+                layers.append(DepthConvBlock(N, N))
+            layers.append(nn.Conv2d(N, N * self.num_symbols, 1))
+            return nn.Sequential(*layers)
+
+        self.stage0 = make_body(N)
+        self.stages = nn.ModuleList([make_body(N * 2) for _ in range(3)])
+
+    def forward_stage(self, stage_idx: int, common_params: torch.Tensor,
+                      y_hat_so_far: torch.Tensor | None = None) -> torch.Tensor:
+        if stage_idx == 0:
+            raw = self.stage0(common_params)
+        else:
+            if y_hat_so_far is None:
+                raise ValueError("y_hat_so_far is required for stages 1-3")
+            raw = self.stages[stage_idx - 1](torch.cat((y_hat_so_far, common_params), dim=1))
+        b, _, h, w = raw.shape
+        return raw.view(b, self.N, self.num_symbols, h, w)
+
+    def predict_symbols(self, stage_idx: int, common_params: torch.Tensor,
+                        y_hat_so_far: torch.Tensor | None = None) -> torch.Tensor:
+        logits = self.forward_stage(stage_idx, common_params, y_hat_so_far)
+        return logits.argmax(dim=2).to(dtype=common_params.dtype) - float(self.radius)
+
+
+class StageResidualValueSynthesizer(nn.Module):
+    """Decoder-side continuous residual synthesis for omitted symbols.
+
+    Unlike :class:`StageResidualSymbolSynthesizer`, this module is not trained
+    to classify the original quantized residual symbol.  It predicts a bounded
+    continuous residual value for positions deliberately removed from the
+    arithmetic-coded stream.  The output is decoder-computable from the same
+    context used by GLC's four-part prior, so it carries no side bits.
+    """
+
+    def __init__(self, N: int = 256, value_bound: float = 2.0, depth: int = 3):
+        super().__init__()
+        assert DepthConvBlock is not None, "GLC リポジトリ直下で import してください。"
+        self.value_bound = float(value_bound)
+        depth = max(1, int(depth))
+
+        def make_body(in_ch: int) -> nn.Sequential:
+            layers = [DepthConvBlock(in_ch, N)]
+            for _ in range(depth - 1):
+                layers.append(DepthConvBlock(N, N))
+            layers.append(zero_module(nn.Conv2d(N, N, 1)))
+            return nn.Sequential(*layers)
+
+        self.stage0 = make_body(N)
+        self.stages = nn.ModuleList([make_body(N * 2) for _ in range(3)])
+
+    def forward_stage(self, stage_idx: int, common_params: torch.Tensor,
+                      y_hat_so_far: torch.Tensor | None = None) -> torch.Tensor:
+        if stage_idx == 0:
+            raw = self.stage0(common_params)
+        else:
+            if y_hat_so_far is None:
+                raise ValueError("y_hat_so_far is required for stages 1-3")
+            raw = self.stages[stage_idx - 1](torch.cat((y_hat_so_far, common_params), dim=1))
+        bound = max(float(self.value_bound), 1e-6)
+        return bound * torch.tanh(raw / bound)
+
+    def predict_values(self, stage_idx: int, common_params: torch.Tensor,
+                       y_hat_so_far: torch.Tensor | None = None) -> torch.Tensor:
+        return self.forward_stage(stage_idx, common_params, y_hat_so_far)
+
+
+class StageResidualSelectiveValueSynthesizer(nn.Module):
+    """Decoder-side residual synthesis with a decoder-computable confidence gate.
+
+    The plain value synthesizer showed that residual synthesis can improve
+    LPIPS/PSNR/FID at no extra bitrate, but unconditional additions can disturb
+    DISTS-sensitive structure.  This module keeps the same no-side-information
+    constraint while learning a confidence map from decoder-available context:
+
+        predicted residual = value(context) * gate(context)
+
+    The gate is not transmitted.  It is recomputed by the decoder from the same
+    common parameters and four-part context used by GLC.
+    """
+
+    def __init__(
+        self,
+        N: int = 256,
+        value_bound: float = 2.0,
+        depth: int = 3,
+        gate_init_prob: float = 0.25,
+    ):
+        super().__init__()
+        assert DepthConvBlock is not None, "GLC リポジトリ直下で import してください。"
+        self.value_bound = float(value_bound)
+        gate_init_prob = min(max(float(gate_init_prob), 1e-4), 1.0 - 1e-4)
+        gate_bias = torch.logit(torch.tensor(gate_init_prob)).item()
+        depth = max(1, int(depth))
+
+        def make_body(in_ch: int) -> nn.Sequential:
+            layers = [DepthConvBlock(in_ch, N)]
+            for _ in range(depth - 1):
+                layers.append(DepthConvBlock(N, N))
+            return nn.Sequential(*layers)
+
+        self.stage0_body = make_body(N)
+        self.stage_bodies = nn.ModuleList([make_body(N * 2) for _ in range(3)])
+        self.stage0_value = zero_module(nn.Conv2d(N, N, 1))
+        self.stage_values = nn.ModuleList([zero_module(nn.Conv2d(N, N, 1)) for _ in range(3)])
+        self.stage0_gate = nn.Conv2d(N, N, 1)
+        self.stage_gates = nn.ModuleList([nn.Conv2d(N, N, 1) for _ in range(3)])
+        nn.init.zeros_(self.stage0_gate.weight)
+        nn.init.constant_(self.stage0_gate.bias, gate_bias)
+        for gate in self.stage_gates:
+            nn.init.zeros_(gate.weight)
+            nn.init.constant_(gate.bias, gate_bias)
+
+    def _features(self, stage_idx: int, common_params: torch.Tensor,
+                  y_hat_so_far: torch.Tensor | None = None) -> torch.Tensor:
+        if stage_idx == 0:
+            return self.stage0_body(common_params)
+        if y_hat_so_far is None:
+            raise ValueError("y_hat_so_far is required for stages 1-3")
+        return self.stage_bodies[stage_idx - 1](torch.cat((y_hat_so_far, common_params), dim=1))
+
+    def forward_stage(
+        self,
+        stage_idx: int,
+        common_params: torch.Tensor,
+        y_hat_so_far: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        feat = self._features(stage_idx, common_params, y_hat_so_far)
+        if stage_idx == 0:
+            raw_value = self.stage0_value(feat)
+            raw_gate = self.stage0_gate(feat)
+        else:
+            raw_value = self.stage_values[stage_idx - 1](feat)
+            raw_gate = self.stage_gates[stage_idx - 1](feat)
+        bound = max(float(self.value_bound), 1e-6)
+        value = bound * torch.tanh(raw_value / bound)
+        gate = torch.sigmoid(raw_gate)
+        return value, gate
+
+    def predict_values(self, stage_idx: int, common_params: torch.Tensor,
+                       y_hat_so_far: torch.Tensor | None = None) -> torch.Tensor:
+        value, gate = self.forward_stage(stage_idx, common_params, y_hat_so_far)
+        return value * gate
+
+    def predict_gate(self, stage_idx: int, common_params: torch.Tensor,
+                     y_hat_so_far: torch.Tensor | None = None) -> torch.Tensor:
+        _, gate = self.forward_stage(stage_idx, common_params, y_hat_so_far)
+        return gate
+
+
 class StageQuantGate(nn.Module):
     """Stage-aware decoder-recomputable quantization gate.
 

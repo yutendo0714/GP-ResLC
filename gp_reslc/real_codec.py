@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import struct
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -159,7 +160,129 @@ def _unpack_fixed_width(data: bytes, count: int, bit_width: int, device: torch.d
     return torch.tensor(vals, dtype=torch.long, device=device)
 
 
+Z_ENTROPY_MODES = {"fixed", "static", "auto"}
+Z_STATIC_PREFIX = b"ZAC0"
+Z_FIXED_PREFIX = b"ZFX0"
+_Z_PROBS_CACHE: Dict[Tuple[str, int], torch.Tensor] = {}
+
+
+def _load_z_entropy_probs(path: str, codebook_size: int) -> torch.Tensor:
+    if not path:
+        raise ValueError("z_entropy_cdf_path is required for static z entropy coding")
+    key = (str(Path(path).resolve()), int(codebook_size))
+    cached = _Z_PROBS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    obj = torch.load(path, map_location="cpu")
+    if isinstance(obj, dict):
+        probs = obj.get("probs")
+        if probs is None:
+            counts = obj.get("counts")
+            if counts is None:
+                raise ValueError(f"{path} must contain 'probs' or 'counts'")
+            probs = counts.to(dtype=torch.float64)
+            probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    else:
+        probs = obj
+    probs = torch.as_tensor(probs, dtype=torch.float64, device="cpu")
+    if probs.ndim == 1:
+        probs = probs.unsqueeze(0).repeat(4, 1)
+    if probs.ndim != 2 or probs.shape[1] != int(codebook_size):
+        raise ValueError(
+            f"invalid z entropy probs shape {tuple(probs.shape)}, expected [Q,{codebook_size}]")
+    probs = probs.clamp_min(1e-12)
+    probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    _Z_PROBS_CACHE[key] = probs.to(dtype=torch.float32)
+    return _Z_PROBS_CACHE[key]
+
+
+def _z_cdf_from_probs(probs: torch.Tensor, count: int) -> torch.Tensor:
+    probs = probs.to(device="cpu", dtype=torch.float32)
+    cdf_1d = torch.empty((probs.numel() + 1,), dtype=torch.float32)
+    cdf_1d[0] = 0.0
+    cdf_1d[1:] = torch.cumsum(probs, dim=0)
+    cdf_1d[-1] = 1.0
+    return cdf_1d.unsqueeze(0).expand(int(count), -1).contiguous()
+
+
+def _encode_z_static(values: torch.Tensor, probs: torch.Tensor) -> bytes:
+    values_cpu = values.reshape(-1).to(device="cpu", dtype=torch.int16)
+    if values_cpu.numel() == 0:
+        return Z_STATIC_PREFIX
+    if int(values_cpu.min().item()) < 0 or int(values_cpu.max().item()) >= probs.numel():
+        raise ValueError("z index outside static entropy codebook range")
+    cdf = _z_cdf_from_probs(probs, values_cpu.numel())
+    data = torchac.encode_float_cdf(cdf, values_cpu, needs_normalization=True, check_input_bounds=False)
+    return Z_STATIC_PREFIX + data
+
+
+def _decode_z_static(data: bytes, count: int, probs: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if not data.startswith(Z_STATIC_PREFIX):
+        raise ValueError("static z payload is missing ZAC0 prefix")
+    body = data[len(Z_STATIC_PREFIX):]
+    if int(count) == 0:
+        return torch.empty((0,), dtype=torch.long, device=device)
+    cdf = _z_cdf_from_probs(probs, int(count))
+    sym = torchac.decode_float_cdf(cdf, body, needs_normalization=True).to(torch.int64)
+    if sym.numel() != int(count):
+        raise ValueError(f"decoded {sym.numel()} z indices, expected {count}")
+    if int(sym.min().item()) < 0 or int(sym.max().item()) >= probs.numel():
+        raise ValueError("decoded invalid z index")
+    return sym.to(device=device, dtype=torch.long)
+
+
+def _encode_z_indices(
+    values: torch.Tensor,
+    codebook_size: int,
+    mode: str,
+    q: int,
+    cdf_path: Optional[str],
+) -> bytes:
+    if mode not in Z_ENTROPY_MODES:
+        raise ValueError(f"unknown z_entropy_mode: {mode}")
+    z_bits = int(math.ceil(math.log2(codebook_size)))
+    fixed = _pack_fixed_width(values, z_bits)
+    if mode == "fixed":
+        return fixed
+    probs = _load_z_entropy_probs(str(cdf_path or ""), codebook_size)
+    q_idx = min(max(int(q), 0), probs.shape[0] - 1)
+    static = _encode_z_static(values, probs[q_idx])
+    if mode == "static":
+        return static
+    fixed_tagged = Z_FIXED_PREFIX + fixed
+    return static if len(static) < len(fixed_tagged) else fixed_tagged
+
+
+def _decode_z_indices(
+    data: bytes,
+    count: int,
+    codebook_size: int,
+    q: int,
+    device: torch.device,
+    mode: str,
+    cdf_path: Optional[str],
+) -> torch.Tensor:
+    z_bits = int(math.ceil(math.log2(codebook_size)))
+    if data.startswith(Z_STATIC_PREFIX):
+        probs = _load_z_entropy_probs(str(cdf_path or ""), codebook_size)
+        q_idx = min(max(int(q), 0), probs.shape[0] - 1)
+        return _decode_z_static(data, count, probs[q_idx], device)
+    if data.startswith(Z_FIXED_PREFIX):
+        return _unpack_fixed_width(data[len(Z_FIXED_PREFIX):], count, z_bits, device=device)
+    if mode in {"fixed", "auto"}:
+        return _unpack_fixed_width(data, count, z_bits, device=device)
+    raise ValueError("static z entropy mode requested, but payload has no static z prefix")
+
+
 ENTROPY_FAMILIES = {"gaussian", "laplace", "logistic"}
+OMITTED_RESIDUAL_MODES = {
+    "zero",
+    "hash_gaussian",
+    "hash_gaussian_clipped",
+    "hash_rademacher",
+    "learned_symbol",
+    "learned_value",
+}
 
 
 def _normal_cdf(x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
@@ -322,6 +445,23 @@ def _decode_control_streams(
     z_h, z_w = z_shape
     vals = _decode_bernoulli_symbols(streams[0], 4 * z_h * z_w, prob_one, device)
     return vals.reshape(1, 4, z_h, z_w)
+
+
+def _encode_stage3_send_stream(send_map: torch.Tensor, prob_one: float) -> ArithmeticStream:
+    if send_map.shape[0] != 1 or send_map.shape[1] != 1:
+        raise ValueError(f"stage3 send map must be 1x1xHzxWz, got {tuple(send_map.shape)}")
+    return _encode_bernoulli_symbols((send_map.detach() > 0.5).to(torch.int16), prob_one)
+
+
+def _decode_stage3_send_stream(
+    stream: ArithmeticStream,
+    z_shape: Tuple[int, int],
+    prob_one: float,
+    device: torch.device,
+) -> torch.Tensor:
+    z_h, z_w = z_shape
+    vals = _decode_bernoulli_symbols(stream, int(z_h) * int(z_w), prob_one, device)
+    return vals.reshape(1, 1, int(z_h), int(z_w))
 
 
 def _ternary_cdf(num: int, prob_nonzero: float, device: torch.device | str = "cpu") -> torch.Tensor:
@@ -489,6 +629,7 @@ def _apply_gp_reslc_params(
         "stage_residual_entropy_quant_gate_control",
         "stage_residual_entropy_quant_gate_residual_control",
         "stage_residual_entropy_quant_gate_latent_control",
+        "stage_residual_entropy_quant_gate_stage3_send_control",
     }
     if not uses_stage_mode:
         if not hasattr(net, "prior_predictor") or net.prior_predictor is None:
@@ -577,6 +718,152 @@ def _stage_delta_and_scales(
     return _bound_delta(delta, predictor_delta_bound), scales
 
 
+def _normalize_stage_set(stages: Optional[Sequence[int]]) -> set[int]:
+    if stages is None:
+        return set()
+    out = {int(s) for s in stages}
+    invalid = sorted(s for s in out if s < 0 or s > 3)
+    if invalid:
+        raise ValueError(f"suppress_yq_stages must be in 0..3, got {invalid}")
+    return out
+
+
+def _deterministic_noise_like(ref: torch.Tensor, stage_idx: int, q: int) -> torch.Tensor:
+    """Return decoder-computable pseudo-noise with no transmitted seed.
+
+    This is for diagnostics, not a trained synthesis model.  It depends only on
+    tensor coordinates, q, and stage index, so encoder and decoder generate the
+    same values without side information.
+    """
+    flat = torch.arange(ref.numel(), device=ref.device, dtype=torch.float32).reshape(ref.shape)
+    seed = float((int(stage_idx) + 1) * 1009 + (int(q) + 1) * 9176)
+    raw = torch.sin(flat * 12.9898 + seed) * 43758.5453
+    u = raw - torch.floor(raw)
+    return (2.0 * u - 1.0).to(dtype=ref.dtype)
+
+
+def _omitted_residual_values(
+    scales: torch.Tensor,
+    mask: torch.Tensor,
+    stage_idx: int,
+    q: int,
+    mode: str,
+    amplitude: float,
+    clip: float,
+) -> torch.Tensor:
+    if mode not in OMITTED_RESIDUAL_MODES:
+        raise ValueError(f"unknown omitted residual mode: {mode}")
+    if mode in {"learned_symbol", "learned_value"}:
+        raise ValueError(f"{mode} requires decoder context; call _learned_or_omitted_residual_values")
+    if mode == "zero" or float(amplitude) == 0.0:
+        return torch.zeros_like(scales) * mask
+    eps = _deterministic_noise_like(scales, stage_idx, q)
+    if mode in {"hash_gaussian", "hash_gaussian_clipped"}:
+        # Convert deterministic uniform-like values to an approximately normal
+        # signal.  Clamp before erfinv to avoid infinities.
+        eps = eps.clamp(-0.999, 0.999)
+        eps = torch.erfinv(eps) * math.sqrt(2.0)
+        if mode == "hash_gaussian_clipped":
+            eps = eps.clamp(-abs(float(clip)), abs(float(clip)))
+    elif mode == "hash_rademacher":
+        eps = torch.where(eps >= 0, torch.ones_like(eps), -torch.ones_like(eps))
+    return float(amplitude) * scales.to(dtype=eps.dtype) * eps * mask
+
+
+def _learned_or_omitted_residual_values(
+    net,
+    common_params: torch.Tensor,
+    y_hat_so_far: Optional[torch.Tensor],
+    scales: torch.Tensor,
+    mask: torch.Tensor,
+    stage_idx: int,
+    q: int,
+    mode: str,
+    amplitude: float,
+    clip: float,
+) -> torch.Tensor:
+    if mode == "learned_symbol":
+        synth = getattr(net, "stage_residual_symbol_synthesizer", None)
+        if synth is None:
+            raise ValueError("omitted_residual_mode=learned_symbol requires net.stage_residual_symbol_synthesizer")
+        return synth.predict_symbols(stage_idx, common_params, y_hat_so_far).to(dtype=scales.dtype) * mask
+    if mode == "learned_value":
+        synth = getattr(net, "stage_residual_value_synthesizer", None)
+        if synth is None:
+            raise ValueError("omitted_residual_mode=learned_value requires net.stage_residual_value_synthesizer")
+        return synth.predict_values(stage_idx, common_params, y_hat_so_far).to(dtype=scales.dtype) * mask
+    return _omitted_residual_values(scales, mask, stage_idx, q, mode, amplitude, clip)
+
+
+def _learned_value_addition(
+    net,
+    common_params: torch.Tensor,
+    y_hat_so_far: Optional[torch.Tensor],
+    mask: torch.Tensor,
+    stage_idx: int,
+    value_scale: float,
+) -> torch.Tensor:
+    if stage_idx != 3:
+        raise ValueError("decoder-side value addition is currently restricted to stage 3")
+    synth = getattr(net, "stage_residual_value_synthesizer", None)
+    if synth is None:
+        raise ValueError("synth value addition requires net.stage_residual_value_synthesizer")
+    return float(value_scale) * synth.predict_values(stage_idx, common_params, y_hat_so_far).to(dtype=mask.dtype) * mask
+
+
+def _append_stage_stream_or_omit(
+    streams: List[ArithmeticStream],
+    y_q: torch.Tensor,
+    scales: torch.Tensor,
+    mask: torch.Tensor,
+    part_idx: int,
+    suppressed_stages: set[int],
+    entropy_family: str,
+    entropy_scale_factor: float,
+) -> None:
+    if part_idx in suppressed_stages:
+        streams.append(ArithmeticStream(lo=0, hi=-1, data=b""))
+        return
+    active = mask > 0.5
+    streams.append(_encode_continuous_symbols(
+        y_q[active], scales[active].clamp_min(1e-5),
+        family=entropy_family, scale_factor=entropy_scale_factor))
+
+
+def _stage_suppression_mask(
+    mask: torch.Tensor,
+    rho: Optional[torch.Tensor],
+    part_idx: int,
+    suppressed_stages: set[int],
+    rho_threshold: float,
+) -> torch.Tensor:
+    active = mask > 0.5
+    if float(rho_threshold) > 0.0:
+        if suppressed_stages and part_idx not in suppressed_stages:
+            return torch.zeros_like(mask, dtype=torch.bool)
+        if rho is None:
+            raise ValueError("rho_threshold suppression requires a stage rho map")
+        return active & (rho >= float(rho_threshold))
+    if part_idx in suppressed_stages:
+        return active
+    return torch.zeros_like(mask, dtype=torch.bool)
+
+
+def _append_symbols_with_suppression(
+    streams: List[ArithmeticStream],
+    y_q: torch.Tensor,
+    scales: torch.Tensor,
+    mask: torch.Tensor,
+    suppress_mask: torch.Tensor,
+    entropy_family: str,
+    entropy_scale_factor: float,
+) -> None:
+    active = (mask > 0.5) & (~suppress_mask)
+    streams.append(_encode_continuous_symbols(
+        y_q[active], scales[active].clamp_min(1e-5),
+        family=entropy_family, scale_factor=entropy_scale_factor))
+
+
 def _encode_y_four_part(
     net,
     y: torch.Tensor,
@@ -584,6 +871,11 @@ def _encode_y_four_part(
     latent_mean_scaled: Optional[torch.Tensor] = None,
     entropy_family: str = "gaussian",
     entropy_scale_factor: float = 1.0,
+    suppress_yq_stages: Optional[Sequence[int]] = None,
+    omitted_residual_mode: str = "zero",
+    omitted_residual_scale: float = 0.0,
+    omitted_residual_clip: float = 2.0,
+    q: int = 0,
 ):
     q_enc, q_dec, scales, means = net.separate_prior(params)
     common_params = net.y_spatial_prior_reduction(params)
@@ -594,6 +886,7 @@ def _encode_y_four_part(
     y_scaled = y * q_enc
     y_hat_so_far = None
     streams: List[ArithmeticStream] = []
+    suppressed_stages = _normalize_stage_set(suppress_yq_stages)
 
     for part_idx, mask in enumerate(masks):
         if part_idx == 0:
@@ -613,12 +906,15 @@ def _encode_y_four_part(
             cur_means_total = cur_means + latent_mean_scaled
         means_hat = cur_means_total * mask
         y_res = (y_scaled - means_hat) * mask
-        y_q = torch.round(y_res)
-        active = mask > 0.5
-        stream = _encode_continuous_symbols(
-            y_q[active], cur_scales[active].clamp_min(1e-5),
-            family=entropy_family, scale_factor=entropy_scale_factor)
-        streams.append(stream)
+        if part_idx in suppressed_stages:
+            y_q = _learned_or_omitted_residual_values(
+                net, common_params, y_hat_so_far, cur_scales, mask, part_idx, q,
+                omitted_residual_mode, omitted_residual_scale, omitted_residual_clip)
+        else:
+            y_q = torch.round(y_res)
+        _append_stage_stream_or_omit(
+            streams, y_q, cur_scales, mask, part_idx, suppressed_stages,
+            entropy_family, entropy_scale_factor)
 
         y_hat_part = y_q + means_hat
         y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
@@ -631,7 +927,12 @@ def _encode_y_four_part_stage_residual(net, y: torch.Tensor, params: torch.Tenso
                                       predictor_delta_bound: float = 0.0,
                                       q_shift: Optional[torch.Tensor] = None,
                                       entropy_family: str = "gaussian",
-                                      entropy_scale_factor: float = 1.0):
+                                      entropy_scale_factor: float = 1.0,
+                                      suppress_yq_stages: Optional[Sequence[int]] = None,
+                                      omitted_residual_mode: str = "zero",
+                                      omitted_residual_scale: float = 0.0,
+                                      omitted_residual_clip: float = 2.0,
+                                      q: int = 0):
     q_enc, q_dec, scales, means = net.separate_prior(params)
     common_params = _apply_stage_q_condition(net.y_spatial_prior_reduction(params), q_shift)
     dtype = y.dtype
@@ -641,6 +942,7 @@ def _encode_y_four_part_stage_residual(net, y: torch.Tensor, params: torch.Tenso
     y_scaled = y * q_enc
     y_hat_so_far = None
     streams: List[ArithmeticStream] = []
+    suppressed_stages = _normalize_stage_set(suppress_yq_stages)
 
     for part_idx, mask in enumerate(masks):
         if part_idx == 0:
@@ -660,11 +962,15 @@ def _encode_y_four_part_stage_residual(net, y: torch.Tensor, params: torch.Tenso
 
         means_hat = (cur_means + delta) * mask
         y_res = (y_scaled - means_hat) * mask
-        y_q = torch.round(y_res)
-        active = mask > 0.5
-        streams.append(_encode_continuous_symbols(
-            y_q[active], cur_scales[active].clamp_min(1e-5),
-            family=entropy_family, scale_factor=entropy_scale_factor))
+        if part_idx in suppressed_stages:
+            y_q = _learned_or_omitted_residual_values(
+                net, common_params, y_hat_so_far, cur_scales, mask, part_idx, q,
+                omitted_residual_mode, omitted_residual_scale, omitted_residual_clip)
+        else:
+            y_q = torch.round(y_res)
+        _append_stage_stream_or_omit(
+            streams, y_q, cur_scales, mask, part_idx, suppressed_stages,
+            entropy_family, entropy_scale_factor)
         y_hat_part = y_q + means_hat
         y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
 
@@ -678,6 +984,15 @@ def _encode_y_four_part_stage_quant_gate(
     q_shift: Optional[torch.Tensor] = None,
     entropy_family: str = "gaussian",
     entropy_scale_factor: float = 1.0,
+    suppress_yq_stages: Optional[Sequence[int]] = None,
+    omitted_residual_mode: str = "zero",
+    omitted_residual_scale: float = 0.0,
+    omitted_residual_clip: float = 2.0,
+    suppress_rho_threshold: float = 0.0,
+    synth_yq_stages: Optional[Sequence[int]] = None,
+    synth_rho_threshold: float = 0.0,
+    synth_value_scale: float = 1.0,
+    q: int = 0,
 ):
     quant_step, scales, means = params.chunk(3, 1)
     quant_step = quant_step.clamp_min(0.5)
@@ -689,6 +1004,8 @@ def _encode_y_four_part_stage_quant_gate(
     y_hat_so_far = None
     q_dec_map = torch.zeros_like(quant_step)
     streams: List[ArithmeticStream] = []
+    suppressed_stages = _normalize_stage_set(suppress_yq_stages)
+    synth_stages = _normalize_stage_set(synth_yq_stages)
 
     for part_idx, mask in enumerate(masks):
         if part_idx == 0:
@@ -708,12 +1025,25 @@ def _encode_y_four_part_stage_quant_gate(
         q_dec_map = q_dec_map + quant_step * rho * mask
         means_hat = cur_means * mask
         y_res = (y * q_enc - means_hat) * mask
+        suppress_mask = _stage_suppression_mask(
+            mask, rho, part_idx, suppressed_stages, suppress_rho_threshold)
         y_q = torch.round(y_res)
-        active = mask > 0.5
-        streams.append(_encode_continuous_symbols(
-            y_q[active], cur_scales[active].clamp_min(1e-5),
-            family=entropy_family, scale_factor=entropy_scale_factor))
-        y_hat_part = y_q + means_hat
+        if suppress_mask.any():
+            omitted = _learned_or_omitted_residual_values(
+                net, common_params, y_hat_so_far, cur_scales, suppress_mask.to(dtype=mask.dtype),
+                part_idx, q, omitted_residual_mode, omitted_residual_scale, omitted_residual_clip)
+            y_q = torch.where(suppress_mask, omitted.to(dtype=y_q.dtype), y_q)
+        _append_symbols_with_suppression(
+            streams, y_q, cur_scales, mask, suppress_mask,
+            entropy_family, entropy_scale_factor)
+        synth_mask = _stage_suppression_mask(
+            mask, rho, part_idx, synth_stages, synth_rho_threshold)
+        synth_add = 0.0
+        if synth_mask.any():
+            synth_add = _learned_value_addition(
+                net, common_params, y_hat_so_far, synth_mask.to(dtype=mask.dtype),
+                part_idx, float(synth_value_scale))
+        y_hat_part = y_q + means_hat + synth_add
         y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
 
     return streams, y_hat_so_far * q_dec_map
@@ -888,6 +1218,217 @@ def _make_signed_latent_control_maps(
     return control_maps
 
 
+def _make_rdo_protection_control_maps(
+    net,
+    y: torch.Tensor,
+    params: torch.Tensor,
+    z_shape: Tuple[int, int],
+    predictor_delta_bound: float,
+    q_shift: Optional[torch.Tensor],
+    topk_frac: float,
+) -> torch.Tensor:
+    """Build encoder-side protection tokens from local residual RDO benefit.
+
+    The binary token means "protect this stage/cell from decoder-only
+    coarsening".  It is not decoder-computable, so it must be entropy-coded and
+    counted.  Scores compare the local latent error under the current rho
+    against the error when rho is forced back to 1.0, using only the source-side
+    latent and the same four-part context order used by the codec.
+    """
+    frac = float(topk_frac)
+    quant_step, scales, means = params.chunk(3, 1)
+    quant_step = quant_step.clamp_min(0.5)
+    common_params = _apply_stage_q_condition(net.y_spatial_prior_reduction(params), q_shift)
+    dtype = y.dtype
+    device = y.device
+    b, c, h, w = y.size()
+    if b != 1:
+        raise ValueError("real codec currently expects batch size 1")
+    masks = net.get_mask_four_parts(b, c, h, w, dtype, device)
+    control_maps = torch.zeros((1, 4, int(z_shape[0]), int(z_shape[1])), dtype=dtype, device=device)
+    y_hat_so_far = None
+
+    for part_idx, mask in enumerate(masks):
+        if part_idx == 0:
+            cur_scales, cur_means = scales, means
+            rho, _ = net.stage_quant_gate.forward_stage(0, common_params)
+            delta, cur_scales = _stage_delta_and_scales(
+                net.stage_residual_predictor, 0, common_params, None, cur_scales,
+                predictor_delta_bound, getattr(net, "stage_scale_calibrator", None),
+                getattr(net, "stage_residual_refiner", None))
+        else:
+            prior_in = torch.cat((y_hat_so_far, common_params), dim=1)
+            adaptor = (
+                net.y_spatial_prior_adaptor_1 if part_idx == 1
+                else net.y_spatial_prior_adaptor_2 if part_idx == 2
+                else net.y_spatial_prior_adaptor_3
+            )
+            cur_scales, cur_means = net.y_spatial_prior(adaptor(prior_in)).chunk(2, 1)
+            rho, _ = net.stage_quant_gate.forward_stage(part_idx, common_params, y_hat_so_far)
+            delta, cur_scales = _stage_delta_and_scales(
+                net.stage_residual_predictor, part_idx, common_params, y_hat_so_far,
+                cur_scales, predictor_delta_bound, getattr(net, "stage_scale_calibrator", None),
+                getattr(net, "stage_residual_refiner", None))
+
+        means_hat = (cur_means + delta) * mask
+        q_enc_base = 1.0 / (quant_step * rho)
+        q_enc_protect = 1.0 / quant_step
+        y_res_base = (y * q_enc_base - means_hat) * mask
+        y_res_protect = (y * q_enc_protect - means_hat) * mask
+        y_q_base = torch.round(y_res_base)
+        y_q_protect = torch.round(y_res_protect)
+        rec_base = (y_q_base + means_hat) * (quant_step * rho) * mask
+        rec_protect = (y_q_protect + means_hat) * quant_step * mask
+        benefit = ((rec_base - y).square() - (rec_protect - y).square()).clamp_min(0.0) * mask
+        benefit = benefit.mean(dim=1, keepdim=True)
+        pooled = F.adaptive_avg_pool2d(benefit, z_shape)
+        symbols = torch.zeros_like(pooled)
+        if frac > 0.0 and float(pooled.max().item()) > 0.0:
+            flat = pooled.flatten(1)
+            k = int(round(max(0.0, min(frac, 1.0)) * flat.shape[1]))
+            if k > 0:
+                k = min(k, flat.shape[1])
+                idx = torch.topk(flat, k=k, dim=1).indices
+                hard = torch.zeros_like(flat)
+                hard.scatter_(1, idx, 1.0)
+                symbols = hard.reshape_as(pooled)
+        control_maps[:, part_idx:part_idx + 1] = symbols
+
+        ctrl_y = F.interpolate(symbols, size=(h, w), mode="nearest").to(dtype=dtype)
+        rho_eff = 1.0 + (rho - 1.0) * (1.0 - ctrl_y)
+        y_res = (y / (quant_step * rho_eff) - means_hat) * mask
+        y_q = torch.round(y_res)
+        y_hat_part = y_q + means_hat
+        y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
+
+    return control_maps
+
+
+def _make_stage3_send_control_map(
+    net,
+    x_padded: torch.Tensor,
+    y: torch.Tensor,
+    params: torch.Tensor,
+    z_shape: Tuple[int, int],
+    predictor_delta_bound: float,
+    q_shift: Optional[torch.Tensor],
+    send_frac: float,
+    score_mode: str = "latent_mse",
+    grad_max_side: int = 256,
+) -> torch.Tensor:
+    """Select stage-3 residual cells to transmit under a counted send mask."""
+    frac = float(send_frac)
+    score_mode = str(score_mode)
+    quant_step, scales, means = params.chunk(3, 1)
+    quant_step = quant_step.clamp_min(0.5)
+    common_params = _apply_stage_q_condition(net.y_spatial_prior_reduction(params), q_shift)
+    dtype = y.dtype
+    device = y.device
+    b, c, h, w = y.size()
+    if b != 1:
+        raise ValueError("real codec currently expects batch size 1")
+    masks = net.get_mask_four_parts(b, c, h, w, dtype, device)
+    y_hat_so_far = None
+    q_dec_map_so_far = torch.zeros_like(quant_step)
+
+    for part_idx, mask in enumerate(masks):
+        if part_idx == 0:
+            cur_scales, cur_means = scales, means
+            rho, _ = net.stage_quant_gate.forward_stage(0, common_params)
+            delta, cur_scales = _stage_delta_and_scales(
+                net.stage_residual_predictor, 0, common_params, None, cur_scales,
+                predictor_delta_bound, getattr(net, "stage_scale_calibrator", None),
+                getattr(net, "stage_residual_refiner", None))
+        else:
+            prior_in = torch.cat((y_hat_so_far, common_params), dim=1)
+            adaptor = (
+                net.y_spatial_prior_adaptor_1 if part_idx == 1
+                else net.y_spatial_prior_adaptor_2 if part_idx == 2
+                else net.y_spatial_prior_adaptor_3
+            )
+            cur_scales, cur_means = net.y_spatial_prior(adaptor(prior_in)).chunk(2, 1)
+            rho, _ = net.stage_quant_gate.forward_stage(part_idx, common_params, y_hat_so_far)
+            delta, cur_scales = _stage_delta_and_scales(
+                net.stage_residual_predictor, part_idx, common_params, y_hat_so_far,
+                cur_scales, predictor_delta_bound, getattr(net, "stage_scale_calibrator", None),
+                getattr(net, "stage_residual_refiner", None))
+
+        q_dec = quant_step * rho
+        means_hat = (cur_means + delta) * mask
+        y_res = (y / q_dec - means_hat) * mask
+        y_q = torch.round(y_res)
+
+        if part_idx == 3:
+            if score_mode == "latent_mse":
+                rec_send = (y_q + means_hat) * q_dec * mask
+                rec_drop = means_hat * q_dec * mask
+                benefit = ((rec_drop - y).square() - (rec_send - y).square()).clamp_min(0.0) * mask
+                benefit = benefit.mean(dim=1, keepdim=True)
+                pooled = F.adaptive_avg_pool2d(benefit, z_shape)
+            elif score_mode in {"image_mse_grad", "image_l1_grad", "image_mse_grad_abs"}:
+                # Encoder-side teacher: rank residual symbols by first-order
+                # image-loss change from the omitted-residual baseline.  The
+                # selected binary mask is transmitted, so using source pixels
+                # at encode time does not introduce hidden side information.
+                q_dec_map = q_dec_map_so_far + q_dec * mask
+                y_prefix = torch.zeros_like(y) if y_hat_so_far is None else y_hat_so_far.detach()
+                y_q_candidate = y_q.detach()
+                means_stage = means_hat.detach()
+                mask_stage = mask.detach()
+                x_ref = x_padded.detach()
+                with torch.enable_grad():
+                    probe = torch.zeros_like(y_q_candidate, requires_grad=True)
+                    y_hat_stage = probe * mask_stage + means_stage
+                    latent = (y_prefix + y_hat_stage) * q_dec_map.detach()
+                    x_hat = net.vqgan.generator(latent)
+                    max_side = int(grad_max_side)
+                    if max_side > 0:
+                        _, _, hh, ww = x_hat.shape
+                        side = max(hh, ww)
+                        if side > max_side:
+                            scale = float(max_side) / float(side)
+                            out_hw = (max(1, int(round(hh * scale))), max(1, int(round(ww * scale))))
+                            x_hat_loss = F.interpolate(x_hat, size=out_hw, mode="bilinear", align_corners=False)
+                            x_ref_loss = F.interpolate(x_ref, size=out_hw, mode="bilinear", align_corners=False)
+                        else:
+                            x_hat_loss = x_hat
+                            x_ref_loss = x_ref
+                    else:
+                        x_hat_loss = x_hat
+                        x_ref_loss = x_ref
+                    if score_mode == "image_l1_grad":
+                        loss = F.l1_loss(x_hat_loss, x_ref_loss)
+                    else:
+                        loss = F.mse_loss(x_hat_loss, x_ref_loss)
+                    grad = torch.autograd.grad(loss, probe, retain_graph=False, create_graph=False)[0]
+                first_order_delta = grad.detach() * y_q_candidate
+                if score_mode == "image_mse_grad_abs":
+                    benefit = first_order_delta.abs() * mask_stage
+                else:
+                    benefit = (-first_order_delta).clamp_min(0.0) * mask_stage
+                benefit = benefit.mean(dim=1, keepdim=True)
+                pooled = F.adaptive_avg_pool2d(benefit, z_shape)
+            else:
+                raise ValueError(f"unknown stage3 send score mode: {score_mode}")
+            send_map = torch.zeros_like(pooled)
+            if frac > 0.0 and float(pooled.max().item()) > 0.0:
+                flat = pooled.flatten(1)
+                k = int(round(max(0.0, min(frac, 1.0)) * flat.shape[1]))
+                if k > 0:
+                    k = min(k, flat.shape[1])
+                    idx = torch.topk(flat, k=k, dim=1).indices
+                    hard = torch.zeros_like(flat)
+                    hard.scatter_(1, idx, 1.0)
+                    send_map = hard.reshape_as(pooled)
+            return send_map.to(dtype=dtype)
+
+        y_hat_part = y_q + means_hat
+        y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
+        q_dec_map_so_far = q_dec_map_so_far + q_dec * mask
+
+    raise RuntimeError("stage 3 was not reached")
+
+
 def _apply_signed_latent_control(
     net,
     y_hat: torch.Tensor,
@@ -923,6 +1464,16 @@ def _encode_y_four_part_stage_residual_quant_gate(
     q_shift: Optional[torch.Tensor] = None,
     entropy_family: str = "gaussian",
     entropy_scale_factor: float = 1.0,
+    suppress_yq_stages: Optional[Sequence[int]] = None,
+    omitted_residual_mode: str = "zero",
+    omitted_residual_scale: float = 0.0,
+    omitted_residual_clip: float = 2.0,
+    suppress_rho_threshold: float = 0.0,
+    synth_yq_stages: Optional[Sequence[int]] = None,
+    synth_rho_threshold: float = 0.0,
+    synth_value_scale: float = 1.0,
+    send_stage3_map: Optional[torch.Tensor] = None,
+    q: int = 0,
 ):
     quant_step, scales, means = params.chunk(3, 1)
     quant_step = quant_step.clamp_min(0.5)
@@ -934,6 +1485,8 @@ def _encode_y_four_part_stage_residual_quant_gate(
     y_hat_so_far = None
     q_dec_map = torch.zeros_like(quant_step)
     streams: List[ArithmeticStream] = []
+    suppressed_stages = _normalize_stage_set(suppress_yq_stages)
+    synth_stages = _normalize_stage_set(synth_yq_stages)
 
     def protect_rho(rho: torch.Tensor, part_idx: int) -> torch.Tensor:
         if control_maps is None:
@@ -975,12 +1528,32 @@ def _encode_y_four_part_stage_residual_quant_gate(
                 stage_control, c, h, w, mean_control_groups, mean_control_delta, dtype)
         means_hat = (cur_means + delta + mean_control) * mask
         y_res = (y * q_enc - means_hat) * mask
+        suppress_mask = _stage_suppression_mask(
+            mask, rho, part_idx, suppressed_stages, suppress_rho_threshold)
+        if send_stage3_map is not None and part_idx == 3:
+            send_y = F.interpolate(
+                send_stage3_map.to(device=device, dtype=mask.dtype),
+                size=(h, w),
+                mode="nearest",
+            ) > 0.5
+            suppress_mask = suppress_mask | ((mask > 0.5) & (~send_y))
         y_q = torch.round(y_res)
-        active = mask > 0.5
-        streams.append(_encode_continuous_symbols(
-            y_q[active], cur_scales[active].clamp_min(1e-5),
-            family=entropy_family, scale_factor=entropy_scale_factor))
-        y_hat_part = y_q + means_hat
+        if suppress_mask.any():
+            omitted = _learned_or_omitted_residual_values(
+                net, common_params, y_hat_so_far, cur_scales, suppress_mask.to(dtype=mask.dtype),
+                part_idx, q, omitted_residual_mode, omitted_residual_scale, omitted_residual_clip)
+            y_q = torch.where(suppress_mask, omitted.to(dtype=y_q.dtype), y_q)
+        _append_symbols_with_suppression(
+            streams, y_q, cur_scales, mask, suppress_mask,
+            entropy_family, entropy_scale_factor)
+        synth_mask = _stage_suppression_mask(
+            mask, rho, part_idx, synth_stages, synth_rho_threshold)
+        synth_add = 0.0
+        if synth_mask.any():
+            synth_add = _learned_value_addition(
+                net, common_params, y_hat_so_far, synth_mask.to(dtype=mask.dtype),
+                part_idx, float(synth_value_scale))
+        y_hat_part = y_q + means_hat + synth_add
         y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
 
     return streams, y_hat_so_far * q_dec_map
@@ -990,7 +1563,11 @@ def _decode_y_four_part_stage_residual(net, payload: RealCodecPayload, params: t
                                       predictor_delta_bound: float = 0.0,
                                       q_shift: Optional[torch.Tensor] = None,
                                       entropy_family: str = "gaussian",
-                                      entropy_scale_factor: float = 1.0):
+                                      entropy_scale_factor: float = 1.0,
+                                      suppress_yq_stages: Optional[Sequence[int]] = None,
+                                      omitted_residual_mode: str = "zero",
+                                      omitted_residual_scale: float = 0.0,
+                                      omitted_residual_clip: float = 2.0):
     q_enc, q_dec, scales, means = net.separate_prior(params)
     del q_enc
     common_params = _apply_stage_q_condition(net.y_spatial_prior_reduction(params), q_shift)
@@ -999,6 +1576,7 @@ def _decode_y_four_part_stage_residual(net, payload: RealCodecPayload, params: t
     c, h, w = payload.y_shape
     masks = net.get_mask_four_parts(1, c, h, w, dtype, device)
     y_hat_so_far = None
+    suppressed_stages = _normalize_stage_set(suppress_yq_stages)
 
     for part_idx, (mask, stream) in enumerate(zip(masks, payload.y_streams)):
         if part_idx == 0:
@@ -1016,12 +1594,20 @@ def _decode_y_four_part_stage_residual(net, payload: RealCodecPayload, params: t
         if predictor_delta_bound and predictor_delta_bound > 0:
             delta = predictor_delta_bound * torch.tanh(delta / predictor_delta_bound)
 
-        active = mask > 0.5
+        suppress_mask = _stage_suppression_mask(
+            mask, rho, part_idx, suppressed_stages, suppress_rho_threshold)
+        active = (mask > 0.5) & (~suppress_mask)
         y_q_part = torch.zeros((1, c, h, w), dtype=dtype, device=device)
-        decoded = _decode_continuous_symbols(
-            stream, cur_scales[active].clamp_min(1e-5),
-            family=entropy_family, scale_factor=entropy_scale_factor)
-        y_q_part[active] = decoded.to(device=device, dtype=dtype)
+        if suppress_mask.any():
+            y_q_part = _learned_or_omitted_residual_values(
+                net, common_params, y_hat_so_far, cur_scales, suppress_mask.to(dtype=mask.dtype),
+                part_idx, payload.q, omitted_residual_mode, omitted_residual_scale, omitted_residual_clip
+            ).to(device=device, dtype=dtype)
+        if active.any():
+            decoded = _decode_continuous_symbols(
+                stream, cur_scales[active].clamp_min(1e-5),
+                family=entropy_family, scale_factor=entropy_scale_factor)
+            y_q_part[active] = decoded.to(device=device, dtype=dtype)
         y_hat_part = y_q_part + (cur_means + delta) * mask
         y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
 
@@ -1035,6 +1621,14 @@ def _decode_y_four_part_stage_quant_gate(
     q_shift: Optional[torch.Tensor] = None,
     entropy_family: str = "gaussian",
     entropy_scale_factor: float = 1.0,
+    suppress_yq_stages: Optional[Sequence[int]] = None,
+    omitted_residual_mode: str = "zero",
+    omitted_residual_scale: float = 0.0,
+    omitted_residual_clip: float = 2.0,
+    suppress_rho_threshold: float = 0.0,
+    synth_yq_stages: Optional[Sequence[int]] = None,
+    synth_rho_threshold: float = 0.0,
+    synth_value_scale: float = 1.0,
 ):
     quant_step, scales, means = params.chunk(3, 1)
     quant_step = quant_step.clamp_min(0.5)
@@ -1045,6 +1639,7 @@ def _decode_y_four_part_stage_quant_gate(
     masks = net.get_mask_four_parts(1, c, h, w, dtype, device)
     y_hat_so_far = None
     q_dec_map = torch.zeros((1, c, h, w), dtype=dtype, device=device)
+    suppressed_stages = _normalize_stage_set(suppress_yq_stages)
 
     for part_idx, (mask, stream) in enumerate(zip(masks, payload.y_streams)):
         if part_idx == 0:
@@ -1060,12 +1655,20 @@ def _decode_y_four_part_stage_quant_gate(
             cur_scales, cur_means = net.y_spatial_prior(adaptor(prior_in)).chunk(2, 1)
             rho, _ = net.stage_quant_gate.forward_stage(part_idx, common_params, y_hat_so_far)
 
-        active = mask > 0.5
+        suppress_mask = _stage_suppression_mask(
+            mask, rho, part_idx, suppressed_stages, suppress_rho_threshold)
+        active = (mask > 0.5) & (~suppress_mask)
         y_q_part = torch.zeros((1, c, h, w), dtype=dtype, device=device)
-        decoded = _decode_continuous_symbols(
-            stream, cur_scales[active].clamp_min(1e-5),
-            family=entropy_family, scale_factor=entropy_scale_factor)
-        y_q_part[active] = decoded.to(device=device, dtype=dtype)
+        if suppress_mask.any():
+            y_q_part = _learned_or_omitted_residual_values(
+                net, common_params, y_hat_so_far, cur_scales, suppress_mask.to(dtype=mask.dtype),
+                part_idx, payload.q, omitted_residual_mode, omitted_residual_scale, omitted_residual_clip
+            ).to(device=device, dtype=dtype)
+        if active.any():
+            decoded = _decode_continuous_symbols(
+                stream, cur_scales[active].clamp_min(1e-5),
+                family=entropy_family, scale_factor=entropy_scale_factor)
+            y_q_part[active] = decoded.to(device=device, dtype=dtype)
         q_dec_map = q_dec_map + quant_step * rho * mask
         y_hat_part = y_q_part + cur_means * mask
         y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
@@ -1086,6 +1689,15 @@ def _decode_y_four_part_stage_residual_quant_gate(
     q_shift: Optional[torch.Tensor] = None,
     entropy_family: str = "gaussian",
     entropy_scale_factor: float = 1.0,
+    suppress_yq_stages: Optional[Sequence[int]] = None,
+    omitted_residual_mode: str = "zero",
+    omitted_residual_scale: float = 0.0,
+    omitted_residual_clip: float = 2.0,
+    suppress_rho_threshold: float = 0.0,
+    synth_yq_stages: Optional[Sequence[int]] = None,
+    synth_rho_threshold: float = 0.0,
+    synth_value_scale: float = 1.0,
+    send_stage3_map: Optional[torch.Tensor] = None,
 ):
     quant_step, scales, means = params.chunk(3, 1)
     quant_step = quant_step.clamp_min(0.5)
@@ -1097,6 +1709,8 @@ def _decode_y_four_part_stage_residual_quant_gate(
     y_hat_so_far = None
     q_dec_map = torch.zeros((1, c, h, w), dtype=dtype, device=device)
     y_streams = list(payload.y_streams if streams is None else streams)
+    suppressed_stages = _normalize_stage_set(suppress_yq_stages)
+    synth_stages = _normalize_stage_set(synth_yq_stages)
 
     def protect_rho(rho: torch.Tensor, part_idx: int) -> torch.Tensor:
         if control_maps is None:
@@ -1128,12 +1742,27 @@ def _decode_y_four_part_stage_residual_quant_gate(
                 getattr(net, "stage_residual_refiner", None))
         rho = protect_rho(rho, part_idx)
 
-        active = mask > 0.5
+        suppress_mask = _stage_suppression_mask(
+            mask, rho, part_idx, suppressed_stages, suppress_rho_threshold)
+        if send_stage3_map is not None and part_idx == 3:
+            send_y = F.interpolate(
+                send_stage3_map.to(device=device, dtype=mask.dtype),
+                size=(h, w),
+                mode="nearest",
+            ) > 0.5
+            suppress_mask = suppress_mask | ((mask > 0.5) & (~send_y))
+        active = (mask > 0.5) & (~suppress_mask)
         y_q_part = torch.zeros((1, c, h, w), dtype=dtype, device=device)
-        decoded = _decode_continuous_symbols(
-            stream, cur_scales[active].clamp_min(1e-5),
-            family=entropy_family, scale_factor=entropy_scale_factor)
-        y_q_part[active] = decoded.to(device=device, dtype=dtype)
+        if suppress_mask.any():
+            y_q_part = _learned_or_omitted_residual_values(
+                net, common_params, y_hat_so_far, cur_scales, suppress_mask.to(dtype=mask.dtype),
+                part_idx, payload.q, omitted_residual_mode, omitted_residual_scale, omitted_residual_clip
+            ).to(device=device, dtype=dtype)
+        if active.any():
+            decoded = _decode_continuous_symbols(
+                stream, cur_scales[active].clamp_min(1e-5),
+                family=entropy_family, scale_factor=entropy_scale_factor)
+            y_q_part[active] = decoded.to(device=device, dtype=dtype)
         q_dec_map = q_dec_map + quant_step * rho * mask
         if mean_control_maps is None:
             mean_control = 0.0
@@ -1141,7 +1770,14 @@ def _decode_y_four_part_stage_residual_quant_gate(
             stage_control = mean_control_maps[:, part_idx * mean_control_groups:(part_idx + 1) * mean_control_groups]
             mean_control = _stage_signed_control_to_mean_map(
                 stage_control, c, h, w, mean_control_groups, mean_control_delta, dtype)
-        y_hat_part = y_q_part + (cur_means + delta + mean_control) * mask
+        synth_mask = _stage_suppression_mask(
+            mask, rho, part_idx, synth_stages, synth_rho_threshold)
+        synth_add = 0.0
+        if synth_mask.any():
+            synth_add = _learned_value_addition(
+                net, common_params, y_hat_so_far, synth_mask.to(dtype=mask.dtype),
+                part_idx, float(synth_value_scale))
+        y_hat_part = y_q_part + (cur_means + delta + mean_control) * mask + synth_add
         y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
 
     return y_hat_so_far * q_dec_map
@@ -1154,6 +1790,10 @@ def _decode_y_four_part(
     latent_mean_scaled: Optional[torch.Tensor] = None,
     entropy_family: str = "gaussian",
     entropy_scale_factor: float = 1.0,
+    suppress_yq_stages: Optional[Sequence[int]] = None,
+    omitted_residual_mode: str = "zero",
+    omitted_residual_scale: float = 0.0,
+    omitted_residual_clip: float = 2.0,
 ):
     q_enc, q_dec, scales, means = net.separate_prior(params)
     del q_enc
@@ -1163,6 +1803,7 @@ def _decode_y_four_part(
     c, h, w = payload.y_shape
     masks = net.get_mask_four_parts(1, c, h, w, dtype, device)
     y_hat_so_far = None
+    suppressed_stages = _normalize_stage_set(suppress_yq_stages)
 
     for part_idx, (mask, stream) in enumerate(zip(masks, payload.y_streams)):
         if part_idx == 0:
@@ -1178,10 +1819,16 @@ def _decode_y_four_part(
 
         active = mask > 0.5
         y_q_part = torch.zeros((1, c, h, w), dtype=dtype, device=device)
-        decoded = _decode_continuous_symbols(
-            stream, cur_scales[active].clamp_min(1e-5),
-            family=entropy_family, scale_factor=entropy_scale_factor)
-        y_q_part[active] = decoded.to(device=device, dtype=dtype)
+        if part_idx in suppressed_stages:
+            y_q_part = _learned_or_omitted_residual_values(
+                net, common_params, y_hat_so_far, cur_scales, mask, part_idx, payload.q,
+                omitted_residual_mode, omitted_residual_scale, omitted_residual_clip
+            ).to(device=device, dtype=dtype)
+        else:
+            decoded = _decode_continuous_symbols(
+                stream, cur_scales[active].clamp_min(1e-5),
+                family=entropy_family, scale_factor=entropy_scale_factor)
+            y_q_part[active] = decoded.to(device=device, dtype=dtype)
         if latent_mean_scaled is None:
             cur_means_total = cur_means
         else:
@@ -1207,11 +1854,29 @@ def compress_to_real_bitstream(
     residual_control_delta: float = 0.25,
     residual_control_groups: int = 1,
     residual_control_levels: int = 1,
+    suppress_yq_stages: Optional[Sequence[int]] = None,
+    omitted_residual_mode: str = "zero",
+    omitted_residual_scale: float = 0.0,
+    omitted_residual_clip: float = 2.0,
+    suppress_rho_threshold: float = 0.0,
+    synth_yq_stages: Optional[Sequence[int]] = None,
+    synth_rho_threshold: float = 0.0,
+    synth_value_scale: float = 1.0,
+    stage3_send_score_mode: str = "latent_mse",
+    stage3_send_grad_max_side: int = 256,
+    z_entropy_mode: str = "fixed",
+    z_entropy_cdf_path: Optional[str] = None,
 ) -> Tuple[bytes, Dict[str, float]]:
     """Encode a padded image tensor and return serialized payload bytes."""
     if entropy_family not in ENTROPY_FAMILIES:
         raise ValueError(f"unknown entropy family: {entropy_family}")
+    if omitted_residual_mode not in OMITTED_RESIDUAL_MODES:
+        raise ValueError(f"unknown omitted residual mode: {omitted_residual_mode}")
+    if z_entropy_mode not in Z_ENTROPY_MODES:
+        raise ValueError(f"unknown z_entropy_mode: {z_entropy_mode}")
     entropy_scale_factor = max(float(entropy_scale_factor), 1e-6)
+    suppressed_stages = _normalize_stage_set(suppress_yq_stages)
+    synth_stages = _normalize_stage_set(synth_yq_stages)
     curr_q_enc = net.q_enc[q:q + 1]
     y_ori = net.vqgan.encoder(x_padded)
     y = net.enc(y_ori, curr_q_enc)
@@ -1249,13 +1914,55 @@ def compress_to_real_bitstream(
             q_shift=q_shift,
             entropy_family=entropy_family,
             entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            suppress_rho_threshold=suppress_rho_threshold,
+            q=q,
+        )
+        streams = control_streams + y_streams
+    elif predictor_param_mode == "stage_residual_entropy_quant_gate_stage3_send_control":
+        send_map = _make_stage3_send_control_map(
+            net, x_padded, y, params, (int(z.shape[2]), int(z.shape[3])),
+            predictor_delta_bound=predictor_delta_bound,
+            q_shift=q_shift,
+            send_frac=residual_control_topk_frac,
+            score_mode=stage3_send_score_mode,
+            grad_max_side=stage3_send_grad_max_side,
+        )
+        control_streams = [_encode_stage3_send_stream(send_map, residual_control_prob_nonzero)]
+        y_streams, _ = _encode_y_four_part_stage_residual_quant_gate(
+            net, y, params, predictor_delta_bound,
+            q_shift=q_shift,
+            entropy_family=entropy_family,
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            suppress_rho_threshold=suppress_rho_threshold,
+            synth_yq_stages=synth_stages,
+            synth_rho_threshold=synth_rho_threshold,
+            synth_value_scale=synth_value_scale,
+            send_stage3_map=send_map,
+            q=q,
         )
         streams = control_streams + y_streams
     elif predictor_param_mode == "stage_residual_entropy_quant_gate_latent_control":
         y_streams, y_hat_base = _encode_y_four_part_stage_residual_quant_gate(
             net, y, params, predictor_delta_bound, q_shift=q_shift,
             entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            suppress_rho_threshold=suppress_rho_threshold,
+            synth_yq_stages=synth_stages,
+            synth_rho_threshold=synth_rho_threshold,
+            synth_value_scale=synth_value_scale,
+            q=q)
         if hasattr(net, "latent_control_encoder") and net.latent_control_encoder is not None:
             common_for_control = _apply_stage_q_condition(net.y_spatial_prior_reduction(params), q_shift)
             control_symbols, _, _ = net.latent_control_encoder(
@@ -1276,17 +1983,37 @@ def compress_to_real_bitstream(
             control_symbols, residual_control_prob_nonzero, max_abs=residual_control_levels)
         streams = control_streams + y_streams
     elif predictor_param_mode in {"stage_residual_quant_gate_control", "stage_residual_entropy_quant_gate_control"}:
-        if not hasattr(net, "tiny_control_encoder") or net.tiny_control_encoder is None:
-            raise ValueError(f"{predictor_param_mode} requires net.tiny_control_encoder")
         common_for_control = _apply_stage_q_condition(net.y_spatial_prior_reduction(params), q_shift)
-        control_symbols, _, _ = net.tiny_control_encoder(
-            y, common_for_control, (int(z.shape[2]), int(z.shape[3])), int(q))
-        control_symbols = (control_symbols > 0.5).to(dtype=y.dtype)
+        if hasattr(net, "tiny_control_encoder") and net.tiny_control_encoder is not None:
+            control_symbols, _, _ = net.tiny_control_encoder(
+                y, common_for_control, (int(z.shape[2]), int(z.shape[3])), int(q))
+            control_symbols = (control_symbols > 0.5).to(dtype=y.dtype)
+        elif float(residual_control_topk_frac) > 0.0:
+            control_symbols = _make_rdo_protection_control_maps(
+                net, y, params, (int(z.shape[2]), int(z.shape[3])),
+                predictor_delta_bound=predictor_delta_bound,
+                q_shift=q_shift,
+                topk_frac=residual_control_topk_frac,
+            )
+            control_prob_one = float(residual_control_prob_nonzero)
+        else:
+            raise ValueError(
+                f"{predictor_param_mode} requires net.tiny_control_encoder or "
+                "--residual_control_topk_frac > 0 for source-side RDO control")
         control_streams = _encode_control_streams(control_symbols, control_prob_one)
         y_streams, _ = _encode_y_four_part_stage_residual_quant_gate(
             net, y, params, predictor_delta_bound, control_maps=control_symbols,
             q_shift=q_shift, entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            suppress_rho_threshold=suppress_rho_threshold,
+            synth_yq_stages=synth_stages,
+            synth_rho_threshold=synth_rho_threshold,
+            synth_value_scale=synth_value_scale,
+            q=q)
         streams = control_streams + y_streams
     elif predictor_param_mode in {
         "stage_residual_quant_gate",
@@ -1297,27 +2024,52 @@ def compress_to_real_bitstream(
         y_streams, _ = _encode_y_four_part_stage_residual_quant_gate(
             net, y, params, predictor_delta_bound, q_shift=q_shift,
             entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            suppress_rho_threshold=suppress_rho_threshold,
+            synth_yq_stages=synth_stages,
+            synth_rho_threshold=synth_rho_threshold,
+            synth_value_scale=synth_value_scale,
+            q=q)
         streams = y_streams
     elif predictor_param_mode == "stage_quant_gate":
         y_streams, _ = _encode_y_four_part_stage_quant_gate(
             net, y, params, q_shift=q_shift, entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            suppress_rho_threshold=suppress_rho_threshold,
+            q=q)
         streams = y_streams
     elif predictor_param_mode == "stage_latent_residual":
         y_streams, _ = _encode_y_four_part_stage_residual(
             net, y, params, predictor_delta_bound, q_shift=q_shift,
             entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            q=q)
         streams = y_streams
     else:
         y_streams, _ = _encode_y_four_part(
             net, y, params, latent_mean_scaled, entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            q=q)
         streams = y_streams
 
-    z_bits = int(math.ceil(math.log2(net.codebook_size)))
-    z_data = _pack_fixed_width(z_indices, z_bits)
+    z_data = _encode_z_indices(
+        z_indices, net.codebook_size, z_entropy_mode, q, z_entropy_cdf_path)
     payload = RealCodecPayload(
         q=q,
         orig_hw=orig_hw,
@@ -1338,14 +2090,27 @@ def compress_to_real_bitstream(
         "header_bytes": float(fixed_header_bytes),
         "z_bytes": float(len(z_data)),
         "y_bytes": float(y_bytes),
+        "y_stage_bytes": [float(len(s.data)) for s in y_streams],
         "control_bytes": float(control_bytes),
         "y_stream_count": float(len(streams)),
         "entropy_family": entropy_family,
         "entropy_scale_factor": float(entropy_scale_factor),
+        "suppress_yq_stages": sorted(suppressed_stages),
+        "omitted_residual_mode": omitted_residual_mode,
+        "omitted_residual_scale": float(omitted_residual_scale),
+        "omitted_residual_clip": float(omitted_residual_clip),
+        "suppress_rho_threshold": float(suppress_rho_threshold),
+        "synth_yq_stages": sorted(synth_stages),
+        "synth_rho_threshold": float(synth_rho_threshold),
+        "synth_value_scale": float(synth_value_scale),
+        "stage3_send_score_mode": str(stage3_send_score_mode),
+        "stage3_send_grad_max_side": float(stage3_send_grad_max_side),
         "residual_control_nonzero": float(
             (control_symbols != 0).sum().item()) if "control_symbols" in locals() else 0.0,
         "residual_control_symbol_count": float(
             control_symbols.numel()) if "control_symbols" in locals() else 0.0,
+        "z_entropy_mode": z_entropy_mode,
+        "z_entropy_cdf_path": str(z_entropy_cdf_path or ""),
     }
     return payload_bytes, stats
 
@@ -1362,15 +2127,32 @@ def decompress_from_real_bitstream(
     residual_control_delta: float = 0.25,
     residual_control_groups: int = 1,
     residual_control_levels: int = 1,
+    suppress_yq_stages: Optional[Sequence[int]] = None,
+    omitted_residual_mode: str = "zero",
+    omitted_residual_scale: float = 0.0,
+    omitted_residual_clip: float = 2.0,
+    suppress_rho_threshold: float = 0.0,
+    synth_yq_stages: Optional[Sequence[int]] = None,
+    synth_rho_threshold: float = 0.0,
+    synth_value_scale: float = 1.0,
+    z_entropy_mode: str = "fixed",
+    z_entropy_cdf_path: Optional[str] = None,
 ) -> torch.Tensor:
     """Decode a serialized payload and return padded reconstruction in [-1, 1]."""
     if entropy_family not in ENTROPY_FAMILIES:
         raise ValueError(f"unknown entropy family: {entropy_family}")
+    if omitted_residual_mode not in OMITTED_RESIDUAL_MODES:
+        raise ValueError(f"unknown omitted residual mode: {omitted_residual_mode}")
+    if z_entropy_mode not in Z_ENTROPY_MODES:
+        raise ValueError(f"unknown z_entropy_mode: {z_entropy_mode}")
     entropy_scale_factor = max(float(entropy_scale_factor), 1e-6)
+    suppressed_stages = _normalize_stage_set(suppress_yq_stages)
+    synth_stages = _normalize_stage_set(synth_yq_stages)
     payload = RealCodecPayload.from_bytes(payload_bytes)
     device = next(net.parameters()).device
-    z_bits = int(math.ceil(math.log2(net.codebook_size)))
-    z_indices = _unpack_fixed_width(payload.z_data, payload.z_count, z_bits, device=device)
+    z_indices = _decode_z_indices(
+        payload.z_data, payload.z_count, net.codebook_size, payload.q, device,
+        z_entropy_mode, z_entropy_cdf_path)
     z_hat = net.z_vq.get_quan_feat(
         z_indices.reshape(-1, 1),
         (1, payload.z_shape[0], payload.z_shape[1], net.N),
@@ -1397,7 +2179,36 @@ def decompress_from_real_bitstream(
             streams=payload.y_streams[1:],
             q_shift=q_shift,
             entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            suppress_rho_threshold=suppress_rho_threshold,
+            synth_yq_stages=synth_stages,
+            synth_rho_threshold=synth_rho_threshold,
+            synth_value_scale=synth_value_scale)
+    elif predictor_param_mode == "stage_residual_entropy_quant_gate_stage3_send_control":
+        if len(payload.y_streams) < 5:
+            raise ValueError(
+                f"{predictor_param_mode} expects 1 stage3-send control + 4 y streams, got {len(payload.y_streams)}")
+        send_map = _decode_stage3_send_stream(
+            payload.y_streams[0], payload.z_shape, residual_control_prob_nonzero, device)
+        y_hat = _decode_y_four_part_stage_residual_quant_gate(
+            net, payload, params, predictor_delta_bound,
+            streams=payload.y_streams[1:],
+            q_shift=q_shift,
+            entropy_family=entropy_family,
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            suppress_rho_threshold=suppress_rho_threshold,
+            synth_yq_stages=synth_stages,
+            synth_rho_threshold=synth_rho_threshold,
+            synth_value_scale=synth_value_scale,
+            send_stage3_map=send_map)
     elif predictor_param_mode == "stage_residual_entropy_quant_gate_latent_control":
         if len(payload.y_streams) < 5:
             raise ValueError(
@@ -1415,7 +2226,15 @@ def decompress_from_real_bitstream(
             streams=payload.y_streams[1:],
             q_shift=q_shift,
             entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            suppress_rho_threshold=suppress_rho_threshold,
+            synth_yq_stages=synth_stages,
+            synth_rho_threshold=synth_rho_threshold,
+            synth_value_scale=synth_value_scale)
         y_hat = _apply_signed_latent_control(
             net, y_hat_base, control_maps, residual_control_delta, residual_control_groups)
     elif predictor_param_mode in {"stage_residual_quant_gate_control", "stage_residual_entropy_quant_gate_control"}:
@@ -1428,7 +2247,15 @@ def decompress_from_real_bitstream(
             net, payload, params, predictor_delta_bound,
             control_maps=control_maps, streams=payload.y_streams[1:],
             q_shift=q_shift, entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            suppress_rho_threshold=suppress_rho_threshold,
+            synth_yq_stages=synth_stages,
+            synth_rho_threshold=synth_rho_threshold,
+            synth_value_scale=synth_value_scale)
     elif predictor_param_mode in {
         "stage_residual_quant_gate",
         "stage_residual_entropy_quant_gate",
@@ -1438,20 +2265,41 @@ def decompress_from_real_bitstream(
         y_hat = _decode_y_four_part_stage_residual_quant_gate(
             net, payload, params, predictor_delta_bound, q_shift=q_shift,
             entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            suppress_rho_threshold=suppress_rho_threshold,
+            synth_yq_stages=synth_stages,
+            synth_rho_threshold=synth_rho_threshold,
+            synth_value_scale=synth_value_scale)
     elif predictor_param_mode == "stage_quant_gate":
         y_hat = _decode_y_four_part_stage_quant_gate(
             net, payload, params, q_shift=q_shift, entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip,
+            suppress_rho_threshold=suppress_rho_threshold)
     elif predictor_param_mode == "stage_latent_residual":
         y_hat = _decode_y_four_part_stage_residual(
             net, payload, params, predictor_delta_bound, q_shift=q_shift,
             entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip)
     else:
         y_hat = _decode_y_four_part(
             net, payload, params, latent_mean_scaled, entropy_family=entropy_family,
-            entropy_scale_factor=entropy_scale_factor)
+            entropy_scale_factor=entropy_scale_factor,
+            suppress_yq_stages=suppressed_stages,
+            omitted_residual_mode=omitted_residual_mode,
+            omitted_residual_scale=omitted_residual_scale,
+            omitted_residual_clip=omitted_residual_clip)
     curr_q_dec = net.q_dec[payload.q:payload.q + 1]
     latent = net.dec(y_hat, curr_q_dec)
     return net.vqgan.generator(latent)

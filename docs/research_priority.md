@@ -28,6 +28,11 @@ Current decision after the 2026-06-30 review:
 - The next highest-value mainline is stage-aware residual-variable coding with a
   serious residual entropy model, supported by safe-coarsening / residual-RDO
   teachers.
+- 2026-07-01 synthesis: before implementing another large branch, run
+  diagnostic-first checks for hard residual omission and same-bpp generative
+  residual synthesis.  See
+  `docs/mainline_research_synthesis_2026_07_01.md` and
+  `docs/mainline_brs_synthesis_diagnostic_plan_2026_07_01.md`.
 
 ## Main Thesis
 
@@ -202,6 +207,39 @@ Current status:
   entropy model exists.  If revisited, the control prior should be
   decoder-computable and stage-wise, not an encoder-only probability map.
 
+### 6. Decoder-side residual synthesis
+
+This is now a validated mechanism signal, not yet the lead.
+
+Current result:
+
+- A decoder-computable stage-3 value synthesizer can be added after normal
+  SafeRDO arithmetic decoding with no extra side bits.
+- Kodak8 same-code comparison at identical serialized bpp:
+  - plain additive scale 0.5: DISTS `+0.24%`, LPIPS `-1.50%`, PSNR `-3.93%`,
+    FID `-1.00%` versus SafeRDO.
+  - plain additive scale 1.0: stronger LPIPS/PSNR but too much DISTS cost.
+  - DISTS-aware safe-hinge training did not beat the plain conservative
+    additive setting.
+
+Interpretation:
+
+```text
+decoder-side synthesis can recover some residual quality without bits,
+but unconditional synthesis perturbs DISTS-sensitive structure.
+```
+
+Next:
+
+- Do not keep doing amplitude/loss sweeps.
+- Make synthesis selective:
+  - decoder-computable confidence gate,
+  - local safe-to-synthesize teacher,
+  - or tiny counted control stream for synthesis/residual necessity.
+- This branch should eventually be combined with residual omission or
+  residual-variable coding.  Alone it improves quality at the same bpp; it does
+  not move the bpp curve left unless paired with actual bit saving.
+
 ## External Reference Use Policy
 
 Use recent SOTA methods as targeted references, not as replacements for the GLC
@@ -307,6 +345,10 @@ Mechanism-specific success criteria:
   actual serialized bpp must decrease after coding overhead is counted; rate
   savings must survive Kodak, DIV2K, and CLIC2020 rather than only estimated
   likelihood.
+- z_hat entropy coding:
+  the decoded `z_hat` and final reconstruction must be exactly unchanged; the
+  probability table must be trained from non-evaluation data; all mode prefixes
+  and coding bytes must be counted in serialized bpp.
 - Tiny counted control:
   total bpp including control must improve BD-rate; control ablation should hurt;
   the control stream must remain small, entropy-coded, and counted.
@@ -340,16 +382,51 @@ are:
 2. Treat q-aware rho-target and safe-weighted stage-mean continuations as
    rejected diagnostics unless they beat the Safe-RDO lead on a larger
    real-codec set.
-3. Implement stage-aware residual-variable coding inside the GLC four-part prior.
-4. Implement or integrate a serious learned residual entropy model for that
+3. Keep selective no-side residual synthesis as the safest generator-recovery
+   branch.  It is still small, but it is the only recent branch that improves
+   all Kodak8 metrics over the same SafeRDO anchor.  Omitted-aware synthesis
+   should train on the same omitted-cell distribution used by the real codec;
+   rho-threshold training and counted send-mask evaluation must not be mixed.
+4. Keep zero-distortion entropy improvements active where validated, but do not
+   use them as the main GP-ResLC claim.  OpenImages-trained static/auto
+   `z_hat` entropy coding is now validated with real serialized bpp on
+   Kodak24, DIV2K validation, and full CLIC2020 test 428.  It is a useful
+   codec cleanup, but it is not specific to residual/generator-recovery coding
+   and could also be applied to the baseline.  Therefore:
+   - Main paper-facing comparisons should prioritize fixed-z or z-excluded
+     BD-rate.
+   - z-entropy results may be reported as an auxiliary full-codec package.
+   - The z-included conservative package reaches about `-5%` to `-10%`
+     BD-rate on several metrics, but this should not be presented as the
+     intrinsic GP-ResLC method gain.
+   - The z-excluded selective synthesis audit is much smaller: CLIC2020 test
+     `+0.18%` DISTS / `-0.65%` LPIPS / `-0.17%` FID, DIV2K validation
+     `-0.52%` DISTS / `-0.72%` LPIPS / `-0.47%` FID, and Kodak24 `-0.16%`
+     DISTS / `-0.74%` LPIPS / `-0.61%` FID versus the same fixed-z SafeRDO
+     anchor.  This confirms that large future gains must come from `y`/
+     residual/control coding, not from `z_hat` entropy cleanup.
+   Do not use the discarded old DIV2K fixed-anchor comparison.
+5. Implement zero-distortion entropy improvements that are currently exposed by
+   the codec, especially replacing fixed-width `z_hat` index coding with a
+   decoder-consistent entropy-coded representation when the side overhead is
+   favorable.
+6. Reject coarse stage-3 send-control as currently implemented.  Counted
+   send-mask experiments with latent-MSE and image-MSE-gradient teachers saved
+   bpp but worsened DISTS/FID.  They should be treated as negative evidence,
+   not as the lead.
+7. Evaluate the active match-send omitted-recovery branch.  It should be
+   promoted only if it closes the DISTS/FID gap of plain stage-3 send-control
+   under real serialized bpp.
+8. Implement stage-aware residual-variable coding inside the GLC four-part prior.
+9. Implement or integrate a serious learned residual entropy model for that
    residual stream.
-5. Build safe-coarsening / residual-RDO teacher signals to supervise allocation
+10. Build safe-coarsening / residual-RDO teacher signals to supervise allocation
    and prevent the method from becoming blind quantization-width tuning.
-6. If zero-side allocation saturates, reintroduce a tiny counted control stream
+11. If zero-side allocation saturates, reintroduce a tiny counted control stream
    with learned entropy coding.
-7. Add semantic/DINO/edge guards only after the core residual mechanism shows
+12. Add semantic/DINO/edge guards only after the core residual mechanism shows
    real-codec rate gain.
-8. Run ablations after a branch has real-codec promise.
+13. Run ablations after a branch has real-codec promise.
 
 ## One-Sentence Research North Star
 

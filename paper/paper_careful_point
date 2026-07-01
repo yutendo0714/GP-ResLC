@@ -1,0 +1,113 @@
+Preparing for International Conferences (Japanese is in the original thread)
+国際会議を目指すなら英語で情報を得ることが基本ですので、あえて英語で書きました。まずはこれを読んでみてください。（細かいニュアンス確認用に、スレッドに日本語訳も載せておきます）。
+I want to give some advice regarding research and writing paper. This is the standard guidance I usually give to advisees submitting to international conferences.
+
+1. Structure of a Research Paper
+A standard research paper consists of six main parts:
+
+1. Abstract.
+2. Introduction.
+3. Related Work.
+4. Methodology / Proposed Method.
+5. Results & Analysis.
+6. Conclusion & Future Work.
+Note: If you are limited by page count, it is acceptable to combine "Introduction" and "Related Work."
+
+2. Idea & Scope (Identifying the Research Gap)
+• Follow Your Interest: First, identify what you are genuinely interested in or want to solve. You will be working on this for weeks or months, so it will be painful if you choose a topic you dislike.
+• Set the Correct Scope: Do not try to solve everything at once. Be specific, not vague.
+• Bad: "I want to build an image recognition model to detect road traffic."
+Why: You would have to prove it is the best at everything. This is too broad to fit into a 4–6 page conference paper.
+• Good: "I want to build an image recognition model to detect traffic violations on highways."
+Why: You only need to prove specific points (e.g., detecting speeding, tailgating, or illegal lane changes). This fits perfectly into a conference paper.
+• Generalizability: Ensure your research applies to wider use cases. Niche research often gets rejected for "insufficient impact." For example, do not propose research that only works on "Highways in Japan." Instead, discuss how the core problem is common across countries so the solution is applicable worldwide.
+• Finding Trends:
+Industry: Read tech news and company whitepapers.
+Academia: Read papers from top conferences.
+Tip: Taking an academic concept, implementing it, and proving it works in a real-world scenario can be a valid contribution (Implementation/Evaluation Paper).
+• Selecting a Conference:
+Check the reputation of a conference using the CORE Ranking.
+Generally, our lab aims for CORE Rank C or higher. Prioritize reading papers from these conferences, as this is where new trends are introduced.
+• Honest Benefits: Ask yourself: What is the benefit to the world? What can people learn? Is this practical?
+Example: Introducing a massive, complex ML model for smartphones will be rejected because reviewers will question the computational and power limitations.
+• Accessing Papers: To access IEEE Xplore/ACM Digital Library from off-campus, refer to the Waseda University Library Guide.
+
+3. Carrying Out the Research
+• Take Ownership: Your advisor provides guidelines, but you are responsible for your research.
+Coding issues: If your code errors out, copy-paste the error into Google. Someone else has likely faced and solved the same issue.
+• Using AI (LLMs): LLMs are great assistants, but do not offload your critical thinking to them. Critical thinking is what separates those who get jobs from those who don't. Always ask the AI to explain its logic, check if it is correct, and learn from it.
+• Feasibility Test: Always perform a preliminary test before committing to the full research. Ensure the idea is actually possible so you don't waste time on a dead end.
+• Cross-Check Results: If a result looks too good to be true, it probably is. Re-run evaluations to confirm your numbers.
+• Framing Metrics: Choose metrics that make your method look appealing.
+Example: If your accuracy is lower but your speed is 10x faster, highlight the speed as the main contribution and frame the accuracy as a "limitation."
+• Perfection is Not Required: Scientific research is about what we learn. If something is too difficult to prove, frame it as a limitation or future work.
+Example: "Our model achieves 50ms inference, suitable for real-time use. In the future, we will extend this to urban streets." (This disarms the reviewer immediately).
+
+4. Writing the Paper
+
+• Check the Template: Different conferences require different templates (e.g., IEEE ComSoc vs. IEEE SPS). Submitting with the wrong template will result in a Desk Reject (rejected without being read)..
+• Page Limits: Check if the page limit includes references or if references can be on an extra page..
+• Use LaTeX (Overleaf): Learn to use Overleaf. It ensures your PDF complies with the template and handles figure numbering and citations automatically..
+Abstract
+
+• Summarize the problem statement, the research gap (why people need to read this), what you did, and what you discovered..
+Introduction & Related Work
+
+• Context: Explain the context and current trends so even a high school student could understand..
+• Research Gap: Why does the world need this paper? What value do you provide?.
+• Novelty: Explain exactly what you did that no one else has done. Support this by citing recent work..
+• Do Not Oversell: Overselling makes reviewers skeptical; they will hunt for flaws. Only claim what you can actually prove..
+• Contributions: Consider listing your contributions in bullet points (check if this is the norm in your specific field)..
+Methodology / Proposed Method
+
+• Reproducibility: Walk through your settings and configurations so the reader can repeat the experiment..
+• Design Logic: Explain the mathematical model or the logic behind your design choices. Why is this method the best given your constraints?.
+• Metrics: Explain why you chose specific metrics to measure performance..
+• Avoid "Math Salad": Do not paste random equations from other papers just to look smart. Cite them instead. Irrelevant math confuses reviewers..
+Results & Analysis
+• Comparison: Describe your results and how they compare to existing work.
+• Tables: Add a column highlighting the difference or percentage improvement to improve readability.
+• Graphs: Always include axis labels and scales. A graph without a scale is useless and looks manipulative.
+• Formatting: If using Excel/PowerPoint, set all text and lines to Black. Default gray looks blurry in print.
+• Utility: Every Figure/Table must add value. If it doesn't help prove your point, remove it.
+• Legibility: Print your paper to check if the figures are readable. If a reviewer can't read it, they may reject it.
+• Discussion: Don't just list numbers; explain why.
+Example: "Accuracy improved by 2% because the Convolution Layer reduced false positives (as seen in Fig 3)."
+• Verification: Re-read this section. Did you answer all the claims you made in the Introduction?
+Conclusion & Future Work
+• Summary: Concisely state what you did and what results you achieved.
+• Implication: Connect back to the wider community. How can others use this?
+• Limitations: Be honest. Frame limitations as "Scope."
+Example: "To maximize accuracy, this work focused specifically on lane switching."
+• Future Work: Suggest a logical next step (e.g., extending the work to a different environment).
+
+Crucial Warning: The "Broken Logic" Trap
+Most first-time papers are rejected not because of bad English, but because of Broken Logic.
+• The "Golden Thread": Your paper must have one continuous story line.
+Intro: "I promise to solve Problem X."
+Method: "Here is the tool to solve Problem X."
+Result: "Here is the evidence that Problem X is solved."
+Conclusion: "Problem X is solved."
+• Common Mistake: Many students promise "X" in the Introduction (e.g., "We improve security"), but the Result shows "Y" (e.g., "The system is faster"). This is immediate grounds for rejection.
+• The "Stranger Test": Before submitting, give your paper to a lab mate who is not working on your specific project. Ask them: "What is the problem and what is the solution?" If they cannot answer clearly after reading the Intro and Conclusion, your logic is broken.
+
+5. Inside the Mind of a Reviewer
+(Based on my experience reviewing for IEEE WCNC/PCS/ICPP/ACM CHI)
+When I review a paper, I follow this pattern:
+• Abstract & Conclusion: I read these first to understand the claim and the final result.
+• Introduction: I check if the "Research Gap" is real and interesting.
+• Methodology: I check if the design actually proves the claim.
+Red Flag: "Math Salad" (irrelevant equations) creates high suspicion.
+• Results: I check if the methodology was carried out correctly.
+Red Flag: Bad papers use strong language/complex methods to hide weak results.
+Red Flag: Result sections that feel like they were written for a different paper.
+• Final Check: Does the conclusion align with the introduction? Is the Future Work feasible?
+
+Good luck with your research!
+
+以下追加点。
+・データセットや評価指標にも引用や参考文献を設ける。「BD-Rate」とかも他の論文が引用しているワードとかはあなたが調べて全て引用すること
+・引用は[1,2,3]とか文章の最後にまとめて付けるのではなく、なるべく個別に付けるのがいいらしい。
+・実験プロジェクトの細かな用語をそのまま載せないでちゃんと他トップカンファレンス論文とか同じ研究分野で使われている研究者共通の自然な表現が好ましい。例えば日本語論文執筆の時だから今回とは違うかもしれないけど、主潜在y streamとか言わないで符号長の方がわかりやすいとか他にも指摘されたことたくさんある。この研究は他の人に勧めてもらってるからその人が使ってる独自の表現（例えばρとかも、adaptive量子化周りでは使われない）は信用しないであなたが調べること。
+・とにかくこの研究ディレクトリは、独自の表現やワードや説明が多すぎるので、あなたが包括的にLIC分野のトップカンファレンスでのワードチョイスや引用や参考文献や、数式や文字には何を使ってるか。それぞれのセクションは大体何割くらい書いてるか。読み手にわかりやすく書く部分と詳細に書く部分使い分けて書いてるのかとか。あとはストーリー性とかを参考にして完成度高めて。
+・real codecとかそういう表現も使わないし。第一実bppで算出してるなんて当たり前のことだからわざわざ書かない。こういうあたりまえでわざわざ書かないようなことを主張するのもよくない。

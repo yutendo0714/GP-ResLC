@@ -8040,3 +8040,1004 @@ Decision:
 - Next work should return to a structural implementation:
   stage-aware residual-variable coding and/or learned residual/control entropy
   modeling, not more fixed-prior control sweeps.
+
+### 2026-07-01 JST - Stage-3 selective hard omission and omitted-residual synthesis
+
+Reason:
+
+- The mainline question was whether the current Safe-RDO `rho` map can be
+  converted from soft residual coarsening into actual residual omission:
+  do not arithmetic-code the selected `y_q` residual symbols, and let the
+  decoder reconstruct them without a side map.
+- This directly tests the GP-ResLC idea of not transmitting residual
+  information that the pretrained GLC decoder can tolerate or recover.
+
+Implementation:
+
+- Added real-codec diagnostic options:
+  - `--suppress_yq_stages`
+  - `--suppress_rho_threshold`
+  - `--omitted_residual_mode`
+  - `--omitted_residual_scale`
+  - `--omitted_residual_clip`
+- Encode removes the selected symbols from the arithmetic-coded `y` stream.
+- Decode recomputes the same threshold mask from decoder-available
+  `z_hat/q/context/rho`.
+- No side map is transmitted.
+- All bpp numbers are serialized real-codec bpp.
+
+Important invalidation:
+
+- The first `rhohard_stage3_t120/t125` outputs without `_fixed` in the path are
+  invalid for quality judgment.
+- The bug was decoder-side: when `--suppress_yq_stages 3` was set, decode
+  omitted the whole stage instead of only `rho >= threshold` positions.
+- The corrected runs below use `_fixed` paths and were verified by smoke test:
+  for a conservative threshold with no selected symbols on `kodim01`, decoded
+  output is exactly identical to SafeRDO.
+
+Valid runs:
+
+| run | output |
+|---|---|
+| stage3 hard, rho>=1.20, zero | `experiments/real_codec/kodak8_safe_rdo_rhohard_stage3_t120_zero_fixed` |
+| stage3 hard, rho>=1.25, zero | `experiments/real_codec/kodak8_safe_rdo_rhohard_stage3_t125_zero_fixed` |
+| stage3 hard, rho>=1.25, deterministic synthesis | `experiments/real_codec/kodak8_safe_rdo_rhohard_stage3_t125_synth_gclip_s05_fixed` |
+
+Metrics:
+
+- Dataset: Kodak8.
+- Metrics: `patch=64`, `split_patch_num=1`, `kid_subset_size=512`.
+- Comparison CSV:
+  `experiments/real_codec/kodak8_rhohard_stage3_synthesis_compare_metrics.csv`.
+
+BD-rate versus local GLC:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| SafeRDO | -6.00% | -2.97% | +1.77% | +0.64% | -7.38% | -22.04% | current anchor |
+| stage3 hard, rho>=1.20, zero | +2.49% | +0.89% | +0.60% | +2.24% | -2.01% | +38.68% | reject |
+| stage3 hard, rho>=1.25, zero | -5.38% | -3.13% | +1.45% | +0.32% | -7.33% | +10.99% | diagnostic only |
+| stage3 hard, rho>=1.25, hash synthesis | -4.93% | -3.05% | +1.65% | +0.48% | -6.65% | +15.85% | reject synthesis |
+
+BD-rate versus SafeRDO:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| stage3 hard, rho>=1.20, zero | +9.87% | +3.19% | -2.34% | -0.06% | +14.92% | +110.85% | reject |
+| stage3 hard, rho>=1.25, zero | +0.45% | -0.17% | -0.31% | -0.31% | +0.89% | +44.30% | not a lead |
+| stage3 hard, rho>=1.25, hash synthesis | +0.88% | -0.05% | -0.20% | -0.20% | +1.42% | +51.48% | reject |
+
+Interpretation:
+
+- A very conservative stage-3 hard omission can preserve LPIPS slightly better
+  than SafeRDO, but it gives back DISTS/FID and is not a new lead.
+- A stronger omission threshold saves more `y` bits but moves the main
+  perceptual curve in the wrong direction.
+- Deterministic pseudo-noise synthesis does not recover the omitted residuals.
+  The useful branch is not random hash synthesis; it would need a learned
+  decoder-side residual synthesizer or a better safe-to-drop teacher.
+
+Decision:
+
+- Keep the selective hard omission path as a diagnostic and ablation tool.
+- Do not promote it over SafeRDO.
+- Do not spend more time on scalar threshold sweeps.
+- Next mainline should implement a learned safe-to-drop / residual-payoff
+  teacher and/or a learned decoder-side omitted-residual synthesis module.
+
+## 2026-07-01 JST - Learned omitted-residual synthesis follow-up
+
+Motivation:
+
+- The previous diagnostic showed that hard omission has real bpp savings but
+  loses quality when too many stage-3 residual symbols are removed.
+- The mainline hypothesis is therefore not just "drop residuals"; it is
+  "drop residuals that can be recovered by a decoder-side generative prior".
+
+Implementation updates:
+
+- Added `StageResidualValueSynthesizer` in `gp_reslc/prior_predictor.py`.
+- Added `omitted_residual_mode=learned_value` to the real codec.
+- Added checkpoint loading for `stage_residual_value_synthesizer` in
+  `scripts/evaluate_real_codec.py`.
+- Added `scripts/train_stage3_value_synth.py`, which freezes pretrained GLC and
+  the SafeRDO checkpoint and trains only the decoder-side value synthesizer with
+  image-space losses.
+- Fixed `scripts/train_stage3_symbol_synth.py`: the previous symbol classifier
+  accidentally used `y_hat_so_far` after stage 3 during training, while decode
+  only has the context before stage 3.  That train/decode mismatch likely
+  contributed to the poor real-codec result.
+
+Rejected result:
+
+- Run: `stage3_symbol_synth_t120_weighted_1k`
+- W&B: `2npfah7e`
+- Real codec output:
+  `experiments/real_codec/kodak8_stage3_symbol_synth_t120_weighted_1k`
+- BD summary:
+  `experiments/real_codec/kodak8_stage3_symbol_synth_compare_bd_vs_glc.md`
+
+Kodak8 / real codec / patch64 split1:
+
+| run | DISTS | LPIPS | FID | decision |
+|---|---:|---:|---:|---|
+| Stage3SymbolSynthT120 vs GLC | non-overlap / much worse | non-overlap / much worse | +27.66% | reject |
+| Stage3SymbolSynthT120 vs SafeRDO | +45.98% | +28.41% | +50.11% | reject |
+
+Interpretation:
+
+- Classification accuracy on rare omitted symbols did not translate to image
+  quality.
+- The initial training script also had a decoder-context mismatch, so this run
+  should not be used as evidence that learned synthesis is impossible.
+- The stronger next test is a continuous value synthesizer trained directly by
+  reconstruction/perceptual losses under the exact decoder-available context.
+
+Active run:
+
+- Run: `stage3_value_synth_t120_perc_1500`
+- W&B: `6x3oe21z`
+- Output directory:
+  `experiments/stage3_value_synth_t120_perc_1500`
+- Mechanism: omit stage-3 residual symbols where `rho >= 1.20`; fill only the
+  omitted positions with decoder-computable continuous residual values.
+- No side map or seed is sent; serialized bpp should match the corresponding
+  hard-omission run.
+
+Smoke finding:
+
+- A 50-iteration smoke checkpoint improved q0 quality at the same bpp over
+  hard zero omission:
+  `DISTS 0.1281 -> 0.1275`, `LPIPS 0.2261 -> 0.2237`,
+  `FID 82.66 -> 82.26`.
+- This is not yet a lead, but it is enough evidence to run the longer
+  image-loss-trained value synthesizer.
+
+Completed result for `stage3_value_synth_t120_perc_1500`:
+
+- W&B: `6x3oe21z`
+- Real codec output:
+  `experiments/real_codec/kodak8_stage3_value_synth_t120_perc_1500`
+- Metrics:
+  `experiments/real_codec/kodak8_stage3_value_synth_t120_perc_1500_metrics_patch64_split1.csv`
+- BD summary:
+  `experiments/real_codec/kodak8_stage3_value_synth_compare_bd_vs_glc.md`
+
+BD-rate versus local GLC:
+
+| run | DISTS | LPIPS | FID | decision |
+|---|---:|---:|---:|---|
+| stage3 value synth, rho>=1.20 | +2.77% | -0.59% | -2.57% | reject as lead |
+
+BD-rate versus SafeRDO:
+
+| run | DISTS | LPIPS | FID | decision |
+|---|---:|---:|---:|---|
+| stage3 value synth, rho>=1.20 | +10.09% | +1.81% | +12.32% | reject as lead |
+
+Interpretation:
+
+- Continuous image-loss synthesis clearly improves over hard zero omission at
+  the same serialized bpp, but the `rho>=1.20` omission set is too aggressive.
+- The mechanism is promising, but the mask must be safer.  The next run moves
+  the same value synthesizer to the conservative `rho>=1.25` mask, where hard
+  omission was already close to SafeRDO.
+
+Active follow-up:
+
+- Run: `stage3_value_synth_t125_perc_1200`
+- W&B: `w1s0ucen`
+- Output directory:
+  `experiments/stage3_value_synth_t125_perc_1200`
+
+Completed result for `stage3_value_synth_t125_perc_1200`:
+
+- Real codec output:
+  `experiments/real_codec/kodak8_stage3_value_synth_t125_perc_1200`
+- Metrics:
+  `experiments/real_codec/kodak8_stage3_value_synth_t125_perc_1200_metrics_patch64_split1.csv`
+- BD summary:
+  `experiments/real_codec/kodak8_stage3_value_synth_t125_compare_bd_vs_glc.md`
+
+BD-rate versus local GLC:
+
+| run | DISTS | LPIPS | FID | decision |
+|---|---:|---:|---:|---|
+| stage3 value synth, rho>=1.25 | -5.31% | -3.25% | -7.07% | close, not lead |
+
+BD-rate versus SafeRDO:
+
+| run | DISTS | LPIPS | FID | decision |
+|---|---:|---:|---:|---|
+| stage3 value synth, rho>=1.25 | +0.50% | -0.27% | +1.20% | LPIPS improves, DISTS/FID weaker |
+
+Interpretation:
+
+- Conservative value synthesis preserves the hard-omission result and gives the
+  best LPIPS among these stage-3 hard-omission variants.
+- It still does not beat the SafeRDO lead on DISTS/FID.
+- The next candidate keeps the SafeRDO bitstream unchanged and adds a
+  decoder-computable stage-3 synthesis residual after decoding, so the test is
+  pure no-side quality recovery at SafeRDO bpp.
+
+Active additive follow-up:
+
+- Run: `stage3_value_add_t120_perc_1200`
+- W&B: `ll6vhs85`
+- Output directory:
+  `experiments/stage3_value_add_t120_perc_1200`
+- Mechanism: transmit the normal SafeRDO y stream; for stage-3 positions with
+  `rho >= 1.20`, add a decoder-side learned residual value after arithmetic
+  decoding.  No y symbols are removed and no side stream is sent.
+
+Additive real-codec fix and result:
+
+- Initial `s1/s5` additive evaluations were invalid: `scripts/evaluate_real_codec.py`
+  accepted `--synth_yq_stages`, but the normal
+  `stage_residual_entropy_quant_gate` branch in `gp_reslc/real_codec.py` did
+  not pass these arguments into the actual encode/decode helpers.  Pixel
+  comparison against SafeRDO showed exact zero difference even with
+  `--synth_value_scale 5.0`.
+- Fixed the real-codec path so `synth_yq_stages`,
+  `synth_rho_threshold`, and `synth_value_scale` are applied in the
+  `stage_residual_quant_gate` helper on both encode and decode.  After the fix,
+  `s5` produced large pixel differences and severe quality degradation, proving
+  the path is active but that large synthesis amplitude is unsafe.
+
+Same-code SafeRDO anchor:
+
+- Real codec:
+  `experiments/real_codec/kodak8_stage_safe_rdo_gate_from_sb03_2000_current`
+- Metrics:
+  `experiments/real_codec/kodak8_stage_safe_rdo_gate_from_sb03_2000_current_metrics_patch64_split1.csv`
+
+Additive synthesis runs:
+
+| run | output | note |
+|---|---|---|
+| `s1` | `experiments/real_codec/kodak8_stage3_value_add_t120_perc_1200_s1_fixed` | trained amplitude |
+| `s0.5` | `experiments/real_codec/kodak8_stage3_value_add_t120_perc_1200_s05_fixed` | conservative amplitude |
+| `s5 q0` | `experiments/real_codec/kodak8_stage3_value_add_t120_perc_1200_s5_q0_fixed` | destructive sanity check |
+
+BD-rate versus same-code SafeRDO, Kodak8 / patch64 split1:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| additive `s1` | +1.44% | -2.26% | -7.62% | -4.58% | -0.71% | -0.63% | LPIPS/PSNR improves, DISTS too loose |
+| additive `s0.5` | +0.24% | -1.50% | -3.93% | -2.38% | -1.00% | -0.61% | useful but not a DISTS lead |
+
+Pointwise interpretation:
+
+- Both `s1` and `s0.5` keep serialized bpp identical to SafeRDO because no
+  additional symbols or side map are transmitted.
+- `s1` improves PSNR, MS-SSIM, and LPIPS at all q points, but worsens DISTS at
+  q1-q3.  It is therefore not paper-lead quality recovery.
+- `s0.5` reduces the DISTS penalty substantially while preserving LPIPS/PSNR
+  gains; q0 even improves all measured metrics relative to SafeRDO.
+- This supports the "generative residual synthesis" hypothesis but also shows
+  that the current value synthesizer is not DISTS-constrained enough.
+
+Decision:
+
+- Keep additive synthesis as the best current no-side quality-recovery signal.
+- Do not claim it as a lead over SafeRDO yet.
+- Next implementation should train the value synthesizer with a DISTS-aware
+  safety objective against the frozen SafeRDO reconstruction, not just generic
+  image-space reconstruction/perceptual loss.
+- The target is: keep SafeRDO serialized bpp, improve LPIPS/PSNR/FID, and make
+  DISTS non-worse across q.  If achieved, then combine with actual omission or
+  counted-control coding to recover both quality and rate.
+
+## 2026-07-01 JST - DISTS-aware additive synthesis training
+
+Implementation:
+
+- Extended `scripts/train_stage3_value_synth.py` with a frozen-baseline safety
+  forward pass.
+- New optional losses:
+  - `lambda_safe_lpips * relu(LPIPS(ours,x) - LPIPS(SafeRDO,x) - margin)`
+  - `lambda_safe_dists * relu(DISTS(ours,x) - DISTS(SafeRDO,x) - margin)`
+- This directly trains the no-side additive synthesis module to avoid making
+  the frozen SafeRDO reconstruction worse on perceptual metrics.
+
+Run A:
+
+- Name: `stage3_value_add_safehinge_dists_t120_2500`
+- W&B: `0shvwfi4`
+- Output:
+  `experiments/stage3_value_add_safehinge_dists_t120_2500`
+- Key settings:
+  `value_bound=2.0`, `lambda_dists=3`, `lambda_safe_dists=20`,
+  `lambda_lpips=2`, `lambda_safe_lpips=5`, additive stage-3, `rho>=1.20`.
+
+Real-codec results versus same-code SafeRDO, Kodak8 / patch64 split1:
+
+| variant | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| final, scale 1.0 | +2.89% | -2.09% | -10.62% | -5.96% | +1.00% | +1.70% | reject: DISTS/FID worse |
+| final, scale 0.5 | +0.71% | -1.72% | -5.57% | -3.16% | -0.29% | +0.31% | not better than plain s0.5 |
+
+Comparison to previous plain additive:
+
+| variant | DISTS | LPIPS | PSNR | FID | decision |
+|---|---:|---:|---:|---:|---|
+| plain additive, scale 0.5 | +0.24% | -1.50% | -3.93% | -1.00% | best current no-side synthesis balance |
+| plain additive, scale 1.0 | +1.44% | -2.26% | -7.62% | -0.71% | too much DISTS cost |
+
+Interpretation:
+
+- The DISTS-aware hinge improved fidelity/alignment strongly but did not beat
+  the simpler conservative amplitude setting.
+- The safe loss was active throughout training, which means the branch is
+  fighting a real objective conflict: decoder-side synthesized detail can help
+  PSNR/LPIPS but can still disturb DISTS texture/structure.
+- The current best no-side additive result is therefore the plain value
+  synthesizer with conservative amplitude `s0.5`, not the safe-hinge final.
+
+Run B:
+
+- Name: `stage3_value_add_distsguard_bound05_t120_1800`
+- W&B: `ij15qn7q`
+- Output:
+  `experiments/stage3_value_add_distsguard_bound05_t120_1800`
+- Key settings:
+  `value_bound=0.5`, `lambda_dists=8`, `lambda_safe_dists=80`.
+- Stopped manually after ~700 iterations.
+
+Reason for stopping:
+
+- DISTS safety violations remained frequent.
+- `synth_abs_mean` grew instead of shrinking, despite the smaller bound.
+- Early logs were clearly worse than the accepted plain `s0.5` balance, so
+  continuing was unlikely to produce a useful lead.
+
+Decision:
+
+- Reject bound-only DISTS guard.
+- Keep the no-side value synthesis implementation because it gives a real,
+  codec-consistent quality recovery signal.
+- The next structural improvement should not be another scalar amplitude/loss
+  sweep.  It should make synthesis selective:
+  - confidence-gated synthesis from decoder-available context,
+  - local safe-to-synthesize teacher,
+  - or a tiny counted control stream that explicitly marks where synthesis is
+    allowed.
+
+## 2026-07-01 JST - Decoder-computable selective value synthesis
+
+Implementation:
+
+- Added `StageResidualSelectiveValueSynthesizer`.
+- The module predicts both a stage-3 residual value and a decoder-computable
+  sigmoid gate from transmitted/decoded context only.
+- No side map or control bits are transmitted.  The serialized payload is
+  identical to the SafeRDO anchor; only the decoder-side reconstruction changes.
+- Evaluation support was added to `scripts/evaluate_real_codec.py` through the
+  checkpoint flag `stage_value_selective`.
+
+Run:
+
+- Name: `stage3_selective_value_add_t120_distsguard_1200`
+- W&B: `sdlsddfn`
+- Output:
+  `experiments/stage3_selective_value_add_t120_distsguard_1200`
+- Base checkpoint:
+  `experiments/stage_safe_rdo_gate_from_sb03_2000/v2_final.pt`
+- Key settings:
+  additive stage-3 synthesis, `rho>=1.20`, `gate_init_prob=0.25`,
+  `lambda_gate=0.02`, `lambda_safe_dists=50`, `lambda_safe_lpips=5`.
+
+Training signal:
+
+- The gate learned to be conservative: mean gate dropped from `0.25` to roughly
+  `0.07-0.12` late in training.
+- This confirmed that the model is not merely adding dense residual texture
+  everywhere.
+- Some batches still showed DISTS safety violations, so real-codec curve
+  evaluation remained necessary.
+
+Kodak8 / patch64 split1, BD-rate versus same-code SafeRDO:
+
+| variant | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID | decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| selective final, scale 0.25 | -0.19% | -0.92% | -2.52% | -1.26% | -0.42% | -0.55% | keep as safe no-side synthesis booster |
+| selective final, scale 0.5 | +0.04% | -1.74% | -4.93% | -2.48% | -0.21% | -0.74% | useful LPIPS/fidelity booster; DISTS-neutral |
+| selective final, scale 1.0 | +1.14% | -2.49% | -9.09% | -4.61% | -0.22% | -0.78% | too much DISTS risk |
+| previous plain additive, scale 0.5 | +0.24% | -1.50% | -3.93% | -2.38% | -1.00% | -0.61% | superseded for DISTS-balanced use |
+
+Artifacts:
+
+- Metrics:
+  `experiments/real_codec/analysis/kodak8_safe_vs_selective_scales_metrics.csv`
+- BD summary:
+  `experiments/real_codec/analysis/kodak8_safe_vs_selective_scales_bd.md`
+
+Interpretation:
+
+- Selective no-side synthesis is real and codec-consistent: at `scale=0.25` it
+  improves all measured Kodak8 metrics over the same-code SafeRDO anchor without
+  adding bits.
+- The gain is small, so this should not become the main performance story.
+- The result is still important because it validates a decoder-side generative
+  residual recovery path: some residual quality can be recovered after reducing
+  transmitted precision.
+- For large gains, the next mainline should move to actual entropy/rate
+  mechanisms: fixed-width `z_hat` coding, stage-aware residual-variable coding,
+  learned residual/control entropy, or a tiny counted control stream.
+
+## 2026-07-01 JST - Static entropy coding for z_hat indices
+
+Motivation:
+
+- The real codec previously followed the published GLC assumption and packed
+  `z_hat` VQ indices with fixed-width `ceil(log2(16384)) = 14` bits/index.
+- Measured Kodak8 and OpenImages distributions are far from uniform, so this is
+  a quality-preserving source of real bpp reduction.
+
+Implementation:
+
+- Added `z_entropy_mode in {fixed, static, auto}` to the real codec.
+- `static` uses a q-specific CDF learned from training-side data.
+- `auto` stores either static arithmetic-coded z indices or fixed-width z
+  indices, whichever is shorter for that image.  The z payload is
+  self-identifying through a small prefix, and all bytes are counted.
+- Existing fixed-width payloads remain backward compatible.
+- Added `scripts/estimate_z_index_cdf.py`.
+
+CDF artifact:
+
+- `experiments/z_entropy/openimages_train_2000_crop256_alpha1.pt`
+- Source: `/dpl/open-images-v6/train/data`
+- 2000 random 256x256 crops, q0-q3, Laplace smoothing `alpha=1.0`.
+- Smoothed entropy:
+  q0 `10.3904`, q1 `10.8674`, q2 `11.0832`, q3 `10.9667` bits/index.
+
+SafeRDO + z entropy, Kodak8 / patch64 split1:
+
+- Output:
+  `experiments/real_codec/kodak8_stage_safe_rdo_zentropy_auto_a1`
+- Metrics:
+  `experiments/real_codec/kodak8_stage_safe_rdo_zentropy_auto_a1_metrics_patch64_split1.csv`
+- BD summary:
+  `experiments/real_codec/analysis/kodak8_safe_vs_safe_zentropy_a1_bd.md`
+
+BD-rate versus same-code SafeRDO fixed-z anchor:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| SafeRDO + z entropy auto | -4.13% | -4.11% | -4.03% | -4.05% | -4.14% | -3.91% |
+
+Decode consistency:
+
+- All 32 Kodak8 reconstructions (`4 q x 8 images`) were pixel-identical between
+  fixed-z SafeRDO and z-entropy SafeRDO (`max_abs_png_diff = 0`).
+- Therefore this gain is pure serialized bpp reduction, not a quality-path
+  change.
+
+Composition with selective no-side synthesis:
+
+- Output:
+  `experiments/real_codec/kodak8_stage3_selective_value_add_t120_distsguard_1200_s025_zentropy_auto_a1`
+- Metrics:
+  `experiments/real_codec/kodak8_stage3_selective_value_add_t120_distsguard_1200_s025_zentropy_auto_a1_metrics_patch64_split1.csv`
+- BD summary:
+  `experiments/real_codec/analysis/kodak8_safe_vs_zentropy_selective_s025_bd.md`
+
+BD-rate versus same-code SafeRDO fixed-z anchor:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| Selective synthesis s0.25 + z entropy auto | -4.32% | -5.01% | -6.52% | -5.29% | -4.53% | -4.40% |
+
+Decision:
+
+- Keep z entropy coding as a fair real-codec booster, provided the CDF is
+  learned only from training-side data.
+- Do not treat it as a GP-ResLC-specific main contribution: the same coding
+  improvement applies to the GLC baseline because it preserves `z_hat` exactly.
+- When reporting main GP-ResLC gains, separate:
+  1. fixed-z GLC/SafeRDO comparisons,
+  2. GLC + z entropy,
+  3. GP-ResLC + z entropy.
+- Next step: validate on DIV2K and CLIC, and optionally build a larger/more
+  stable z CDF from more OpenImages crops.
+
+Fairness check on GLC baseline:
+
+- Output:
+  `experiments/real_codec/kodak8_glc_zentropy_auto_a1`
+- Metrics:
+  `experiments/real_codec/analysis/kodak8_glc_fixed_vs_zentropy_a1_metrics.csv`
+- BD summary:
+  `experiments/real_codec/analysis/kodak8_glc_fixed_vs_zentropy_a1_bd.md`
+
+GLC fixed-z -> GLC z-entropy auto:
+
+| run | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| GLC + z entropy auto | -3.78% | -3.69% | -3.80% | -3.74% | -3.99% | -9.06% |
+
+Interpretation:
+
+- This confirms that z entropy coding is not unique to GP-ResLC.
+- It is still useful for a serious codec package, but the main research axis
+  must return to `y` residual allocation/coding.
+
+## 2026-07-01 JST - Stage-3 send-control and selective synthesis follow-up
+
+Goal:
+
+- Test a cleaner residual-allocation branch than rho-only tuning:
+  transmit only selected stage-3 residual cells under a counted binary send
+  mask, and let omitted residuals be handled by the prior/generator.
+- Check whether selective synthesis should become the main generator-recovery
+  path.
+
+Implementation:
+
+- Added `stage3_send_score_mode` to the real codec evaluator.
+- Existing `latent_mse` send-mask selection is kept.
+- Added encoder-side image-loss teacher modes:
+  - `image_mse_grad`
+  - `image_l1_grad`
+  - `image_mse_grad_abs`
+- The image-gradient teacher uses the source image only at encode time to choose
+  a binary mask.  The mask is entropy-coded and counted, so decode remains
+  self-contained.
+
+Artifacts:
+
+- Image-gradient send-control:
+  `experiments/real_codec/kodak8_stage3_send_img_mse_grad_f075`
+- Send-control + selective synthesis:
+  `experiments/real_codec/kodak8_stage3_send_f075_selective_s025`
+  `experiments/real_codec/kodak8_stage3_send_f090_selective_s025`
+  `experiments/real_codec/kodak8_stage3_send_f095_selective_s025`
+- Summaries:
+  `experiments/real_codec/analysis/kodak8_safe_vs_stage3_send_imggrad_bd.md`
+  `experiments/real_codec/analysis/kodak8_safe_vs_send_selective_bd.md`
+  `experiments/real_codec/analysis/kodak8_safe_vs_selective_send_f095_bd.md`
+
+Kodak8 / patch64 split1 BD-rate versus same-code SafeRDO:
+
+| branch | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| stage3 send, latent-MSE, send 75% | +1.09% | +0.95% | -1.31% | +0.08% | +2.75% | +4.77% |
+| stage3 send, image-MSE-grad, send 75% | +4.58% | +2.42% | -0.41% | +2.59% | +5.52% | +12.79% |
+| send 75% + selective synthesis s0.25 | +0.95% | -0.01% | -3.75% | -0.93% | +3.42% | +11.80% |
+| send 90% + selective synthesis s0.25 | +0.56% | -0.59% | -2.49% | -0.62% | +2.09% | -2.24% |
+| send 95% + selective synthesis s0.25 | +0.37% | -0.73% | -2.19% | -0.58% | +1.84% | +17.34% |
+| selective synthesis s0.25 only | -0.19% | -0.92% | -2.52% | -1.26% | -0.42% | -6.88% |
+
+Decision:
+
+- Reject the current stage-3 send-control branch as a lead.  It saves some
+  stage-3 bpp, but DISTS/FID degradation dominates.
+- Reject image-MSE-gradient allocation for perceptual compression.  It preserves
+  distortion slightly, but it is worse than latent-MSE for DISTS/FID and is not
+  aligned with the generative compression objective.
+- Keep selective synthesis as the active generator-recovery branch.  It is small
+  but consistently safe.
+- The next meaningful step is not another `send_frac` sweep.  It is an
+  omitted-aware selective synthesizer:
+
+```text
+residual transmitted      -> keep original y_q precision
+residual not transmitted  -> synthesize only if the decoder-computable gate says safe
+otherwise                 -> fall back to GLC/SafeRDO prior mean
+```
+
+This is closer to the core GP-ResLC story than generic additive synthesis.
+
+## 2026-07-01 JST - Omitted-aware selective value synthesis training
+
+Rationale:
+
+- The previous selective synthesis checkpoint was trained as an additive
+  decoder-side correction.  It improves all Kodak8 metrics at conservative
+  scale, but it is not yet the cleanest GP-ResLC mechanism.
+- When used directly as `omitted_residual_mode=learned_value`, it improves
+  PSNR/LPIPS but still hurts DISTS/FID because it was not trained as an omitted
+  residual recovery model:
+
+| branch | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| omitted learned_value, send 75% | +2.11% | -0.54% | -8.93% | -2.76% | +2.93% | +5.06% |
+
+Decision:
+
+- Train a dedicated omitted-recovery selective synthesizer, with `additive`
+  disabled.  During training, selected high-rho stage-3 residual symbols are
+  replaced by decoder-computable predicted values, so the training task matches
+  the intended real-codec omitted-residual path.
+
+Run:
+
+- Name: `stage3_omitted_selective_value_t120_distsguard_3000`
+- W&B: `vgebegpr`
+- Base checkpoint:
+  `experiments/stage_safe_rdo_gate_from_sb03_2000/v2_final.pt`
+- Output:
+  `experiments/stage3_omitted_selective_value_t120_distsguard_3000`
+- Key settings:
+  `rho_threshold=1.20`, `selective=true`, `additive=false`,
+  `lambda_dists=8`, `lambda_safe_dists=70`, `lambda_safe_lpips=5`,
+  `lambda_gate=0.005`, OpenImages train crops, q0-q3.
+
+Early training read:
+
+- Iteration 0 starts with substantial safety violations because omitted
+  positions are reconstructed as near-zero residuals.
+- By iterations 25-100 the gate remains active (`~0.23-0.24`) rather than
+  collapsing to zero, while the synthesizer learns nonzero omitted residual
+  values.
+- This run should be evaluated with:
+
+```text
+--predictor_param_mode stage_residual_entropy_quant_gate_stage3_send_control
+--omitted_residual_mode learned_value
+--residual_control_topk_frac {0.75,0.90,0.95}
+```
+
+Success criterion:
+
+- At minimum, beat stage3 send-control without learned omitted recovery on
+  DISTS/LPIPS at matched real bpp.
+- Promotion requires matching or beating the selective-synthesis-only branch
+  while reducing serialized y bits.
+
+Follow-up:
+
+- The 1000-step checkpoint was evaluated as
+  `experiments/real_codec/kodak8_stage3_omitted_selective_1000_f075`.
+- BD-rate versus the same SafeRDO anchor:
+
+| branch | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| omitted learned old, send 75% | +2.11% | -0.54% | -8.93% | -2.76% | +2.93% | +5.06% |
+| omitted selective 1000, send 75% | +1.32% | -0.76% | -8.88% | -3.00% | +3.72% | +39.73% |
+| stage3 send only, send 75% | +1.09% | +0.95% | -1.31% | +0.08% | +2.75% | +4.77% |
+
+Interpretation:
+
+- The dedicated omitted-value model recovered LPIPS/PSNR but still damaged
+  DISTS/FID, so it is not a lead.
+- The issue is partly conceptual and partly implementation-alignment: the
+  initial training selected replacement positions by a decoder-computable
+  `rho >= 1.20` threshold, but the real-codec branch evaluated with a counted
+  latent-MSE stage-3 send mask.  The omitted-cell distribution therefore did
+  not match between training and evaluation.
+- The training script now supports `--stage3_send_frac` so the learned
+  synthesizer is trained on exactly the cells omitted by the real-codec
+  counted send-control branch.
+
+New run:
+
+- Name: `stage3_omitted_selective_matchsend_f075_distsguard_3000`
+- W&B: `otccokhz`
+- Output:
+  `experiments/stage3_omitted_selective_matchsend_f075_distsguard_3000`
+- Key change:
+  `stage3_send_frac=0.75`, `stage3_send_score_mode=latent_mse`,
+  `gate_init_prob=0.08`, `value_bound=1.0`, stronger DISTS safety.
+
+This branch tests the real question more cleanly: after the encoder chooses
+which stage-3 cells to transmit, can the decoder synthesize the omitted cells
+well enough to close the DISTS/FID gap?
+
+Result:
+
+- 1000-step checkpoint:
+  `experiments/stage3_omitted_selective_matchsend_f075_distsguard_3000/value_synth_001000.pt`
+- Real codec output:
+  `experiments/real_codec/kodak8_stage3_omitted_matchsend_1000_f075`
+- BD-rate versus SafeRDO:
+
+| branch | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| match-send omitted selective 1000, send 75% | +3.48% | -0.03% | -11.88% | -3.95% | +0.58% | +33.76% |
+
+Decision:
+
+- Stop this branch as a DISTS-led mainline.
+- It partially restores FID relative to plain stage-3 send-control, but it
+  substantially worsens DISTS.  This confirms that omitted residual synthesis
+  can make images more distributionally natural while disrupting
+  DISTS-sensitive local structure.
+- Keep the result as evidence that synthesis may remain useful as an auxiliary
+  FID/LPIPS branch, but do not use it as the primary rate-saving mechanism.
+- Next priority is zero-distortion entropy improvement and stage-aware
+  residual-variable coding.
+
+## 2026-07-01 JST - Full Kodak z-entropy and selective synthesis package
+
+Rationale:
+
+- The omitted-send synthesis branches did not close the DISTS gap.
+- The strongest reliable bpp reduction available now is zero-distortion
+  entropy coding of the GLC `z_hat` VQ indices.
+- Pair this with the conservative no-side selective additive synthesis branch
+  (`scale=0.25`) because it was the only recent synthesis variant that improved
+  all Kodak8 metrics.
+
+Runs:
+
+- Fixed-z SafeRDO anchor:
+  `experiments/real_codec/kodak_stage_safe_rdo_current_fixed`
+- SafeRDO + z entropy auto:
+  `experiments/real_codec/kodak_stage_safe_rdo_zentropy_auto_a1`
+- Selective synthesis s0.25 + z entropy auto:
+  `experiments/real_codec/kodak_stage3_selective_s025_zentropy_auto_a1`
+
+Average real bpp on Kodak24:
+
+| run | q0 | q1 | q2 | q3 |
+|---|---:|---:|---:|---:|
+| SafeRDO fixed z | 0.02336 | 0.02716 | 0.03168 | 0.03583 |
+| SafeRDO z entropy auto | 0.02203 | 0.02600 | 0.03063 | 0.03475 |
+| Selective s0.25 z entropy auto | 0.02203 | 0.02600 | 0.03063 | 0.03475 |
+
+Kodak24 / patch64 split1 BD-rate versus fixed-z SafeRDO:
+
+| branch | DISTS | LPIPS | PSNR | MS-SSIM | FID |
+|---|---:|---:|---:|---:|---:|
+| SafeRDO + z entropy auto | -4.38% | -4.28% | -4.17% | -4.20% | -4.34% |
+| Selective s0.25 + z entropy auto | -4.52% | -5.00% | -6.87% | -5.72% | -4.92% |
+
+Notes:
+
+- `z_entropy_auto` changes only the serialized `z_hat` index representation.
+  Reconstructions are pixel-identical to the fixed-z anchor.
+- Selective s0.25 adds no side bits and gives small but consistent quality gains
+  on top of the z-entropy left shift.
+- KID is intentionally omitted from the table because Kodak is too small for a
+  stable KID claim.
+
+Decision:
+
+- Treat `SelectiveS025ZEntropyAutoA1` as the current best conservative package.
+- Treat z entropy as a zero-distortion entropy-coding improvement, not the
+  whole GP-ResLC novelty.
+- Continue mainline research toward stage-aware residual-variable coding and a
+  stronger learned residual/control entropy model.
+
+## 2026-07-01 JST - DIV2K validation z-entropy protocol cleanup
+
+Issue:
+
+- An initial DIV2K z-entropy comparison used the old fixed-z anchor
+  `experiments/real_codec/div2k_stage_safe_rdo_gate_from_sb03_2000`.
+- That anchor was generated before the current real-codec path and used a
+  different recorded input path.  Its reconstructions were not pixel-identical
+  to the new z-entropy output, so the resulting BD-rate table is not a valid
+  pure z-coding comparison and must not be used as evidence.
+
+Corrected runs:
+
+- Current fixed-z SafeRDO anchor:
+  `experiments/real_codec/div2k_stage_safe_rdo_current_fixed_20260701`
+- SafeRDO + z entropy auto:
+  `experiments/real_codec/div2k_stage_safe_rdo_zentropy_auto_a1`
+- Metrics/BD table:
+  `experiments/real_codec/analysis/div2k_valid_safe_current_vs_zentropy_a1_bd.md`
+
+Consistency checks:
+
+- All 100 DIV2K validation images and all q0-q3 reconstructions are
+  byte-identical PNGs between the corrected fixed-z anchor and z-entropy run.
+- `avg_bpp_y` is identical at every q.
+- Only the serialized `z_hat` representation changes.
+
+Average real bpp on DIV2K validation:
+
+| run | q0 | q1 | q2 | q3 |
+|---|---:|---:|---:|---:|
+| SafeRDO fixed z current | 0.02106 | 0.02482 | 0.02921 | 0.03334 |
+| SafeRDO z entropy auto | 0.01958 | 0.02353 | 0.02803 | 0.03212 |
+
+Corrected DIV2K validation BD-rate versus current fixed-z SafeRDO:
+
+| branch | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| SafeRDO + z entropy auto | -5.36% | -5.14% | -4.89% | -5.10% | -5.36% | -5.07% |
+
+Decision:
+
+- Keep z entropy as a validated zero-distortion codec improvement on both
+  Kodak24 and DIV2K validation.
+- Do not present the discarded old-anchor DIV2K table.
+- Keep the research narrative centered on y/residual/control coding; z entropy
+  is a clean auxiliary improvement, not the full GP-ResLC mechanism.
+
+## 2026-07-01 JST - DIV2K validation selective synthesis s0.25 + z entropy
+
+Purpose:
+
+- Check whether the conservative no-side selective additive synthesis branch
+  that worked on Kodak24 also generalizes to DIV2K validation.
+- This branch changes reconstruction only; it sends no additional side
+  information.  Real bpp is therefore the same as SafeRDO + z entropy auto.
+
+Run:
+
+- `experiments/real_codec/div2k_stage3_selective_s025_zentropy_auto_a1`
+- Checkpoint:
+  `experiments/stage3_selective_value_add_t120_distsguard_1200/value_synth_final.pt`
+- Settings:
+  `synth_yq_stages=3`, `synth_rho_threshold=1.20`,
+  `synth_value_scale=0.25`, `z_entropy_mode=auto`
+- Metrics:
+  `experiments/real_codec/analysis/div2k_valid_safe_current_vs_zentropy_selective_s025_bd.md`
+
+Average real bpp:
+
+| run | q0 | q1 | q2 | q3 |
+|---|---:|---:|---:|---:|
+| SafeRDO fixed z current | 0.02106 | 0.02482 | 0.02921 | 0.03334 |
+| SafeRDO z entropy auto | 0.01958 | 0.02353 | 0.02803 | 0.03212 |
+| Selective s0.25 z entropy auto | 0.01958 | 0.02353 | 0.02803 | 0.03212 |
+
+DIV2K validation BD-rate versus current fixed-z SafeRDO:
+
+| branch | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| SafeRDO + z entropy auto | -5.36% | -5.14% | -4.89% | -5.10% | -5.36% | -5.07% |
+| Selective s0.25 + z entropy auto | -5.87% | -5.83% | -7.17% | -6.44% | -5.82% | -7.59% |
+
+Decision:
+
+- Promote `SelectiveS025ZEntropyAutoA1` from Kodak-only conservative package
+  to the current validated conservative package on Kodak24 + DIV2K validation.
+- This is still not the full GP-ResLC mainline: the z-entropy part is a
+  zero-distortion codec cleanup, and the selective synthesis part is a small
+  decoder-side generator-recovery correction.
+- The next mainline step should still attack y/residual/control coding directly.
+
+## 2026-07-01 JST - CLIC2020 test split preparation
+
+Protocol note:
+
+- Built `data_splits/eval/clic2020_test_428` from
+  `/dpl/clic/professional/test` and `/dpl/clic/mobile/test`.
+- Counts:
+  - professional test: 250 images
+  - mobile test: 178 images
+  - merged CLIC2020 test: 428 images
+- Symlink names are prefixed with `pro_` and `mob_` to avoid collisions and to
+  keep the subset source explicit.
+
+Current run:
+
+- Current fixed-z SafeRDO anchor completed at
+  `experiments/real_codec/clic2020_test_stage_safe_rdo_current_fixed_20260701`.
+- The previous CLIC outputs are not reused as anchors until protocol and
+  current-code consistency are verified, mirroring the DIV2K cleanup above.
+
+Average real bpp on CLIC2020 test 428:
+
+| run | q0 | q1 | q2 | q3 |
+|---|---:|---:|---:|---:|
+| SafeRDO fixed z current | 0.01855 | 0.02209 | 0.02648 | 0.03045 |
+
+Average real bpp split:
+
+| q | total | y | z | header | enc s/img | dec s/img |
+|---|---:|---:|---:|---:|---:|---:|
+| q0 | 0.018548 | 0.014778 | 0.003520 | 0.000249 | 0.655 | 0.934 |
+| q1 | 0.022088 | 0.018318 | 0.003520 | 0.000249 | 0.725 | 1.007 |
+| q2 | 0.026480 | 0.022711 | 0.003520 | 0.000249 | 0.772 | 1.056 |
+| q3 | 0.030451 | 0.026681 | 0.003520 | 0.000249 | 0.888 | 1.163 |
+
+Completed conservative package run:
+
+- Run:
+  `experiments/real_codec/clic2020_test_stage3_selective_s025_zentropy_auto_a1`
+- Checkpoint:
+  `experiments/stage3_selective_value_add_t120_distsguard_1200/value_synth_final.pt`
+- Settings:
+  `synth_yq_stages=3`, `synth_rho_threshold=1.20`,
+  `synth_value_scale=0.25`, `z_entropy_mode=auto`,
+  `z_entropy_cdf_path=experiments/z_entropy/openimages_train_2000_crop256_alpha1.pt`
+
+Average real bpp on CLIC2020 test 428:
+
+| run | q0 | q1 | q2 | q3 |
+|---|---:|---:|---:|---:|
+| SafeRDO fixed z current | 0.01855 | 0.02209 | 0.02648 | 0.03045 |
+| Selective s0.25 z entropy auto | 0.01705 | 0.02078 | 0.02528 | 0.02922 |
+
+Average real bpp split for `SelectiveS025ZEntropyAutoA1`:
+
+| q | total | vs fixed-z | y | z | header | enc s/img | dec s/img |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| q0 | 0.017055 | -8.05% | 0.014778 | 0.002027 | 0.000249 | 0.746 | 1.016 |
+| q1 | 0.020775 | -5.94% | 0.018318 | 0.002208 | 0.000249 | 0.817 | 1.091 |
+| q2 | 0.025282 | -4.53% | 0.022711 | 0.002322 | 0.000249 | 0.902 | 1.181 |
+| q3 | 0.029219 | -4.05% | 0.026681 | 0.002288 | 0.000249 | 0.989 | 1.270 |
+
+Metrics:
+
+- CSV:
+  `experiments/real_codec/analysis/clic2020_test_safe_current_vs_selective_s025_zentropy_metrics.csv`
+- BD summary:
+  `experiments/real_codec/analysis/clic2020_test_safe_current_vs_selective_s025_zentropy_bd.md`
+- FID/KID protocol: 256 x 256 patches with normal tiling plus 128-pixel shift
+  (`FID_PATCHES=28650`, `KID_PATCHES=28650`).
+
+CLIC2020 test BD-rate versus current fixed-z SafeRDO:
+
+| branch | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| Selective s0.25 + z entropy auto | -5.87% | -6.58% | -8.12% | -7.42% | -6.29% | -10.17% |
+
+Per-point metric notes:
+
+- q0 and q1 reduce real bpp while keeping DISTS essentially equal and slightly
+  improving LPIPS/FID.
+- q2 and q3 keep LPIPS/PSNR/MS-SSIM slightly better, while DISTS/FID are nearly
+  tied or slightly worse at the same q index.  The BD-rate comparison still
+  favors the selective package because the curve is shifted left in real bpp.
+- The y stream is identical to the fixed-z anchor in this conservative package;
+  the measured gain is dominated by decoder-consistent entropy coding of
+  `z_hat`, with the small no-side selective synthesis branch helping quality.
+
+Research interpretation:
+
+- The CLIC run is package validation, not a new mechanism search.
+- The current conservative package is now validated on Kodak24, DIV2K
+  validation, and full CLIC2020 test 428 under real serialized bpp, but the
+  main table should not mix the `z_hat` entropy-coding gain into the GP-ResLC
+  method gain.
+- `z_hat` entropy coding is a useful codec cleanup and should be reported as an
+  auxiliary/appendix result.  It is not the central GP-ResLC mechanism.
+- This is a good stopping point for documentation.  The next research step
+  should not be more q/rho/loss tuning; it should move back to the GP-ResLC
+  mainline mechanisms: stage residual omission diagnostics, same-bpp omitted
+  residual synthesis diagnostics, and learned residual/control entropy coding.
+
+## 2026-07-01 JST - z entropy excluded BD-rate audit
+
+Motivation:
+
+- `z_hat` entropy coding is decode-equivalent and improves real bpp, but it is
+  not specific to the GP-ResLC residual/generator-recovery idea.
+- For the main GP-ResLC claim, the primary comparison should exclude this gain:
+  use the fixed-width `z_hat` rate for both anchor and proposal, while keeping
+  the selective reconstruction quality.  This isolates the no-side selective
+  synthesis effect from the general codec cleanup.
+
+Derived metric files:
+
+- CLIC:
+  `experiments/real_codec/analysis/clic2020_test_safe_current_vs_selective_s025_no_zentropy_metrics.csv`
+- DIV2K:
+  `experiments/real_codec/analysis/div2k_valid_safe_current_vs_selective_s025_no_zentropy_metrics.csv`
+- Kodak:
+  `experiments/real_codec/analysis/kodak24_safe_vs_selective_s025_no_zentropy_metrics.csv`
+- CLIC/DIV2K BD:
+  `experiments/real_codec/analysis/no_zentropy_selective_s025_bd_clic_div2k.md`
+- Kodak BD:
+  `experiments/real_codec/analysis/no_zentropy_selective_s025_bd_kodak24.md`
+
+z entropy excluded BD-rate versus the same fixed-z SafeRDO anchor:
+
+| dataset | DISTS | LPIPS | PSNR | MS-SSIM | FID | KID |
+|---|---:|---:|---:|---:|---:|---:|
+| CLIC2020 test 428 | +0.18% | -0.65% | -2.42% | -1.66% | -0.17% | -4.89% |
+| DIV2K validation | -0.52% | -0.72% | -2.32% | -1.37% | -0.47% | -2.74% |
+| Kodak24 | -0.16% | -0.74% | -2.73% | -1.54% | -0.61% | -95.16% |
+
+Interpretation:
+
+- After removing `z_hat` entropy coding, the current selective synthesis branch
+  is only a small quality-side improvement.  It should not be claimed as a
+  large GP-ResLC rate reduction.
+- The large `-5%` to `-10%` BD-rate table is useful as a full codec-package
+  result, but it must be clearly separated from the method-mainline result.
+- Kodak KID is unstable and should not be used as a primary claim because the
+  dataset is small; this is especially visible in the z-excluded derived table.
+- Mainline research priority remains unchanged: attack `y`/residual/control
+  coding directly.  The next paper-facing gains should come from actual
+  residual omission, residual synthesis, or learned residual/control entropy,
+  not from `z_hat` coding cleanup.

@@ -39,6 +39,9 @@ from gp_reslc.prior_predictor import (
     StageResidualEntropyPredictor,
     StageResidualPredictor,
     StageResidualRefiner,
+    StageResidualSelectiveValueSynthesizer,
+    StageResidualSymbolSynthesizer,
+    StageResidualValueSynthesizer,
     StageQuantGate,
     StageScaleCalibrator,
     StageTinyControlEncoder,
@@ -46,6 +49,8 @@ from gp_reslc.prior_predictor import (
 )
 from gp_reslc.real_codec import (
     ENTROPY_FAMILIES,
+    OMITTED_RESIDUAL_MODES,
+    Z_ENTROPY_MODES,
     compress_to_real_bitstream,
     crop_to_original,
     decompress_from_real_bitstream,
@@ -103,6 +108,7 @@ def build_gp_reslc(weights: str, ckpt_path: str, interpolate: bool, device: str)
             "stage_residual_entropy_quant_gate_residual_refiner",
             "stage_residual_entropy_quant_gate_control",
             "stage_residual_entropy_quant_gate_latent_control",
+            "stage_residual_entropy_quant_gate_stage3_send_control",
         }:
             net.stage_residual_predictor = StageResidualEntropyPredictor(
                 net.N, scale_log_bound=ck.get("stage_scale_log_bound", 0.7))
@@ -123,6 +129,28 @@ def build_gp_reslc(weights: str, ckpt_path: str, interpolate: bool, device: str)
             depth=ck.get("stage_residual_refiner_depth", 3),
         )
         net.stage_residual_refiner.load_state_dict(ck["stage_residual_refiner"])
+    if "stage_residual_symbol_synthesizer" in ck:
+        net.stage_residual_symbol_synthesizer = StageResidualSymbolSynthesizer(
+            net.N,
+            radius=ck.get("stage_symbol_radius", 3),
+            depth=ck.get("stage_symbol_depth", 2),
+        )
+        net.stage_residual_symbol_synthesizer.load_state_dict(ck["stage_residual_symbol_synthesizer"])
+    if "stage_residual_value_synthesizer" in ck:
+        if ck.get("stage_value_selective", False):
+            net.stage_residual_value_synthesizer = StageResidualSelectiveValueSynthesizer(
+                net.N,
+                value_bound=ck.get("stage_value_bound", 2.0),
+                depth=ck.get("stage_value_depth", 3),
+                gate_init_prob=ck.get("stage_value_gate_init_prob", 0.25),
+            )
+        else:
+            net.stage_residual_value_synthesizer = StageResidualValueSynthesizer(
+                net.N,
+                value_bound=ck.get("stage_value_bound", 2.0),
+                depth=ck.get("stage_value_depth", 3),
+            )
+        net.stage_residual_value_synthesizer.load_state_dict(ck["stage_residual_value_synthesizer"])
     if "tiny_control_encoder" in ck:
         net.tiny_control_encoder = StageTinyControlEncoder(
             net.N,
@@ -220,6 +248,7 @@ def parse_args() -> argparse.Namespace:
             "stage_residual_entropy_quant_gate_control",
             "stage_residual_entropy_quant_gate_residual_control",
             "stage_residual_entropy_quant_gate_latent_control",
+            "stage_residual_entropy_quant_gate_stage3_send_control",
         ],
         default=None,
     )
@@ -248,6 +277,32 @@ def parse_args() -> argparse.Namespace:
                     help="Max absolute signed control symbol. 1 gives ternary {-1,0,+1}; higher values enable counted multi-level controls.")
     ap.add_argument("--latent_control_delta_override", type=float, default=None,
                     help="Override checkpoint latent-control correction magnitude for diagnostic sweeps.")
+    ap.add_argument("--suppress_yq_stages", type=int, nargs="*", default=None,
+                    help="Diagnostic: omit residual symbols for selected four-part y stages, e.g. 3 or 2 3.")
+    ap.add_argument("--omitted_residual_mode", choices=sorted(OMITTED_RESIDUAL_MODES), default="zero",
+                    help="Diagnostic reconstruction for omitted residual stages.")
+    ap.add_argument("--omitted_residual_scale", type=float, default=0.0,
+                    help="Scale for deterministic omitted-residual synthesis in quantized residual units.")
+    ap.add_argument("--omitted_residual_clip", type=float, default=2.0,
+                    help="Clip value for hash_gaussian_clipped omitted-residual synthesis.")
+    ap.add_argument("--suppress_rho_threshold", type=float, default=0.0,
+                    help="Diagnostic: omit y residual symbols whose decoder-computable rho is at least this value.")
+    ap.add_argument("--synth_yq_stages", type=int, nargs="*", default=None,
+                    help="No-side decoder synthesis addition for selected stages. Currently stage 3 only.")
+    ap.add_argument("--synth_rho_threshold", type=float, default=0.0,
+                    help="Apply decoder synthesis addition where rho is at least this value.")
+    ap.add_argument("--synth_value_scale", type=float, default=1.0,
+                    help="Scale for learned decoder-side continuous residual addition.")
+    ap.add_argument("--stage3_send_score_mode",
+                    choices=["latent_mse", "image_mse_grad", "image_l1_grad", "image_mse_grad_abs"],
+                    default="latent_mse",
+                    help="Encoder-side score used for counted stage-3 send-control masks.")
+    ap.add_argument("--stage3_send_grad_max_side", type=int, default=256,
+                    help="Max image side used for image-gradient stage-3 send scoring; <=0 uses full padded resolution.")
+    ap.add_argument("--z_entropy_mode", choices=sorted(Z_ENTROPY_MODES), default="fixed",
+                    help="Coding mode for z VQ indices: fixed, static CDF, or per-image auto best.")
+    ap.add_argument("--z_entropy_cdf_path", default=None,
+                    help="Torch file containing q-specific z-index probs/counts for static/auto z coding.")
     ap.add_argument("--max_images", type=int, default=0)
     ap.add_argument("--save_streams", action="store_true", help="Write .gprc payload files next to reconstructions.")
     ap.add_argument("--skip_recon", action="store_true", help="Do not write decoded PNG reconstructions.")
@@ -276,6 +331,12 @@ def main() -> None:
     if args.predictor_param_mode is None:
         args.predictor_param_mode = getattr(net, "predictor_param_mode", "mean")
         print(f"[evaluate_real_codec] predictor_param_mode={args.predictor_param_mode}", flush=True)
+    suppress_stages = sorted(set(args.suppress_yq_stages or []))
+    if any(s < 0 or s > 3 for s in suppress_stages):
+        raise ValueError(f"--suppress_yq_stages must be in 0..3, got {suppress_stages}")
+    synth_stages = sorted(set(args.synth_yq_stages or []))
+    if any(s != 3 for s in synth_stages):
+        raise ValueError(f"--synth_yq_stages currently supports stage 3 only, got {synth_stages}")
     if args.check_estimated_consistency and args.predictor_param_mode in {
         "stage_residual_entropy_quant_gate_residual_control",
         "stage_residual_entropy_quant_gate_latent_control",
@@ -283,6 +344,11 @@ def main() -> None:
         raise ValueError(
             "--check_estimated_consistency is not available for counted control-stream modes; "
             "this mode uses a counted source-side control stream not represented in train_forward."
+        )
+    if args.check_estimated_consistency and (suppress_stages or args.suppress_rho_threshold > 0.0):
+        raise ValueError(
+            "--check_estimated_consistency is not available with diagnostic residual omission; "
+            "the likelihood forward path does not implement diagnostic residual omission."
         )
 
     paths = image_paths(args.input)
@@ -305,6 +371,18 @@ def main() -> None:
         "residual_control_delta": args.residual_control_delta,
         "residual_control_groups": args.residual_control_groups,
         "residual_control_levels": args.residual_control_levels,
+        "suppress_yq_stages": suppress_stages,
+        "omitted_residual_mode": args.omitted_residual_mode,
+        "omitted_residual_scale": args.omitted_residual_scale,
+        "omitted_residual_clip": args.omitted_residual_clip,
+        "suppress_rho_threshold": args.suppress_rho_threshold,
+        "synth_yq_stages": synth_stages,
+        "synth_rho_threshold": args.synth_rho_threshold,
+        "synth_value_scale": args.synth_value_scale,
+        "stage3_send_score_mode": args.stage3_send_score_mode,
+        "stage3_send_grad_max_side": args.stage3_send_grad_max_side,
+        "z_entropy_mode": args.z_entropy_mode,
+        "z_entropy_cdf_path": args.z_entropy_cdf_path,
         "q": {},
     }
 
@@ -336,6 +414,18 @@ def main() -> None:
                 "residual_control_delta": args.residual_control_delta,
                 "residual_control_groups": args.residual_control_groups,
                 "residual_control_levels": args.residual_control_levels,
+                "suppress_yq_stages": suppress_stages,
+                "omitted_residual_mode": args.omitted_residual_mode,
+                "omitted_residual_scale": args.omitted_residual_scale,
+                "omitted_residual_clip": args.omitted_residual_clip,
+                "suppress_rho_threshold": args.suppress_rho_threshold,
+                "synth_yq_stages": synth_stages,
+                "synth_rho_threshold": args.synth_rho_threshold,
+                "synth_value_scale": args.synth_value_scale,
+                "stage3_send_score_mode": args.stage3_send_score_mode,
+                "stage3_send_grad_max_side": args.stage3_send_grad_max_side,
+                "z_entropy_mode": args.z_entropy_mode,
+                "z_entropy_cdf_path": args.z_entropy_cdf_path,
                 "images": {},
             }
         manifest["gate_alpha"] = gate_alpha
@@ -346,9 +436,25 @@ def main() -> None:
         manifest["residual_control_delta"] = args.residual_control_delta
         manifest["residual_control_groups"] = args.residual_control_groups
         manifest["residual_control_levels"] = args.residual_control_levels
+        manifest["suppress_yq_stages"] = suppress_stages
+        manifest["omitted_residual_mode"] = args.omitted_residual_mode
+        manifest["omitted_residual_scale"] = args.omitted_residual_scale
+        manifest["omitted_residual_clip"] = args.omitted_residual_clip
+        manifest["suppress_rho_threshold"] = args.suppress_rho_threshold
+        manifest["synth_yq_stages"] = synth_stages
+        manifest["synth_rho_threshold"] = args.synth_rho_threshold
+        manifest["synth_value_scale"] = args.synth_value_scale
+        manifest["stage3_send_score_mode"] = args.stage3_send_score_mode
+        manifest["stage3_send_grad_max_side"] = args.stage3_send_grad_max_side
+        manifest["z_entropy_mode"] = args.z_entropy_mode
+        manifest["z_entropy_cdf_path"] = args.z_entropy_cdf_path
         totals = {
             "bpp": 0.0,
             "bpp_y": 0.0,
+            "bpp_y_stage0": 0.0,
+            "bpp_y_stage1": 0.0,
+            "bpp_y_stage2": 0.0,
+            "bpp_y_stage3": 0.0,
             "bpp_control": 0.0,
             "bpp_z": 0.0,
             "bpp_header": 0.0,
@@ -392,6 +498,18 @@ def main() -> None:
                 residual_control_delta=args.residual_control_delta,
                 residual_control_groups=args.residual_control_groups,
                 residual_control_levels=args.residual_control_levels,
+                suppress_yq_stages=suppress_stages,
+                omitted_residual_mode=args.omitted_residual_mode,
+                omitted_residual_scale=args.omitted_residual_scale,
+                omitted_residual_clip=args.omitted_residual_clip,
+                suppress_rho_threshold=args.suppress_rho_threshold,
+                synth_yq_stages=synth_stages,
+                synth_rho_threshold=args.synth_rho_threshold,
+                synth_value_scale=args.synth_value_scale,
+                stage3_send_score_mode=args.stage3_send_score_mode,
+                stage3_send_grad_max_side=args.stage3_send_grad_max_side,
+                z_entropy_mode=args.z_entropy_mode,
+                z_entropy_cdf_path=args.z_entropy_cdf_path,
             )
             sync(device)
             t1 = time.perf_counter()
@@ -407,6 +525,16 @@ def main() -> None:
                 residual_control_delta=args.residual_control_delta,
                 residual_control_groups=args.residual_control_groups,
                 residual_control_levels=args.residual_control_levels,
+                suppress_yq_stages=suppress_stages,
+                omitted_residual_mode=args.omitted_residual_mode,
+                omitted_residual_scale=args.omitted_residual_scale,
+                omitted_residual_clip=args.omitted_residual_clip,
+                suppress_rho_threshold=args.suppress_rho_threshold,
+                synth_yq_stages=synth_stages,
+                synth_rho_threshold=args.synth_rho_threshold,
+                synth_value_scale=args.synth_value_scale,
+                z_entropy_mode=args.z_entropy_mode,
+                z_entropy_cdf_path=args.z_entropy_cdf_path,
             )
             sync(device)
             t2 = time.perf_counter()
@@ -438,6 +566,10 @@ def main() -> None:
             pixels = h * w
             bpp = len(payload) * 8.0 / pixels
             bpp_y = stats["y_bytes"] * 8.0 / pixels
+            y_stage_bytes = list(stats.get("y_stage_bytes", []))
+            while len(y_stage_bytes) < 4:
+                y_stage_bytes.append(0.0)
+            bpp_y_stages = [float(v) * 8.0 / pixels for v in y_stage_bytes[:4]]
             bpp_control = stats.get("control_bytes", 0.0) * 8.0 / pixels
             bpp_z = stats["z_bytes"] * 8.0 / pixels
             bpp_header = stats["header_bytes"] * 8.0 / pixels
@@ -447,17 +579,34 @@ def main() -> None:
             item = {
                 "bpp": bpp,
                 "bpp_y": bpp_y,
+                "bpp_y_stage0": bpp_y_stages[0],
+                "bpp_y_stage1": bpp_y_stages[1],
+                "bpp_y_stage2": bpp_y_stages[2],
+                "bpp_y_stage3": bpp_y_stages[3],
                 "bpp_control": bpp_control,
                 "bpp_z": bpp_z,
                 "bpp_header": bpp_header,
                 "payload_bytes": len(payload),
                 "y_bytes": stats["y_bytes"],
+                "y_stage_bytes": y_stage_bytes[:4],
                 "control_bytes": stats.get("control_bytes", 0.0),
                 "residual_control_nonzero": stats.get("residual_control_nonzero", 0.0),
                 "residual_control_symbol_count": stats.get("residual_control_symbol_count", 0.0),
                 "z_bytes": stats["z_bytes"],
                 "header_bytes": stats["header_bytes"],
                 "entropy_family": args.entropy_family,
+                "suppress_yq_stages": suppress_stages,
+                "omitted_residual_mode": args.omitted_residual_mode,
+                "omitted_residual_scale": args.omitted_residual_scale,
+                "omitted_residual_clip": args.omitted_residual_clip,
+                "suppress_rho_threshold": args.suppress_rho_threshold,
+                "synth_yq_stages": synth_stages,
+                "synth_rho_threshold": args.synth_rho_threshold,
+                "synth_value_scale": args.synth_value_scale,
+                "stage3_send_score_mode": stats.get("stage3_send_score_mode", args.stage3_send_score_mode),
+                "stage3_send_grad_max_side": stats.get("stage3_send_grad_max_side", args.stage3_send_grad_max_side),
+                "z_entropy_mode": stats.get("z_entropy_mode", args.z_entropy_mode),
+                "z_entropy_cdf_path": stats.get("z_entropy_cdf_path", args.z_entropy_cdf_path),
                 "encode_time_s": enc_t,
                 "decode_time_s": dec_t,
                 "height": h,
@@ -485,7 +634,9 @@ def main() -> None:
 
             print(
                 f"[{method} q={q} {idx + 1}/{len(paths)} {name}] "
-                f"bpp={bpp:.5f} y={bpp_y:.5f} c={bpp_control:.5f} z={bpp_z:.5f} "
+                f"bpp={bpp:.5f} y={bpp_y:.5f} "
+                f"ys={bpp_y_stages[0]:.5f}/{bpp_y_stages[1]:.5f}/{bpp_y_stages[2]:.5f}/{bpp_y_stages[3]:.5f} "
+                f"c={bpp_control:.5f} z={bpp_z:.5f} "
                 f"hdr={bpp_header:.5f} enc={enc_t:.3f}s dec={dec_t:.3f}s"
                 + (f" max_abs={consistency_max_abs:.3e}" if consistency_max_abs is not None else "")
             )
